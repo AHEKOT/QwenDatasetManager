@@ -1,0 +1,300 @@
+// State management
+let currentFolder = '';
+let images = [];
+let currentIndex = 0;
+let overlayActive = false;
+let opacityValue = 50; // Default 50%
+
+// DOM elements
+const folderSelect = document.getElementById('folder-select');
+const imageGrid = document.getElementById('image-grid');
+const imageCount = document.getElementById('image-count');
+const modal = document.getElementById('preview-modal');
+const previewImg = document.getElementById('preview-img');
+const previewControl = document.getElementById('preview-control');
+const currentFilename = document.getElementById('current-filename');
+const closeBtn = document.getElementById('close-modal');
+const prevBtn = document.getElementById('prev-btn');
+const nextBtn = document.getElementById('next-btn');
+const toggleBtn = document.getElementById('toggle-overlay');
+const deleteBtn = document.getElementById('delete-btn');
+const opacitySlider = document.getElementById('opacity-slider');
+const opacityValueDisplay = document.getElementById('opacity-value');
+
+// Initialize
+document.addEventListener('DOMContentLoaded', () => {
+    loadFolders();
+    setupEventListeners();
+});
+
+// Load available folders
+async function loadFolders() {
+    try {
+        const response = await fetch('/api/folders');
+        const data = await response.json();
+
+        if (data.error) {
+            console.error('Error loading folders:', data.error);
+            return;
+        }
+
+        folderSelect.innerHTML = '<option value="">-- Select a folder --</option>';
+        data.folders.forEach(folder => {
+            const option = document.createElement('option');
+            option.value = folder.path;
+            option.textContent = folder.name;
+            folderSelect.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Failed to load folders:', error);
+    }
+}
+
+// Load images from selected folder
+async function loadImages(folder) {
+    if (!folder) {
+        imageGrid.innerHTML = '<div class="empty-state"><p>📁 Select a dataset folder to view images</p></div>';
+        imageCount.textContent = '';
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/images?folder=${encodeURIComponent(folder)}`);
+        const data = await response.json();
+
+        if (data.error) {
+            console.error('Error loading images:', data.error);
+            imageGrid.innerHTML = `<div class="empty-state"><p>❌ Error: ${data.error}</p></div>`;
+            return;
+        }
+
+        images = data.images;
+        currentFolder = folder;
+        renderImageGrid();
+        updateImageCount();
+    } catch (error) {
+        console.error('Failed to load images:', error);
+        imageGrid.innerHTML = '<div class="empty-state"><p>❌ Failed to load images</p></div>';
+    }
+}
+
+// Render image grid
+function renderImageGrid() {
+    if (images.length === 0) {
+        imageGrid.innerHTML = '<div class="empty-state"><p>📷 No images found in this folder</p></div>';
+        return;
+    }
+
+    imageGrid.innerHTML = '';
+    images.forEach((filename, index) => {
+        const item = document.createElement('div');
+        item.className = 'image-item';
+        item.onclick = () => openPreview(index);
+
+        const img = document.createElement('img');
+        img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`;
+        img.alt = filename;
+        img.loading = 'lazy';
+
+        const filenameSpan = document.createElement('span');
+        filenameSpan.className = 'filename';
+        filenameSpan.textContent = filename;
+
+        item.appendChild(img);
+        item.appendChild(filenameSpan);
+        imageGrid.appendChild(item);
+    });
+}
+
+// Update image count display
+function updateImageCount() {
+    imageCount.textContent = `${images.length} image${images.length !== 1 ? 's' : ''}`;
+}
+
+// Open preview modal
+function openPreview(index) {
+    currentIndex = index;
+    overlayActive = false;
+    updatePreview();
+    modal.classList.add('active');
+    document.body.style.overflow = 'hidden';
+}
+
+// Close preview modal
+function closePreview() {
+    modal.classList.remove('active');
+    document.body.style.overflow = '';
+    overlayActive = false;
+    previewImg.classList.remove('overlay-active');
+    previewControl.classList.remove('active');
+    toggleBtn.classList.remove('active');
+}
+
+// Update preview with current image
+function updatePreview() {
+    if (images.length === 0) return;
+
+    const filename = images[currentIndex];
+    const baseUrl = `/api/image`;
+    const folderParam = `?folder=${encodeURIComponent(currentFolder)}`;
+
+    previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
+    previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
+    currentFilename.textContent = filename;
+
+    // Update navigation buttons
+    prevBtn.disabled = currentIndex === 0;
+    nextBtn.disabled = currentIndex === images.length - 1;
+
+    // Reset overlay state
+    if (!overlayActive) {
+        previewImg.classList.remove('overlay-active');
+        previewControl.classList.remove('active');
+        toggleBtn.classList.remove('active');
+    } else {
+        previewImg.classList.add('overlay-active');
+        previewControl.classList.add('active');
+        toggleBtn.classList.add('active');
+    }
+}
+
+// Navigate to previous image
+function showPrevious() {
+    if (currentIndex > 0) {
+        currentIndex--;
+        updatePreview();
+    }
+}
+
+// Navigate to next image
+function showNext() {
+    if (currentIndex < images.length - 1) {
+        currentIndex++;
+        updatePreview();
+    }
+}
+
+// Toggle overlay
+function toggleOverlay() {
+    overlayActive = !overlayActive;
+
+    if (overlayActive) {
+        previewImg.style.opacity = opacityValue / 100;
+        previewControl.classList.add('active');
+        toggleBtn.classList.add('active');
+    } else {
+        previewImg.style.opacity = 1;
+        previewControl.classList.remove('active');
+        toggleBtn.classList.remove('active');
+    }
+}
+
+// Update opacity value
+function updateOpacity(value) {
+    opacityValue = parseInt(value);
+    opacityValueDisplay.textContent = `${opacityValue}%`;
+
+    // Update preview image opacity if overlay is active
+    if (overlayActive) {
+        previewImg.style.opacity = opacityValue / 100;
+    }
+}
+
+// Delete current image set
+async function deleteCurrentImage() {
+    if (images.length === 0) return;
+
+    const filename = images[currentIndex];
+
+    try {
+        const response = await fetch(
+            `/api/delete/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`,
+            { method: 'DELETE' }
+        );
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Remove from images array
+            images.splice(currentIndex, 1);
+
+            // Update UI
+            if (images.length === 0) {
+                closePreview();
+                renderImageGrid();
+                updateImageCount();
+            } else {
+                // Adjust index if needed
+                if (currentIndex >= images.length) {
+                    currentIndex = images.length - 1;
+                }
+                updatePreview();
+                renderImageGrid();
+                updateImageCount();
+            }
+
+            console.log('Deleted:', data.deleted);
+            if (data.errors && data.errors.length > 0) {
+                console.warn('Warnings:', data.errors);
+            }
+        } else {
+            alert(`Failed to delete: ${data.error || 'Unknown error'}`);
+        }
+    } catch (error) {
+        console.error('Failed to delete image:', error);
+        alert('Failed to delete image. Check console for details.');
+    }
+}
+
+// Event listeners
+function setupEventListeners() {
+    // Folder selection
+    folderSelect.addEventListener('change', (e) => {
+        loadImages(e.target.value);
+    });
+
+    // Modal controls
+    closeBtn.addEventListener('click', closePreview);
+    prevBtn.addEventListener('click', showPrevious);
+    nextBtn.addEventListener('click', showNext);
+    toggleBtn.addEventListener('click', toggleOverlay);
+    deleteBtn.addEventListener('click', deleteCurrentImage);
+
+    // Opacity slider
+    opacitySlider.addEventListener('input', (e) => {
+        updateOpacity(e.target.value);
+    });
+
+    // Keyboard navigation
+    document.addEventListener('keydown', (e) => {
+        if (!modal.classList.contains('active')) return;
+
+        switch (e.key) {
+            case 'Escape':
+                closePreview();
+                break;
+            case 'ArrowLeft':
+                showPrevious();
+                break;
+            case 'ArrowRight':
+                showNext();
+                break;
+            case 'Backspace':
+            case 'Delete':
+                e.preventDefault();
+                deleteCurrentImage();
+                break;
+            case ' ':
+                e.preventDefault();
+                toggleOverlay();
+                break;
+        }
+    });
+
+    // Close modal when clicking outside
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+            closePreview();
+        }
+    });
+}
