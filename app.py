@@ -90,8 +90,23 @@ def delete_image(filename):
         deleted_files = []
         errors = []
         
-        # Delete from all three folders
-        for folder_name in ['img', 'Control1', 'Control2']:
+        # Delete from all relevant folders
+        folders_to_check = ['img', 'Control1', 'Control2', 'Control3']
+        
+        # Also check for .txt caption file in img folder
+        basename = os.path.splitext(filename)[0]
+        txt_filename = f"{basename}.txt"
+        
+        # Add txt file to deletion list if it exists
+        txt_path = dataset_dir / 'img' / txt_filename
+        if txt_path.exists():
+            try:
+                txt_path.unlink()
+                deleted_files.append(f"img/{txt_filename}")
+            except Exception as e:
+                errors.append(f"Failed to delete img/{txt_filename}: {str(e)}")
+
+        for folder_name in folders_to_check:
             folder = dataset_dir / folder_name
             file_path = folder / filename
             
