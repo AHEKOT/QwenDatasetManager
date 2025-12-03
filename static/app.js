@@ -4,6 +4,7 @@ let images = [];
 let currentIndex = 0;
 let overlayActive = false;
 let opacityValue = 50; // Default 50%
+let cacheBuster = Date.now(); // For cache busting after reshuffle
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -18,6 +19,7 @@ const prevBtn = document.getElementById('prev-btn');
 const nextBtn = document.getElementById('next-btn');
 const toggleBtn = document.getElementById('toggle-overlay');
 const deleteBtn = document.getElementById('delete-btn');
+const reshuffleBtn = document.getElementById('reshuffle-btn');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
 
@@ -92,7 +94,7 @@ function renderImageGrid() {
         item.onclick = () => openPreview(index);
 
         const img = document.createElement('img');
-        img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`;
+        img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
         img.alt = filename;
         img.loading = 'lazy';
 
@@ -136,7 +138,7 @@ function updatePreview() {
 
     const filename = images[currentIndex];
     const baseUrl = `/api/image`;
-    const folderParam = `?folder=${encodeURIComponent(currentFolder)}`;
+    const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
 
     previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
     previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
@@ -246,6 +248,54 @@ async function deleteCurrentImage() {
     }
 }
 
+// Reshuffle dataset
+async function reshuffleDataset() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    const confirmed = confirm(
+        'Are you sure you want to reshuffle all images?\n\n' +
+        'This will randomize the filenames (image_00001, image_00002...) ' +
+        'while keeping targets, controls, and captions synchronized.\n\n' +
+        'This action cannot be undone.'
+    );
+
+    if (!confirmed) return;
+
+    try {
+        reshuffleBtn.disabled = true;
+        reshuffleBtn.textContent = 'Shuffling...';
+
+        const response = await fetch(`/api/reshuffle?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST'
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Update cache buster to force reload of images
+            cacheBuster = Date.now();
+            alert(`Successfully reshuffled ${data.count} images!`);
+            loadImages(currentFolder); // Reload grid
+        } else {
+            alert(`Failed to reshuffle: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Reshuffle failed:', error);
+        alert('Failed to reshuffle dataset. Check console for details.');
+    } finally {
+        reshuffleBtn.disabled = false;
+        reshuffleBtn.innerHTML = `
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"></path>
+            </svg>
+            Reshuffle
+        `;
+    }
+}
+
 // Event listeners
 function setupEventListeners() {
     // Folder selection
@@ -259,6 +309,7 @@ function setupEventListeners() {
     nextBtn.addEventListener('click', showNext);
     toggleBtn.addEventListener('click', toggleOverlay);
     deleteBtn.addEventListener('click', deleteCurrentImage);
+    reshuffleBtn.addEventListener('click', reshuffleDataset);
 
     // Opacity slider
     opacitySlider.addEventListener('input', (e) => {
