@@ -1,10 +1,12 @@
 // State management
 let currentFolder = '';
+let targetFolder = ''; // For transfer functionality
 let images = [];
 let currentIndex = 0;
 let overlayActive = false;
 let opacityValue = 50; // Default 50%
 let cacheBuster = Date.now(); // For cache busting after reshuffle
+let allFolders = []; // Store all folders for target selection
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -22,6 +24,8 @@ const deleteBtn = document.getElementById('delete-btn');
 const reshuffleBtn = document.getElementById('reshuffle-btn');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
+const targetDatasetSelect = document.getElementById('target-dataset-select');
+const transferBtn = document.getElementById('transfer-btn');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -40,7 +44,16 @@ async function loadFolders() {
             return;
         }
 
+        allFolders = data.folders; // Store for later use
         folderSelect.innerHTML = '<option value="">-- Select a folder --</option>';
+
+        // Add Create New Dataset option
+        const createOption = document.createElement('option');
+        createOption.value = '__create_new__';
+        createOption.textContent = '➕ Create New Dataset';
+        createOption.style.fontWeight = 'bold';
+        folderSelect.appendChild(createOption);
+
         data.folders.forEach(folder => {
             const option = document.createElement('option');
             option.value = folder.path;
@@ -49,6 +62,40 @@ async function loadFolders() {
         });
     } catch (error) {
         console.error('Failed to load folders:', error);
+    }
+}
+
+// Create new dataset
+async function createNewDataset() {
+    const name = prompt('Enter new dataset name (letters, numbers, underscores, hyphens only):');
+
+    if (!name) {
+        folderSelect.value = '';
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/create-dataset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name.trim() })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            alert(`Dataset "${data.name}" created successfully!`);
+            await loadFolders(); // Reload folder list
+            folderSelect.value = data.path; // Select new dataset
+            loadImages(data.path);
+        } else {
+            alert(`Failed to create dataset: ${data.error}`);
+            folderSelect.value = '';
+        }
+    } catch (error) {
+        console.error('Failed to create dataset:', error);
+        alert('Failed to create dataset. Check console for details.');
+        folderSelect.value = '';
     }
 }
 
@@ -117,9 +164,32 @@ function updateImageCount() {
 function openPreview(index) {
     currentIndex = index;
     overlayActive = false;
+    targetFolder = ''; // Reset target folder
+    updateTargetDatasetSelect(); // Update dropdown options
     updatePreview();
     modal.classList.add('active');
     document.body.style.overflow = 'hidden';
+}
+
+// Update target dataset dropdown (exclude current folder)
+function updateTargetDatasetSelect() {
+    targetDatasetSelect.innerHTML = '<option value="">-- Select target dataset --</option>';
+    allFolders.forEach(folder => {
+        if (folder.path !== currentFolder) {
+            const option = document.createElement('option');
+            option.value = folder.path;
+            option.textContent = folder.name;
+            targetDatasetSelect.appendChild(option);
+        }
+    });
+    targetDatasetSelect.value = '';
+    transferBtn.style.display = 'none';
+}
+
+// Handle target dataset selection
+function onTargetDatasetChange(value) {
+    targetFolder = value;
+    transferBtn.style.display = value ? 'flex' : 'none';
 }
 
 // Close preview modal
@@ -199,6 +269,63 @@ function updateOpacity(value) {
     // Update preview image opacity if overlay is active
     if (overlayActive) {
         previewImg.style.opacity = opacityValue / 100;
+    }
+}
+
+// Transfer current image to target dataset
+async function transferCurrentImage() {
+    if (images.length === 0 || !targetFolder) return;
+
+    const filename = images[currentIndex];
+
+    try {
+        transferBtn.disabled = true;
+        transferBtn.textContent = 'Transferring...';
+
+        const response = await fetch(
+            `/api/transfer/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ targetFolder: targetFolder })
+            }
+        );
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Remove from images array (file was moved)
+            images.splice(currentIndex, 1);
+
+            // Update UI
+            if (images.length === 0) {
+                closePreview();
+                renderImageGrid();
+                updateImageCount();
+            } else {
+                if (currentIndex >= images.length) {
+                    currentIndex = images.length - 1;
+                }
+                updatePreview();
+                renderImageGrid();
+                updateImageCount();
+            }
+
+            console.log('Transferred:', data.transferred);
+        } else {
+            alert(`Failed to transfer: ${data.error || 'Unknown error'}`);
+        }
+    } catch (error) {
+        console.error('Failed to transfer image:', error);
+        alert('Failed to transfer image. Check console for details.');
+    } finally {
+        transferBtn.disabled = false;
+        transferBtn.innerHTML = `
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 19V5M5 12l7-7 7 7"></path>
+            </svg>
+            Transfer (↑)
+        `;
     }
 }
 
@@ -300,7 +427,11 @@ async function reshuffleDataset() {
 function setupEventListeners() {
     // Folder selection
     folderSelect.addEventListener('change', (e) => {
-        loadImages(e.target.value);
+        if (e.target.value === '__create_new__') {
+            createNewDataset();
+        } else {
+            loadImages(e.target.value);
+        }
     });
 
     // Modal controls
@@ -309,7 +440,13 @@ function setupEventListeners() {
     nextBtn.addEventListener('click', showNext);
     toggleBtn.addEventListener('click', toggleOverlay);
     deleteBtn.addEventListener('click', deleteCurrentImage);
+    transferBtn.addEventListener('click', transferCurrentImage);
     reshuffleBtn.addEventListener('click', reshuffleDataset);
+
+    // Target dataset selection
+    targetDatasetSelect.addEventListener('change', (e) => {
+        onTargetDatasetChange(e.target.value);
+    });
 
     // Opacity slider
     opacitySlider.addEventListener('input', (e) => {
@@ -338,6 +475,12 @@ function setupEventListeners() {
             case ' ':
                 e.preventDefault();
                 toggleOverlay();
+                break;
+            case 'ArrowUp':
+                e.preventDefault();
+                if (targetFolder) {
+                    transferCurrentImage();
+                }
                 break;
         }
     });

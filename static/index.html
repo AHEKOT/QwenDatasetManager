@@ -39,6 +39,13 @@
         <div class="modal-content">
             <button id="close-modal" class="close-btn" title="Close (Esc)">✕</button>
 
+            <div class="transfer-header">
+                <label for="target-dataset-select">Transfer to:</label>
+                <select id="target-dataset-select">
+                    <option value="">-- Select target dataset --</option>
+                </select>
+            </div>
+
             <div class="image-container">
                 <img id="preview-img" src="" alt="Preview">
                 <img id="preview-control" src="" alt="Control" class="control-overlay">
@@ -74,6 +81,15 @@
                         <input type="range" id="opacity-slider" min="0" max="100" value="50" />
                         <span id="opacity-value">50%</span>
                     </div>
+
+                    <button id="transfer-btn" class="transfer-btn" title="Transfer to target dataset (↑)"
+                        style="display: none;">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M12 19V5M5 12l7-7 7 7"></path>
+                        </svg>
+                        Transfer (↑)
+                    </button>
 
                     <button id="delete-btn" class="delete-btn" title="Delete (Backspace)">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
