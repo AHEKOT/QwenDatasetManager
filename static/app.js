@@ -7,6 +7,7 @@ let overlayActive = false;
 let opacityValue = 50; // Default 50%
 let cacheBuster = Date.now(); // For cache busting after reshuffle
 let allFolders = []; // Store all folders for target selection
+let activeControlView = null; // Which control is shown in full preview (null = original image)
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -26,6 +27,11 @@ const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
 const targetDatasetSelect = document.getElementById('target-dataset-select');
 const transferBtn = document.getElementById('transfer-btn');
+const controlThumbs = {
+    Control1: document.getElementById('control1-thumb'),
+    Control2: document.getElementById('control2-thumb'),
+    Control3: document.getElementById('control3-thumb')
+};
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -165,6 +171,7 @@ function openPreview(index) {
     currentIndex = index;
     overlayActive = false;
     targetFolder = ''; // Reset target folder
+    activeControlView = null; // Reset to show original image
     updateTargetDatasetSelect(); // Update dropdown options
     updatePreview();
     modal.classList.add('active');
@@ -210,9 +217,17 @@ function updatePreview() {
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
 
-    previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
+    // Show original image or active control in main preview
+    if (activeControlView) {
+        previewImg.src = `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`;
+    } else {
+        previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
+    }
     previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
+
+    // Load control thumbnails
+    loadControlThumbnails(filename);
 
     // Update navigation buttons
     prevBtn.disabled = currentIndex === 0;
@@ -228,6 +243,48 @@ function updatePreview() {
         previewControl.classList.add('active');
         toggleBtn.classList.add('active');
     }
+}
+
+// Load control thumbnails and check which exist
+function loadControlThumbnails(filename) {
+    const baseUrl = `/api/image`;
+    const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+
+    const controls = ['Control1', 'Control2', 'Control3'];
+
+    controls.forEach(controlName => {
+        const thumb = controlThumbs[controlName];
+        const img = thumb.querySelector('img');
+        const imgUrl = `${baseUrl}/${controlName}/${encodeURIComponent(filename)}${folderParam}`;
+
+        // Reset state
+        thumb.classList.remove('hidden', 'active');
+
+        // Mark active if this control is shown in main preview
+        if (activeControlView === controlName) {
+            thumb.classList.add('active');
+        }
+
+        // Try to load image
+        img.src = imgUrl;
+        img.onerror = () => {
+            thumb.classList.add('hidden');
+        };
+        img.onload = () => {
+            thumb.classList.remove('hidden');
+        };
+    });
+}
+
+// Show control image in full preview
+function showControlFullPreview(controlName) {
+    if (activeControlView === controlName) {
+        // Toggle off - show original image
+        activeControlView = null;
+    } else {
+        activeControlView = controlName;
+    }
+    updatePreview();
 }
 
 // Navigate to previous image
@@ -446,6 +503,13 @@ function setupEventListeners() {
     // Target dataset selection
     targetDatasetSelect.addEventListener('change', (e) => {
         onTargetDatasetChange(e.target.value);
+    });
+
+    // Control thumbnail clicks
+    Object.entries(controlThumbs).forEach(([controlName, thumb]) => {
+        thumb.addEventListener('click', () => {
+            showControlFullPreview(controlName);
+        });
     });
 
     // Opacity slider

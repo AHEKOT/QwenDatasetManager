@@ -108,7 +108,7 @@ def get_image(image_type, filename):
         dataset_dir = DATASETS_DIR / folder_path
         
         # Validate image_type
-        if image_type not in ['img', 'Control1', 'Control2']:
+        if image_type not in ['img', 'Control1', 'Control2', 'Control3']:
             return jsonify({'error': 'Invalid image type'}), 400
         
         image_dir = dataset_dir / image_type
