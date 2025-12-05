@@ -78,6 +78,57 @@ def create_dataset():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/compare-datasets', methods=['POST'])
+def compare_datasets():
+    """Compare two datasets and find orphan files in linked dataset"""
+    try:
+        data = request.get_json() or {}
+        primary_folder = data.get('primaryFolder', '')
+        linked_folder = data.get('linkedFolder', '')
+        
+        if not primary_folder or not linked_folder:
+            return jsonify({'error': 'Primary and linked folders are required'}), 400
+        
+        primary_dir = DATASETS_DIR / primary_folder / 'img'
+        linked_dir = DATASETS_DIR / linked_folder / 'img'
+        
+        if not primary_dir.exists():
+            return jsonify({'error': 'Primary dataset not found'}), 404
+        if not linked_dir.exists():
+            return jsonify({'error': 'Linked dataset not found'}), 404
+        
+        # Get basenames from both datasets
+        primary_basenames = set()
+        for f in primary_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                primary_basenames.add(f.stem)
+        
+        linked_basenames = set()
+        for f in linked_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                linked_basenames.add(f.stem)
+        
+        # Find orphans (in linked but not in primary)
+        orphan_basenames = linked_basenames - primary_basenames
+        
+        # Get full filenames for orphans
+        orphans = []
+        for basename in orphan_basenames:
+            for f in linked_dir.iterdir():
+                if f.stem == basename and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                    orphans.append(f.name)
+                    break
+        
+        return jsonify({
+            'orphans': orphans,
+            'primaryCount': len(primary_basenames),
+            'linkedCount': len(linked_basenames),
+            'orphanCount': len(orphans)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/images')
 def get_images():
     """Get list of images from the img folder"""
@@ -123,43 +174,48 @@ def get_image(image_type, filename):
 
 @app.route('/api/delete/<filename>', methods=['DELETE'])
 def delete_image(filename):
-    """Delete all three images (img, Control1, Control2) with the same filename"""
+    """Delete all related files (img, Control1-3, txt) with the same filename, optionally from linked dataset too"""
     folder_path = request.args.get('folder', '')
+    linked_folder = request.args.get('linkedFolder', '')
     
     try:
-        dataset_dir = DATASETS_DIR / folder_path
-        
         deleted_files = []
         errors = []
         
-        # Delete from all relevant folders
-        folders_to_check = ['img', 'Control1', 'Control2', 'Control3']
-        
-        # Also check for .txt caption file in img folder
-        basename = os.path.splitext(filename)[0]
-        txt_filename = f"{basename}.txt"
-        
-        # Add txt file to deletion list if it exists
-        txt_path = dataset_dir / 'img' / txt_filename
-        if txt_path.exists():
-            try:
-                txt_path.unlink()
-                deleted_files.append(f"img/{txt_filename}")
-            except Exception as e:
-                errors.append(f"Failed to delete img/{txt_filename}: {str(e)}")
-
-        for folder_name in folders_to_check:
-            folder = dataset_dir / folder_name
-            file_path = folder / filename
+        # Helper function to delete from a single dataset
+        def delete_from_dataset(dataset_path, prefix=''):
+            dataset_dir = DATASETS_DIR / dataset_path
+            folders_to_check = ['img', 'Control1', 'Control2', 'Control3']
+            basename = os.path.splitext(filename)[0]
+            txt_filename = f"{basename}.txt"
             
-            if file_path.exists():
+            # Delete txt file from img folder
+            txt_path = dataset_dir / 'img' / txt_filename
+            if txt_path.exists():
                 try:
-                    file_path.unlink()
-                    deleted_files.append(f"{folder_name}/{filename}")
+                    txt_path.unlink()
+                    deleted_files.append(f"{prefix}img/{txt_filename}")
                 except Exception as e:
-                    errors.append(f"Failed to delete {folder_name}/{filename}: {str(e)}")
-            else:
-                errors.append(f"{folder_name}/{filename} not found")
+                    errors.append(f"Failed to delete {prefix}img/{txt_filename}: {str(e)}")
+            
+            # Delete image files
+            for folder_name in folders_to_check:
+                folder = dataset_dir / folder_name
+                file_path = folder / filename
+                
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        deleted_files.append(f"{prefix}{folder_name}/{filename}")
+                    except Exception as e:
+                        errors.append(f"Failed to delete {prefix}{folder_name}/{filename}: {str(e)}")
+        
+        # Delete from primary dataset
+        delete_from_dataset(folder_path)
+        
+        # Delete from linked dataset if provided
+        if linked_folder:
+            delete_from_dataset(linked_folder, f"[linked:{linked_folder}] ")
         
         if deleted_files:
             return jsonify({
@@ -179,10 +235,11 @@ def delete_image(filename):
 
 @app.route('/api/transfer/<filename>', methods=['POST'])
 def transfer_image(filename):
-    """Transfer all related files (img, Control1-3, .txt) to another dataset folder"""
+    """Transfer all related files (img, Control1-3, .txt) to another dataset folder, optionally from linked dataset too"""
     source_folder = request.args.get('folder', '')
     data = request.get_json() or {}
     target_folder = data.get('targetFolder', '')
+    linked_folder = data.get('linkedFolder', '')
     
     if not source_folder or not target_folder:
         return jsonify({'error': 'Source and target folders are required'}), 400
@@ -191,15 +248,13 @@ def transfer_image(filename):
         return jsonify({'error': 'Source and target folders must be different'}), 400
     
     try:
-        source_dir = DATASETS_DIR / source_folder
         target_dir = DATASETS_DIR / target_folder
         
-        # Verify both directories exist and are valid datasets
-        for dir_path, name in [(source_dir, 'Source'), (target_dir, 'Target')]:
-            if not dir_path.exists():
-                return jsonify({'error': f'{name} directory not found'}), 404
-            if not (dir_path / 'img').exists():
-                return jsonify({'error': f'{name} is not a valid dataset (no img folder)'}), 400
+        # Verify target exists
+        if not target_dir.exists():
+            return jsonify({'error': 'Target directory not found'}), 404
+        if not (target_dir / 'img').exists():
+            return jsonify({'error': 'Target is not a valid dataset (no img folder)'}), 400
         
         # Get basename without extension
         basename = os.path.splitext(filename)[0]
@@ -209,10 +264,10 @@ def transfer_image(filename):
         import string
         chars = string.ascii_lowercase + string.digits
         
-        def generate_unique_name():
+        def generate_unique_name(target_dataset_dir):
             """Generate a unique name that doesn't exist in target dataset"""
             existing_names = set()
-            target_img_dir = target_dir / 'img'
+            target_img_dir = target_dataset_dir / 'img'
             if target_img_dir.exists():
                 for f in target_img_dir.iterdir():
                     existing_names.add(f.stem)
@@ -223,53 +278,69 @@ def transfer_image(filename):
                 if name not in existing_names:
                     return name
         
-        new_basename = generate_unique_name()
-        
-        # Folders to check for related files
-        folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
-        
-        # Collect all files to transfer
-        files_to_transfer = []
-        for folder_name in folders_to_process:
-            source_subfolder = source_dir / folder_name
-            target_subfolder = target_dir / folder_name
+        def transfer_from_dataset(src_folder, target_dataset_dir, src_basename):
+            """Transfer files from source to target with new unique name"""
+            source_dir = DATASETS_DIR / src_folder
             
-            if not source_subfolder.exists():
-                continue
+            if not source_dir.exists():
+                return [], f"Source directory {src_folder} not found"
             
-            # Check for image files with this basename
-            for ext in ['.png', '.jpg', '.jpeg', '.webp']:
-                source_file = source_subfolder / f"{basename}{ext}"
-                if source_file.exists():
-                    # Create target subfolder if it doesn't exist
-                    target_subfolder.mkdir(parents=True, exist_ok=True)
-                    target_file = target_subfolder / f"{new_basename}{ext}"
-                    files_to_transfer.append((source_file, target_file))
+            new_basename = generate_unique_name(target_dataset_dir)
+            folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
             
-            # Check for txt caption file (only in img folder)
-            if folder_name == 'img':
-                txt_source = source_subfolder / f"{basename}.txt"
-                if txt_source.exists():
-                    txt_target = target_subfolder / f"{new_basename}.txt"
-                    files_to_transfer.append((txt_source, txt_target))
+            files_to_transfer = []
+            for folder_name in folders_to_process:
+                source_subfolder = source_dir / folder_name
+                target_subfolder = target_dataset_dir / folder_name
+                
+                if not source_subfolder.exists():
+                    continue
+                
+                # Check for image files with this basename
+                for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                    source_file = source_subfolder / f"{src_basename}{ext}"
+                    if source_file.exists():
+                        target_subfolder.mkdir(parents=True, exist_ok=True)
+                        target_file = target_subfolder / f"{new_basename}{ext}"
+                        files_to_transfer.append((source_file, target_file))
+                
+                # Check for txt caption file (only in img folder)
+                if folder_name == 'img':
+                    txt_source = source_subfolder / f"{src_basename}.txt"
+                    if txt_source.exists():
+                        txt_target = target_subfolder / f"{new_basename}.txt"
+                        files_to_transfer.append((txt_source, txt_target))
+            
+            # Move all files
+            transferred = []
+            for source_file, target_file in files_to_transfer:
+                shutil.move(str(source_file), str(target_file))
+                transferred.append({
+                    'from': str(source_file.relative_to(BASE_DIR)),
+                    'to': str(target_file.relative_to(BASE_DIR))
+                })
+            
+            return transferred, new_basename
         
-        if not files_to_transfer:
+        # Transfer from primary dataset
+        primary_transferred, primary_new_name = transfer_from_dataset(source_folder, target_dir, basename)
+        
+        if not primary_transferred:
             return jsonify({'error': 'No files found to transfer'}), 404
         
-        # Move all files
-        transferred = []
-        for source_file, target_file in files_to_transfer:
-            shutil.move(str(source_file), str(target_file))
-            transferred.append({
-                'from': str(source_file.relative_to(BASE_DIR)),
-                'to': str(target_file.relative_to(BASE_DIR))
-            })
-        
-        return jsonify({
+        result = {
             'success': True,
-            'newFilename': f"{new_basename}{original_ext}",
-            'transferred': transferred
-        })
+            'newFilename': f"{primary_new_name}{original_ext}",
+            'transferred': primary_transferred
+        }
+        
+        # Transfer from linked dataset if provided
+        if linked_folder:
+            linked_transferred, linked_new_name = transfer_from_dataset(linked_folder, target_dir, basename)
+            result['linkedTransferred'] = linked_transferred
+            result['linkedNewFilename'] = f"{linked_new_name}{original_ext}" if linked_new_name else None
+        
+        return jsonify(result)
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500

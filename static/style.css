@@ -125,6 +125,70 @@ header h1 {
     transform: translateY(0);
 }
 
+/* Link Dataset Controls */
+.link-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.link-btn {
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+    border-color: transparent;
+    color: white;
+}
+
+.link-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+    border-color: transparent;
+}
+
+.link-select {
+    padding: 0.5rem 1rem;
+    background: var(--bg-secondary);
+    border: 2px solid var(--accent-primary);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.linked-indicator {
+    padding: 0.4rem 0.8rem;
+    background: linear-gradient(135deg, var(--success), #059669);
+    color: white;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.linked-indicator::before {
+    content: "🔗";
+}
+
+.unlink-btn {
+    padding: 0.4rem 0.6rem;
+    background: var(--danger);
+    border-color: var(--danger);
+    color: white;
+    font-size: 0.85rem;
+    border-radius: 6px;
+}
+
+.unlink-btn:hover {
+    background: #dc2626;
+    border-color: #dc2626;
+}
+
+.hidden {
+    display: none !important;
+}
+
 /* Image Grid */
 .image-grid {
     display: grid;

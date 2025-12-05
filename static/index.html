@@ -23,6 +23,19 @@
                     </svg>
                     Reshuffle
                 </button>
+
+                <!-- Link Dataset Controls -->
+                <div class="link-controls" id="link-controls">
+                    <button id="link-btn" class="action-btn link-btn" title="Link to another dataset">
+                        🔗 Link Dataset
+                    </button>
+                    <select id="link-select" class="link-select hidden">
+                        <option value="">-- Select linked dataset --</option>
+                    </select>
+                    <span id="linked-indicator" class="linked-indicator hidden"></span>
+                    <button id="unlink-btn" class="action-btn unlink-btn hidden" title="Unlink dataset">✕</button>
+                </div>
+
                 <span id="image-count" class="image-count"></span>
             </div>
         </header>

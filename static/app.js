@@ -8,6 +8,7 @@ let opacityValue = 50; // Default 50%
 let cacheBuster = Date.now(); // For cache busting after reshuffle
 let allFolders = []; // Store all folders for target selection
 let activeControlView = null; // Which control is shown in full preview (null = original image)
+let linkedDataset = null; // Linked dataset for synchronized operations
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -32,6 +33,12 @@ const controlThumbs = {
     Control2: document.getElementById('control2-thumb'),
     Control3: document.getElementById('control3-thumb')
 };
+
+// Link dataset elements
+const linkBtn = document.getElementById('link-btn');
+const linkSelect = document.getElementById('link-select');
+const linkedIndicator = document.getElementById('linked-indicator');
+const unlinkBtn = document.getElementById('unlink-btn');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -103,6 +110,99 @@ async function createNewDataset() {
         alert('Failed to create dataset. Check console for details.');
         folderSelect.value = '';
     }
+}
+
+// Link Dataset Functions
+function showLinkSelector() {
+    // Populate link select with other folders
+    linkSelect.innerHTML = '<option value="">-- Select linked dataset --</option>';
+    allFolders.forEach(folder => {
+        if (folder.path !== currentFolder) {
+            const option = document.createElement('option');
+            option.value = folder.path;
+            option.textContent = folder.name;
+            linkSelect.appendChild(option);
+        }
+    });
+
+    linkBtn.classList.add('hidden');
+    linkSelect.classList.remove('hidden');
+}
+
+async function linkDataset(folderPath) {
+    if (!folderPath) {
+        linkSelect.classList.add('hidden');
+        linkBtn.classList.remove('hidden');
+        return;
+    }
+
+    linkedDataset = folderPath;
+    const folderName = allFolders.find(f => f.path === folderPath)?.name || folderPath;
+
+    // Update UI
+    linkSelect.classList.add('hidden');
+    linkBtn.classList.add('hidden');
+    linkedIndicator.textContent = folderName;
+    linkedIndicator.classList.remove('hidden');
+    unlinkBtn.classList.remove('hidden');
+
+    // Check for orphan files
+    await checkOrphanFiles();
+}
+
+function unlinkDataset() {
+    linkedDataset = null;
+    linkedIndicator.classList.add('hidden');
+    unlinkBtn.classList.add('hidden');
+    linkBtn.classList.remove('hidden');
+}
+
+async function checkOrphanFiles() {
+    if (!currentFolder || !linkedDataset) return;
+
+    try {
+        const response = await fetch('/api/compare-datasets', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                primaryFolder: currentFolder,
+                linkedFolder: linkedDataset
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.orphans && data.orphans.length > 0) {
+            const deleteOrphans = confirm(
+                `Found ${data.orphans.length} orphan file(s) in linked dataset ` +
+                `that don't exist in primary dataset.\n\n` +
+                `Examples: ${data.orphans.slice(0, 3).join(', ')}${data.orphans.length > 3 ? '...' : ''}\n\n` +
+                `Delete these orphan files?`
+            );
+
+            if (deleteOrphans) {
+                await deleteOrphanFiles(data.orphans);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to check orphan files:', error);
+    }
+}
+
+async function deleteOrphanFiles(orphans) {
+    let deleted = 0;
+    for (const filename of orphans) {
+        try {
+            const response = await fetch(
+                `/api/delete/${encodeURIComponent(filename)}?folder=${encodeURIComponent(linkedDataset)}`,
+                { method: 'DELETE' }
+            );
+            if (response.ok) deleted++;
+        } catch (error) {
+            console.error(`Failed to delete orphan ${filename}:`, error);
+        }
+    }
+    alert(`Deleted ${deleted} orphan file(s) from linked dataset.`);
 }
 
 // Load images from selected folder
@@ -339,12 +439,18 @@ async function transferCurrentImage() {
         transferBtn.disabled = true;
         transferBtn.textContent = 'Transferring...';
 
+        // Build request body with optional linked folder
+        const requestBody = { targetFolder: targetFolder };
+        if (linkedDataset) {
+            requestBody.linkedFolder = linkedDataset;
+        }
+
         const response = await fetch(
             `/api/transfer/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ targetFolder: targetFolder })
+                body: JSON.stringify(requestBody)
             }
         );
 
@@ -392,11 +498,14 @@ async function deleteCurrentImage() {
 
     const filename = images[currentIndex];
 
+    // Build URL with optional linked folder
+    let deleteUrl = `/api/delete/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`;
+    if (linkedDataset) {
+        deleteUrl += `&linkedFolder=${encodeURIComponent(linkedDataset)}`;
+    }
+
     try {
-        const response = await fetch(
-            `/api/delete/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`,
-            { method: 'DELETE' }
-        );
+        const response = await fetch(deleteUrl, { method: 'DELETE' });
 
         const data = await response.json();
 
@@ -511,6 +620,13 @@ function setupEventListeners() {
             showControlFullPreview(controlName);
         });
     });
+
+    // Link dataset controls
+    linkBtn.addEventListener('click', showLinkSelector);
+    linkSelect.addEventListener('change', (e) => {
+        linkDataset(e.target.value);
+    });
+    unlinkBtn.addEventListener('click', unlinkDataset);
 
     // Opacity slider
     opacitySlider.addEventListener('input', (e) => {
