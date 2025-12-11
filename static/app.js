@@ -24,6 +24,8 @@ const nextBtn = document.getElementById('next-btn');
 const toggleBtn = document.getElementById('toggle-overlay');
 const deleteBtn = document.getElementById('delete-btn');
 const reshuffleBtn = document.getElementById('reshuffle-btn');
+const compressBtn = document.getElementById('compress-btn');
+const exportBtn = document.getElementById('export-btn');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
 const targetDatasetSelect = document.getElementById('target-dataset-select');
@@ -589,6 +591,110 @@ async function reshuffleDataset() {
     }
 }
 
+// Compress dataset
+async function compressDataset() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    const confirmed = confirm(
+        'Compress all PNG images in this dataset?\n\n' +
+        'This will optimize PNG files for smaller size.\n' +
+        'Original quality will be preserved as much as possible.'
+    );
+
+    if (!confirmed) return;
+
+    try {
+        compressBtn.disabled = true;
+        compressBtn.textContent = 'Compressing...';
+
+        const response = await fetch(`/api/compress?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST'
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            cacheBuster = Date.now();
+            alert(
+                `Compressed ${data.compressed} images!\n\n` +
+                `Original: ${data.originalSizeMB} MB\n` +
+                `New: ${data.newSizeMB} MB\n` +
+                `Saved: ${data.savingsMB} MB (${data.savingsPercent}%)`
+            );
+            loadImages(currentFolder);
+        } else {
+            alert(`Failed to compress: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Compress failed:', error);
+        alert('Failed to compress dataset. Check console for details.');
+    } finally {
+        compressBtn.disabled = false;
+        compressBtn.innerHTML = `
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 14h6v6H4zM14 4h6v6h-6zM4 4h6v6H4zM14 14l6 6M17 14v7h-7"></path>
+            </svg>
+            Compress
+        `;
+    }
+}
+
+// Export to AI-Toolkit format
+async function exportDataset() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    const exportPath = prompt(
+        'Enter the export path:\n\n' +
+        'Folders will be created as:\n' +
+        `• ${currentFolder}_img\n` +
+        `• ${currentFolder}_ctr1\n` +
+        `• ${currentFolder}_ctr2\n` +
+        `• ${currentFolder}_ctr3\n\n` +
+        '(Empty folders will be skipped)'
+    );
+
+    if (!exportPath) return;
+
+    try {
+        exportBtn.disabled = true;
+        exportBtn.textContent = 'Exporting...';
+
+        const response = await fetch(`/api/export?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ exportPath })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            const summary = Object.entries(data.exported)
+                .map(([folder, info]) => `${folder}: ${info.files} files`)
+                .join('\n');
+            alert(`Export complete!\n\nPath: ${data.exportPath}\n\n${summary}`);
+        } else {
+            alert(`Failed to export: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Export failed:', error);
+        alert('Failed to export dataset. Check console for details.');
+    } finally {
+        exportBtn.disabled = false;
+        exportBtn.innerHTML = `
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
+            </svg>
+            Export
+        `;
+    }
+}
+
 // Event listeners
 function setupEventListeners() {
     // Folder selection
@@ -608,6 +714,8 @@ function setupEventListeners() {
     deleteBtn.addEventListener('click', deleteCurrentImage);
     transferBtn.addEventListener('click', transferCurrentImage);
     reshuffleBtn.addEventListener('click', reshuffleDataset);
+    compressBtn.addEventListener('click', compressDataset);
+    exportBtn.addEventListener('click', exportDataset);
 
     // Target dataset selection
     targetDatasetSelect.addEventListener('change', (e) => {

@@ -427,6 +427,136 @@ def reshuffle_dataset():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/compress', methods=['POST'])
+def compress_dataset():
+    """Compress all images in the dataset to 90% quality while keeping PNG format"""
+    folder_path = request.args.get('folder', '')
+    
+    try:
+        from PIL import Image
+        
+        dataset_dir = DATASETS_DIR / folder_path
+        folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
+        
+        compressed_count = 0
+        original_size = 0
+        new_size = 0
+        
+        for folder_name in folders_to_process:
+            folder = dataset_dir / folder_name
+            if not folder.exists():
+                continue
+            
+            for file_path in folder.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() == '.png':
+                    try:
+                        original_size += file_path.stat().st_size
+                        
+                        # Open and re-save with compression
+                        img = Image.open(file_path)
+                        
+                        # Convert to RGB if necessary (PNG can have alpha)
+                        if img.mode in ('RGBA', 'LA', 'P'):
+                            # Keep alpha channel
+                            img.save(file_path, 'PNG', optimize=True, compress_level=9)
+                        else:
+                            img.save(file_path, 'PNG', optimize=True, compress_level=9)
+                        
+                        new_size += file_path.stat().st_size
+                        compressed_count += 1
+                        
+                    except Exception as e:
+                        print(f"Failed to compress {file_path}: {e}")
+        
+        # Calculate savings
+        savings_mb = (original_size - new_size) / (1024 * 1024)
+        savings_percent = ((original_size - new_size) / original_size * 100) if original_size > 0 else 0
+        
+        return jsonify({
+            'success': True,
+            'compressed': compressed_count,
+            'originalSizeMB': round(original_size / (1024 * 1024), 2),
+            'newSizeMB': round(new_size / (1024 * 1024), 2),
+        'savingsMB': round(savings_mb, 2),
+            'savingsPercent': round(savings_percent, 1)
+        })
+        
+    except ImportError:
+        return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/export', methods=['POST'])
+def export_dataset():
+    """Export dataset to AI-Toolkit format with separate folders per control type"""
+    folder_path = request.args.get('folder', '')
+    data = request.get_json() or {}
+    export_path = data.get('exportPath', '')
+    
+    if not folder_path:
+        return jsonify({'error': 'Dataset folder is required'}), 400
+    if not export_path:
+        return jsonify({'error': 'Export path is required'}), 400
+    
+    try:
+        dataset_dir = DATASETS_DIR / folder_path
+        dataset_name = folder_path.replace('/', '_')
+        export_base = Path(export_path)
+        
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+        
+        # Create export base directory if it doesn't exist
+        export_base.mkdir(parents=True, exist_ok=True)
+        
+        # Mapping of source folders to export folder suffixes
+        folder_mapping = {
+            'img': '_img',
+            'Control1': '_ctr1',
+            'Control2': '_ctr2',
+            'Control3': '_ctr3'
+        }
+        
+        exported = {}
+        for src_folder, suffix in folder_mapping.items():
+            src_dir = dataset_dir / src_folder
+            
+            if not src_dir.exists():
+                continue
+            
+            # Check if folder has any files
+            files = [f for f in src_dir.iterdir() if f.is_file()]
+            if not files:
+                continue
+            
+            # Create export folder
+            export_folder = export_base / f"{dataset_name}{suffix}"
+            export_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Copy all files
+            copied_count = 0
+            for file_path in files:
+                dest_path = export_folder / file_path.name
+                shutil.copy2(str(file_path), str(dest_path))
+                copied_count += 1
+            
+            exported[src_folder] = {
+                'folder': str(export_folder),
+                'files': copied_count
+            }
+        
+        if not exported:
+            return jsonify({'error': 'No files to export'}), 404
+        
+        return jsonify({
+            'success': True,
+            'exportPath': str(export_base),
+            'exported': exported
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")
