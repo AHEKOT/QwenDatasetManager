@@ -446,7 +446,7 @@ header h1 {
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
-    padding: 1.5rem;
+    padding: 0.75rem;
     background: rgba(30, 36, 53, 0.8);
     backdrop-filter: blur(20px);
     border-radius: 16px;
@@ -467,9 +467,9 @@ header h1 {
 .nav-btn {
     background: var(--bg-tertiary);
     border: 2px solid var(--border-color);
-    width: 48px;
-    height: 48px;
-    border-radius: 12px;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
     color: var(--text-primary);
     cursor: pointer;
     transition: var(--transition);
@@ -490,10 +490,10 @@ header h1 {
 }
 
 .toggle-btn {
-    padding: 0.75rem 1.5rem;
+    padding: 0.4rem 1rem;
     background: var(--accent-gradient);
     border: none;
-    border-radius: 12px;
+    border-radius: 8px;
     color: var(--text-primary);
     font-weight: 500;
     cursor: pointer;
@@ -501,7 +501,7 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-size: 1rem;
+    font-size: 0.9rem;
     font-family: inherit;
 }
 
@@ -515,10 +515,10 @@ header h1 {
 }
 
 .delete-btn {
-    padding: 0.75rem 1.5rem;
+    padding: 0.4rem 1rem;
     background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
     border: none;
-    border-radius: 12px;
+    border-radius: 8px;
     color: var(--text-primary);
     font-weight: 500;
     cursor: pointer;
@@ -526,7 +526,7 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-size: 1rem;
+    font-size: 0.9rem;
     font-family: inherit;
 }
 
@@ -772,9 +772,9 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.5rem 1rem;
+    padding: 0.25rem 0.75rem;
     background: var(--bg-tertiary);
-    border-radius: 12px;
+    border-radius: 8px;
     border: 2px solid var(--border-color);
 }
 
@@ -852,10 +852,10 @@ header h1 {
 }
 
 .filename {
-    padding: 0.5rem 1rem;
+    padding: 0.25rem 0.75rem;
     background: var(--bg-tertiary);
-    border-radius: 8px;
-    font-size: 0.9rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
     color: var(--text-secondary);
     font-family: 'Courier New', monospace;
 }
