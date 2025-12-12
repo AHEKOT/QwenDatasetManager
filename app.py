@@ -21,6 +21,35 @@ def index():
     """Serve the main HTML page"""
     return send_from_directory('static', 'index.html')
 
+@app.route('/api/save/<filename>', methods=['POST'])
+def save_image(filename):
+    """Save an edited image to the dataset"""
+    try:
+        folder = request.args.get('folder')
+        if not folder:
+            return jsonify({'error': 'Folder parameter is required'}), 400
+            
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+            
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+            
+        # Construct path
+        # We are saving to the 'img' subfolder of the dataset
+        save_path = DATASETS_DIR / folder / 'img' / filename
+        
+        if not save_path.parent.exists():
+            return jsonify({'error': 'Dataset folder not found'}), 404
+            
+        file.save(save_path)
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/folders')
 def get_folders():
     """Get list of available dataset folders"""

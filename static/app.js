@@ -9,6 +9,7 @@ let cacheBuster = Date.now(); // For cache busting after reshuffle
 let allFolders = []; // Store all folders for target selection
 let activeControlView = null; // Which control is shown in full preview (null = original image)
 let linkedDataset = null; // Linked dataset for synchronized operations
+let imageEditor = null; // Image editor instance
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -47,6 +48,18 @@ document.addEventListener('DOMContentLoaded', () => {
     loadFolders();
     setupEventListeners();
 });
+
+// Global callback for editor to notify when image is saved
+window.onImageSaved = function() {
+    cacheBuster = Date.now();
+    updatePreview();
+    // Also refresh the grid thumbnail for this image
+    const gridImg = document.querySelector(`.image-item:nth-child(${currentIndex + 1}) img`);
+    if (gridImg) {
+        const src = gridImg.src.split('?')[0];
+        gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+    }
+};
 
 // Load available folders
 async function loadFolders() {
@@ -319,7 +332,7 @@ function updatePreview() {
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
 
-    // Show original image or active control in main preview
+    // Update preview images
     if (activeControlView) {
         previewImg.src = `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`;
     } else {
@@ -327,6 +340,28 @@ function updatePreview() {
     }
     previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
+
+    // Initialize canvas editor
+    previewImg.onload = () => {
+        const controlImg = new Image();
+        controlImg.crossOrigin = 'anonymous';
+        controlImg.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
+        controlImg.onload = () => {
+            const canvas = document.getElementById('edit-canvas');
+            if (!imageEditor) {
+                imageEditor = new ImageEditor(canvas, previewImg, controlImg);
+            } else {
+                imageEditor.targetImageElement = previewImg;
+                imageEditor.controlImageElement = controlImg;
+                imageEditor.setupCanvas();
+                imageEditor.history = [];
+                imageEditor.saveState();
+            }
+            imageEditor.currentFilename = filename;
+            imageEditor.currentFolder = currentFolder;
+            imageEditor.updateSaveButton();
+        };
+    };
 
     // Load control thumbnails
     loadControlThumbnails(filename);

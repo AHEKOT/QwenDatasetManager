@@ -306,8 +306,9 @@ header h1 {
     position: relative;
     width: 90vw;
     height: 90vh;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto 1fr auto;
     gap: 1.5rem;
 }
 
@@ -334,10 +335,11 @@ header h1 {
 
 /* Preview Area Layout */
 .preview-area {
-    flex: 1;
     display: flex;
     gap: 1rem;
     overflow: hidden;
+    grid-column: 2;
+    grid-row: 2;
 }
 
 .image-container {
@@ -399,6 +401,22 @@ header h1 {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
+    display: none;
+    position: relative;
+    z-index: 1;
+}
+
+#edit-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    cursor: crosshair;
+    display: block;
+    z-index: 10;
+}
+
+#edit-canvas.active {
     display: block;
 }
 
@@ -433,6 +451,8 @@ header h1 {
     backdrop-filter: blur(20px);
     border-radius: 16px;
     border: 1px solid var(--border-color);
+    grid-column: 2;
+    grid-row: 3;
 }
 
 .center-controls {
@@ -518,34 +538,53 @@ header h1 {
 /* Transfer Header */
 .transfer-header {
     display: flex;
-    align-items: center;
-    gap: 1rem;
+    flex-direction: column;
+    gap: 1.5rem;
     padding: 1rem 1.5rem;
     background: rgba(30, 36, 53, 0.8);
     backdrop-filter: blur(20px);
     border-radius: 12px;
     border: 1px solid var(--border-color);
-    margin-bottom: 1rem;
+    grid-column: 1;
+    grid-row: 1 / -1;
+    width: 260px;
+    overflow-y: auto;
+    height: fit-content;
+    max-height: 100%;
+    align-self: center;
 }
 
-.transfer-header label {
-    font-weight: 500;
+.transfer-header h3 {
+    font-size: 0.85rem;
+    font-weight: 600;
     color: var(--text-secondary);
-    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0;
+}
+
+.panel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.panel-section label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-weight: 500;
 }
 
 #target-dataset-select {
-    flex: 1;
     padding: 0.6rem 1rem;
     background: var(--bg-tertiary);
     border: 2px solid var(--border-color);
     border-radius: 8px;
     color: var(--text-primary);
-    font-size: 0.95rem;
+    font-size: 0.9rem;
     font-family: inherit;
     cursor: pointer;
     transition: var(--transition);
-    min-width: 200px;
 }
 
 #target-dataset-select:hover {
@@ -556,6 +595,149 @@ header h1 {
     outline: none;
     border-color: var(--accent-primary);
     box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+}
+
+/* Tools Grid */
+.tools-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+}
+
+.tool-btn {
+    padding: 0.75rem;
+    background: var(--bg-tertiary);
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: var(--transition);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: inherit;
+}
+
+.tool-btn:hover {
+    border-color: var(--accent-primary);
+    background: var(--bg-secondary);
+}
+
+.tool-btn.active {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: white;
+}
+
+/* Brush Settings */
+.setting {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.setting label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+}
+
+#brush-size,
+#brush-opacity {
+    width: 100%;
+    height: 5px;
+    background: var(--bg-secondary);
+    border-radius: 3px;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+}
+
+#brush-size::-webkit-slider-thumb,
+#brush-opacity::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--accent-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+#brush-size::-webkit-slider-thumb:hover,
+#brush-opacity::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+#brush-size::-moz-range-thumb,
+#brush-opacity::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--accent-primary);
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+#brush-size::-moz-range-thumb:hover,
+#brush-opacity::-moz-range-thumb:hover {
+    transform: scale(1.2);
+}
+
+#brush-color {
+    width: 100%;
+    height: 40px;
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+#brush-color:hover {
+    border-color: var(--accent-primary);
+}
+
+/* Panel Buttons */
+.panel-btn {
+    padding: 0.75rem 1rem;
+    background: var(--bg-tertiary);
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: inherit;
+    justify-content: center;
+}
+
+.panel-btn:hover {
+    border-color: var(--accent-primary);
+    background: var(--bg-secondary);
+}
+
+.panel-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.undo-btn {
+    border-color: var(--accent-secondary);
+}
+
+.undo-btn:hover {
+    background: var(--bg-secondary);
 }
 
 /* Transfer Button */
