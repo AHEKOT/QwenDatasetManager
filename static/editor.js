@@ -1,10 +1,11 @@
 // Image Editor Module
 class ImageEditor {
-    constructor(canvas, targetImageElement, controlImageElement) {
+    constructor(canvas, targetImageElement, controlImageElement, overlayElement) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { willReadFrequently: true });
         this.targetImageElement = targetImageElement;
         this.controlImageElement = controlImageElement;
+        this.overlayElement = overlayElement;
         
         this.currentTool = null;
         this.brushSize = 10;
@@ -81,7 +82,17 @@ class ImageEditor {
     }
     
     applyTransform() {
-        this.canvas.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+        const transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+        this.canvas.style.transform = transform;
+        
+        if (this.overlayElement) {
+            this.overlayElement.style.transform = transform;
+            this.overlayElement.style.transformOrigin = '0 0';
+            this.overlayElement.style.width = `${this.canvas.width}px`;
+            this.overlayElement.style.height = `${this.canvas.height}px`;
+            this.overlayElement.style.left = '0';
+            this.overlayElement.style.top = '0';
+        }
     }
     
     setupEventListeners() {
@@ -135,6 +146,9 @@ class ImageEditor {
         if (saveBtn) saveBtn.addEventListener('click', () => this.save());
 
         document.addEventListener('keydown', (e) => {
+            // Only handle shortcuts if canvas is visible
+            if (this.canvas.offsetParent === null) return;
+
             if (e.ctrlKey && e.key === 'z') {
                 e.preventDefault();
                 this.undo();
@@ -144,6 +158,32 @@ class ImageEditor {
                     e.preventDefault();
                     this.save();
                 }
+            } else if (e.key === '[' || e.key === ']') {
+                const step = 2;
+                let newSize = this.brushSize;
+                
+                if (e.key === '[') {
+                    newSize = Math.max(1, this.brushSize - step);
+                } else {
+                    newSize = Math.min(100, this.brushSize + step);
+                }
+                
+                if (newSize !== this.brushSize) {
+                    this.brushSize = newSize;
+                    const sizeSlider = document.getElementById('brush-size');
+                    const sizeValue = document.getElementById('size-value');
+                    
+                    if (sizeSlider) sizeSlider.value = newSize;
+                    if (sizeValue) sizeValue.textContent = newSize;
+                }
+            } else if (e.key === '1') {
+                this.selectTool('brush');
+            } else if (e.key === '2') {
+                this.selectTool('picker');
+            } else if (e.key === '3') {
+                this.selectTool('stamp');
+            } else if (e.key === '4') {
+                this.selectTool('eraser');
             }
         });
     }

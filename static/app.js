@@ -349,10 +349,11 @@ function updatePreview() {
         controlImg.onload = () => {
             const canvas = document.getElementById('edit-canvas');
             if (!imageEditor) {
-                imageEditor = new ImageEditor(canvas, previewImg, controlImg);
+                imageEditor = new ImageEditor(canvas, previewImg, controlImg, previewControl);
             } else {
                 imageEditor.targetImageElement = previewImg;
                 imageEditor.controlImageElement = controlImg;
+                imageEditor.overlayElement = previewControl;
                 imageEditor.setupCanvas();
                 imageEditor.history = [];
                 imageEditor.saveState();
@@ -443,13 +444,14 @@ function showNext() {
 // Toggle overlay
 function toggleOverlay() {
     overlayActive = !overlayActive;
+    const canvas = document.getElementById('edit-canvas');
 
     if (overlayActive) {
-        previewImg.style.opacity = opacityValue / 100;
+        canvas.style.opacity = opacityValue / 100;
         previewControl.classList.add('active');
         toggleBtn.classList.add('active');
     } else {
-        previewImg.style.opacity = 1;
+        canvas.style.opacity = 1;
         previewControl.classList.remove('active');
         toggleBtn.classList.remove('active');
     }
@@ -460,9 +462,10 @@ function updateOpacity(value) {
     opacityValue = parseInt(value);
     opacityValueDisplay.textContent = `${opacityValue}%`;
 
-    // Update preview image opacity if overlay is active
+    // Update canvas opacity if overlay is active
     if (overlayActive) {
-        previewImg.style.opacity = opacityValue / 100;
+        const canvas = document.getElementById('edit-canvas');
+        canvas.style.opacity = opacityValue / 100;
     }
 }
 

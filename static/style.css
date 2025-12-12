@@ -428,14 +428,18 @@ header h1 {
     transition: opacity 0.3s ease;
 }
 
-.control-overlay {
+.image-container .control-overlay {
     position: absolute;
-    inset: 0;
-    margin: auto;
+    top: 0;
+    left: 0;
     opacity: 0;
     z-index: 1;
     pointer-events: none;
     transition: opacity 0.3s ease;
+    display: block !important;
+    transform-origin: 0 0;
+    max-width: none;
+    max-height: none;
 }
 
 .control-overlay.active {
