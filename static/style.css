@@ -354,6 +354,45 @@ header h1 {
     border-radius: 16px;
     background: var(--bg-secondary);
     box-shadow: var(--shadow-lg);
+    transition: all 0.3s ease;
+}
+
+.image-container.comparison-mode {
+    justify-content: flex-end !important;
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+
+/* Comparison Container */
+.comparison-container {
+    flex: 0;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 16px;
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-lg);
+    border: 2px solid var(--accent-secondary);
+    width: 0;
+    opacity: 0;
+    transition: all 0.3s ease;
+}
+
+.comparison-container.active {
+    flex: 1;
+    width: auto;
+    opacity: 1;
+    justify-content: flex-start;
+    border-top-left-radius: 4px;
+    border-bottom-left-radius: 4px;
+}
+
+.comparison-container img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
 }
 
 /* Control Sidebar */
@@ -387,6 +426,12 @@ header h1 {
 .control-thumb.active {
     border-color: var(--accent-secondary);
     box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.3);
+}
+
+.control-thumb.comparison-active {
+    border-color: #10b981;
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.3);
+    background: rgba(16, 185, 129, 0.1);
 }
 
 .control-thumb.hidden {

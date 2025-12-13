@@ -8,6 +8,7 @@ let opacityValue = 50; // Default 50%
 let cacheBuster = Date.now(); // For cache busting after reshuffle
 let allFolders = []; // Store all folders for target selection
 let activeControlView = null; // Which control is shown in full preview (null = original image)
+let comparisonControlView = null; // Which control is shown in comparison view (null = hidden)
 let linkedDataset = null; // Linked dataset for synchronized operations
 let imageEditor = null; // Image editor instance
 
@@ -18,6 +19,8 @@ const imageCount = document.getElementById('image-count');
 const modal = document.getElementById('preview-modal');
 const previewImg = document.getElementById('preview-img');
 const previewControl = document.getElementById('preview-control');
+const comparisonContainer = document.getElementById('comparison-container');
+const comparisonImg = document.getElementById('comparison-img');
 const currentFilename = document.getElementById('current-filename');
 const closeBtn = document.getElementById('close-modal');
 const prevBtn = document.getElementById('prev-btn');
@@ -287,6 +290,7 @@ function openPreview(index) {
     overlayActive = false;
     targetFolder = ''; // Reset target folder
     activeControlView = null; // Reset to show original image
+    comparisonControlView = null; // Reset comparison view
     updateTargetDatasetSelect(); // Update dropdown options
     updatePreview();
     modal.classList.add('active');
@@ -331,6 +335,23 @@ function updatePreview() {
     const filename = images[currentIndex];
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+    const imageContainer = document.querySelector('.image-container');
+    
+    if (!imageContainer) {
+        console.error('imageContainer not found');
+        return;
+    }
+
+    // Update comparison view FIRST - before changing src
+    if (comparisonControlView) {
+        comparisonContainer.classList.add('active');
+        imageContainer.classList.add('comparison-mode');
+        console.log('Added comparison-mode class');
+    } else {
+        comparisonContainer.classList.remove('active');
+        imageContainer.classList.remove('comparison-mode');
+        console.log('Removed comparison-mode class');
+    }
 
     // Update preview images
     if (activeControlView) {
@@ -341,8 +362,21 @@ function updatePreview() {
     previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
 
+    // Update comparison image src
+    if (comparisonControlView) {
+        comparisonImg.src = `${baseUrl}/${comparisonControlView}/${encodeURIComponent(filename)}${folderParam}`;
+    } else {
+        comparisonImg.src = '';
+    }
+
+    // Force canvas update if image is already loaded (e.g. toggling comparison)
+    if (imageEditor && previewImg.complete) {
+        setTimeout(() => imageEditor.updateCanvasSize(), 50);
+    }
+
     // Initialize canvas editor
     previewImg.onload = () => {
+
         const controlImg = new Image();
         controlImg.crossOrigin = 'anonymous';
         controlImg.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
@@ -396,11 +430,16 @@ function loadControlThumbnails(filename) {
         const imgUrl = `${baseUrl}/${controlName}/${encodeURIComponent(filename)}${folderParam}`;
 
         // Reset state
-        thumb.classList.remove('hidden', 'active');
+        thumb.classList.remove('hidden', 'active', 'comparison-active');
 
         // Mark active if this control is shown in main preview
         if (activeControlView === controlName) {
             thumb.classList.add('active');
+        }
+
+        // Mark active if this control is shown in comparison
+        if (comparisonControlView === controlName) {
+            thumb.classList.add('comparison-active');
         }
 
         // Try to load image
@@ -414,13 +453,13 @@ function loadControlThumbnails(filename) {
     });
 }
 
-// Show control image in full preview
+// Show control image in full preview or side-by-side comparison
 function showControlFullPreview(controlName) {
-    if (activeControlView === controlName) {
-        // Toggle off - show original image
-        activeControlView = null;
+    if (comparisonControlView === controlName) {
+        // Toggle off - hide comparison
+        comparisonControlView = null;
     } else {
-        activeControlView = controlName;
+        comparisonControlView = controlName;
     }
     updatePreview();
 }
