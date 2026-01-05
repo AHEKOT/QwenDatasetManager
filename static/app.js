@@ -34,6 +34,8 @@ const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
 const targetDatasetSelect = document.getElementById('target-dataset-select');
 const transferBtn = document.getElementById('transfer-btn');
+const captionText = document.getElementById('caption-text');
+const saveCaptionBtn = document.getElementById('save-caption-btn');
 const controlThumbs = {
     Control1: document.getElementById('control1-thumb'),
     Control2: document.getElementById('control2-thumb'),
@@ -361,6 +363,9 @@ function updatePreview() {
     }
     previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
+
+    // Load caption
+    loadCaption(filename);
 
     // Update comparison image src
     if (comparisonControlView) {
@@ -772,6 +777,62 @@ async function exportDataset() {
     }
 }
 
+// Load caption for current image
+async function loadCaption(filename) {
+    try {
+        captionText.value = 'Loading...';
+        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`);
+        const data = await response.json();
+        
+        if (data.error) {
+            console.error('Error loading caption:', data.error);
+            captionText.value = '';
+            return;
+        }
+        
+        captionText.value = data.caption || '';
+    } catch (error) {
+        console.error('Failed to load caption:', error);
+        captionText.value = '';
+    }
+}
+
+// Save current caption
+async function saveCurrentCaption() {
+    if (images.length === 0) return;
+    
+    const filename = images[currentIndex];
+    const caption = captionText.value;
+    
+    try {
+        saveCaptionBtn.disabled = true;
+        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ caption })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            console.log('Caption saved successfully');
+            // Visual feedback
+            const originalBackground = saveCaptionBtn.style.background;
+            saveCaptionBtn.style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+            setTimeout(() => {
+                saveCaptionBtn.style.background = originalBackground;
+            }, 1000);
+        } else {
+            alert(`Failed to save caption: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Failed to save caption:', error);
+        alert('Failed to save caption. Check console for details.');
+    } finally {
+        saveCaptionBtn.disabled = false;
+    }
+}
+
 // Event listeners
 function setupEventListeners() {
     // Folder selection
@@ -790,6 +851,7 @@ function setupEventListeners() {
     toggleBtn.addEventListener('click', toggleOverlay);
     deleteBtn.addEventListener('click', deleteCurrentImage);
     transferBtn.addEventListener('click', transferCurrentImage);
+    saveCaptionBtn.addEventListener('click', saveCurrentCaption);
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
     exportBtn.addEventListener('click', exportDataset);
@@ -821,6 +883,18 @@ function setupEventListeners() {
     // Keyboard navigation
     document.addEventListener('keydown', (e) => {
         if (!modal.classList.contains('active')) return;
+
+        // Handle Ctrl+S for saving caption
+        if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+            e.preventDefault();
+            saveCurrentCaption();
+            return;
+        }
+
+        // Don't trigger navigation if user is typing in the caption textarea
+        if (document.activeElement === captionText) {
+            return;
+        }
 
         switch (e.key) {
             case 'Escape':

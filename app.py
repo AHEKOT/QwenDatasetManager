@@ -201,6 +201,47 @@ def get_image(image_type, filename):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/caption/<filename>')
+def get_caption(filename):
+    """Get caption text for an image"""
+    folder_path = request.args.get('folder', '')
+    try:
+        dataset_dir = DATASETS_DIR / folder_path
+        basename = os.path.splitext(filename)[0]
+        txt_path = dataset_dir / 'img' / f"{basename}.txt"
+        
+        if not txt_path.exists():
+            return jsonify({'caption': ''})
+            
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            caption = f.read()
+            
+        return jsonify({'caption': caption})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/caption/<filename>', methods=['POST'])
+def save_caption(filename):
+    """Save caption text for an image"""
+    folder_path = request.args.get('folder', '')
+    try:
+        data = request.get_json() or {}
+        caption = data.get('caption', '')
+        
+        dataset_dir = DATASETS_DIR / folder_path
+        basename = os.path.splitext(filename)[0]
+        txt_path = dataset_dir / 'img' / f"{basename}.txt"
+        
+        # Ensure img directory exists
+        (dataset_dir / 'img').mkdir(parents=True, exist_ok=True)
+        
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(caption)
+            
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/delete/<filename>', methods=['DELETE'])
 def delete_image(filename):
     """Delete all related files (img, Control1-3, txt) with the same filename, optionally from linked dataset too"""

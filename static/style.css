@@ -911,6 +911,66 @@ header h1 {
     font-family: 'Courier New', monospace;
 }
 
+.caption-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    border: 2px solid var(--border-color);
+    padding: 0.75rem;
+    width: 100%;
+}
+
+#caption-text {
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    resize: vertical;
+    min-height: 100px;
+    max-height: 300px;
+    line-height: 1.4;
+    outline: none;
+    font-family: inherit;
+    overflow-y: auto;
+}
+
+#caption-text::-webkit-scrollbar {
+    width: 6px;
+}
+
+#caption-text::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 3px;
+}
+
+.save-caption-btn {
+    background: var(--accent-gradient);
+    border: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem;
+    transition: var(--transition);
+    border-radius: 6px;
+    font-weight: 500;
+    gap: 0.5rem;
+}
+
+.save-caption-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+}
+
+.save-caption-btn::after {
+    content: 'Save Caption';
+    font-size: 0.85rem;
+}
+
 /* Responsive Design */
 @media (max-width: 768px) {
     .container {
