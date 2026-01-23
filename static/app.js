@@ -240,6 +240,12 @@ async function loadImages(folder) {
         return;
     }
 
+    // Capture current filename to restore position after reload
+    let currentFilename = null;
+    if (images.length > 0 && currentIndex >= 0 && currentIndex < images.length) {
+        currentFilename = images[currentIndex];
+    }
+
     try {
         const response = await fetch(`/api/images?folder=${encodeURIComponent(folder)}`);
         const data = await response.json();
@@ -252,6 +258,21 @@ async function loadImages(folder) {
 
         images = data.images;
         currentFolder = folder;
+
+        // Restore currentIndex to keep user on the same image even if list order changed
+        if (currentFilename) {
+            const newIndex = images.indexOf(currentFilename);
+            if (newIndex !== -1) {
+                currentIndex = newIndex;
+                console.log(`Restored position: ${currentFilename} is at index ${currentIndex}`);
+            } else {
+                // If file is gone, stay at roughly same position or 0
+                if (currentIndex >= images.length) {
+                    currentIndex = Math.max(0, images.length - 1);
+                }
+            }
+        }
+
         renderImageGrid();
         updateImageCount();
     } catch (error) {
