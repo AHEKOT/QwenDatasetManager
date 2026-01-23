@@ -68,6 +68,9 @@ def get_folders():
                         'path': str(item.relative_to(DATASETS_DIR))
                     })
         
+        # Sort folders alphabetically
+        folders.sort(key=lambda x: x['name'].lower())
+        
         return jsonify({'folders': folders})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
