@@ -97,10 +97,36 @@
                             </svg>
                             Eraser
                         </button>
+                        <button class="tool-btn" id="crop-tool" title="Crop & Augment (C)" data-tool="crop">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M6.13 1L6 16a2 2 0 0 0 2 2h15"></path>
+                                <path d="M1 6.13L16 6a2 2 0 0 1 2 2v15"></path>
+                            </svg>
+                            Crop
+                        </button>
                     </div>
                 </div>
 
-                <div class="panel-section">
+                <div class="panel-section" id="crop-settings-panel" style="display: none;">
+                    <h3>Crop Settings</h3>
+                    <div class="setting">
+                         <label for="crop-source-exception">Source Exception:</label>
+                         <select id="crop-source-exception" title="The selected folder will NOT be cropped (keeps original full image)">
+                            <option value="">None (Crop All)</option>
+                            <option value="Control1">Control 1</option>
+                            <option value="Control2">Control 2</option>
+                            <option value="Control3">Control 3</option>
+                         </select>
+                    </div>
+                    <button id="apply-crop-btn" class="action-btn" disabled style="width: 100%; margin-top: 10px;">
+                        Apply Crop
+                    </button>
+                    <p style="font-size: 0.8em; color: #888; margin-top: 5px;">
+                        Drag to select area. Creates new image pair.
+                    </p>
+                </div>
+
+                <div class="panel-section" id="brush-settings-panel">
                     <h3>Brush Settings</h3>
                     <div class="setting">
                         <label for="brush-size">Size: <span id="size-value">10</span>px</label>

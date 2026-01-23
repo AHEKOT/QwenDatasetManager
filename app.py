@@ -627,6 +627,139 @@ def export_dataset():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/augment/crop', methods=['POST'])
+def augment_crop():
+    """Create a new augmented image set by cropping a region"""
+    try:
+        data = request.get_json() or {}
+        folder_path = data.get('folder', '')
+        filename = data.get('filename', '')
+        crop_data = data.get('crop', {}) # {x, y, w, h}
+        source_exception = data.get('sourceException', '') # folder name like 'Control1'
+        
+        if not folder_path or not filename:
+             return jsonify({'error': 'Folder and filename are required'}), 400
+             
+        if not crop_data or 'x' not in crop_data or 'w' not in crop_data:
+            return jsonify({'error': 'Invalid crop data'}), 400
+            
+        dataset_dir = DATASETS_DIR / folder_path
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+            
+        # Get crop coordinates
+        x = int(crop_data.get('x', 0))
+        y = int(crop_data.get('y', 0))
+        w = int(crop_data.get('w', 1))
+        h = int(crop_data.get('h', 1))
+        
+        if w <= 0 or h <= 0:
+            return jsonify({'error': 'Invalid crop dimensions'}), 400
+            
+        # Generate new unique basename
+        import string
+        chars = string.ascii_lowercase + string.digits
+        
+        def generate_unique_name():
+            existing_names = set()
+            img_dir = dataset_dir / 'img'
+            if img_dir.exists():
+                for f in img_dir.iterdir():
+                    existing_names.add(f.stem)
+            
+            while True:
+                name = ''.join(random.choices(chars, k=8))
+                if name not in existing_names:
+                    return name
+                    
+        new_basename = generate_unique_name()
+        
+        # Process each folder
+        from PIL import Image
+        
+        folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
+        processed_files = []
+        
+        basename = os.path.splitext(filename)[0]
+        original_ext = os.path.splitext(filename)[1]
+        
+        for folder_name in folders_to_process:
+            src_folder = dataset_dir / folder_name
+            
+            # Find the file in this folder (might have different extension)
+            src_file = None
+            for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                temp_path = src_folder / f"{basename}{ext}"
+                if temp_path.exists():
+                    src_file = temp_path
+                    break
+            
+            if not src_file:
+                continue
+                
+            # Determine logic: Copy original OR Crop & Resize
+            # If folder matches source_exception, we keep original (COPY)
+            # Otherwise we crop
+            
+            dest_file = src_folder / f"{new_basename}{src_file.suffix}"
+            
+            if folder_name == source_exception:
+                # Exception case: Keep the full original image
+                shutil.copy2(src_file, dest_file)
+            else:
+                # Normal case: Crop and Resize
+                try:
+                    img = Image.open(src_file)
+                    original_size = img.size # (width, height)
+                    
+                    # Validate crop bounds
+                    cw, ch = original_size
+                    cx = max(0, min(x, cw - 1))
+                    cy = max(0, min(y, ch - 1))
+                    cw_crop = min(w, cw - cx)
+                    ch_crop = min(h, ch - cy)
+                    
+                    if cw_crop <= 0 or ch_crop <= 0:
+                         # Fallback to copy if crop is invalid
+                         shutil.copy2(src_file, dest_file)
+                    else:
+                        # Crop
+                        cropped_img = img.crop((cx, cy, cx + cw_crop, cy + ch_crop))
+                        
+                        # Resize back to original size
+                        resized_img = cropped_img.resize(original_size, Image.Resampling.LANCZOS)
+                        
+                        # Save
+                        # Preservation of format is handled by save() based on extension or img.format
+                        # If original was PNG with P mode (palette), we might want to convert to RGB/RGBA first to avoid issues with resizing?
+                        # But Image.open usually handles it.
+                        
+                        resized_img.save(dest_file)
+                except Exception as e:
+                    print(f"Error processing {src_file}: {e}")
+                    # Fallback copy on error?
+                    shutil.copy2(src_file, dest_file)
+            
+            processed_files.append(str(dest_file.relative_to(BASE_DIR)))
+            
+            # Handle Caption (only for img folder)
+            if folder_name == 'img':
+                txt_src = src_folder / f"{basename}.txt"
+                if txt_src.exists():
+                    txt_dest = src_folder / f"{new_basename}.txt"
+                    shutil.copy2(txt_src, txt_dest)
+
+        return jsonify({
+            'success': True,
+            'newBasename': new_basename,
+            'processed': processed_files
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")
