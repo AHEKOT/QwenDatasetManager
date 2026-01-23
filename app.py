@@ -610,7 +610,11 @@ def export_dataset():
             copied_count = 0
             for file_path in files:
                 dest_path = export_folder / file_path.name
-                shutil.copy2(str(file_path), str(dest_path))
+                try:
+                    shutil.copy2(str(file_path), str(dest_path))
+                except OSError:
+                     # Fallback if metadata copy fails (e.g. invalid argument on exFAT)
+                    shutil.copy(str(file_path), str(dest_path))
                 copied_count += 1
             
             exported[src_folder] = {
