@@ -734,7 +734,7 @@ class ImageEditor {
 
                 // Refresh grid if needed
                 if (window.onImageSaved) {
-                    window.onImageSaved(); // This reloads the grid
+                    window.onImageSaved(true); // reloadList = true
                 }
             } else {
                 alert(`Failed to create augment: ${data.error}`);

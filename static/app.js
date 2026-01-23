@@ -55,14 +55,21 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Global callback for editor to notify when image is saved
-window.onImageSaved = function() {
+// Global callback for editor to notify when image is saved
+window.onImageSaved = function (reloadList = false) {
     cacheBuster = Date.now();
     updatePreview();
-    // Also refresh the grid thumbnail for this image
-    const gridImg = document.querySelector(`.image-item:nth-child(${currentIndex + 1}) img`);
-    if (gridImg) {
-        const src = gridImg.src.split('?')[0];
-        gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+
+    if (reloadList) {
+        // Reload the entire grid (for new images)
+        loadImages(currentFolder);
+    } else {
+        // Just refresh the grid thumbnail for this image
+        const gridImg = document.querySelector(`.image-item:nth-child(${currentIndex + 1}) img`);
+        if (gridImg) {
+            const src = gridImg.src.split('?')[0];
+            gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+        }
     }
 };
 
@@ -338,7 +345,7 @@ function updatePreview() {
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
     const imageContainer = document.querySelector('.image-container');
-    
+
     if (!imageContainer) {
         console.error('imageContainer not found');
         return;
@@ -783,13 +790,13 @@ async function loadCaption(filename) {
         captionText.value = 'Loading...';
         const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`);
         const data = await response.json();
-        
+
         if (data.error) {
             console.error('Error loading caption:', data.error);
             captionText.value = '';
             return;
         }
-        
+
         captionText.value = data.caption || '';
     } catch (error) {
         console.error('Failed to load caption:', error);
@@ -800,10 +807,10 @@ async function loadCaption(filename) {
 // Save current caption
 async function saveCurrentCaption() {
     if (images.length === 0) return;
-    
+
     const filename = images[currentIndex];
     const caption = captionText.value;
-    
+
     try {
         saveCaptionBtn.disabled = true;
         const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`, {
@@ -811,9 +818,9 @@ async function saveCurrentCaption() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ caption })
         });
-        
+
         const data = await response.json();
-        
+
         if (data.success) {
             console.log('Caption saved successfully');
             // Visual feedback
