@@ -3,3 +3,6 @@
 # Ignore dataset contents but keep folder
 Datasets/*
 !Datasets/.gitkeep
+.venv
+__pycache__
+
