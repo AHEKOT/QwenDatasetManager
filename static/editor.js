@@ -1,11 +1,13 @@
 // Image Editor Module
 class ImageEditor {
-    constructor(canvas, targetImageElement, controlImageElement, overlayElement) {
+    constructor(canvas, targetImageElement, controlImageElement, overlayElement, subfolder = 'img') {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { willReadFrequently: true });
         this.targetImageElement = targetImageElement;
         this.controlImageElement = controlImageElement;
         this.overlayElement = overlayElement;
+        this.subfolder = subfolder;
+        this.onStateChange = null;
 
         this.currentTool = null;
         this.brushSize = 10;
@@ -23,6 +25,10 @@ class ImageEditor {
         this.cloneSource = null;
         this.stampOffset = { x: 0, y: 0 };
 
+        // Spray state
+        this.sprayInterval = null;
+        this.sprayDensity = 0.5; // Dots per pixel area per tick approx
+
         // Crop state
         this.selectionRect = null; // {x, y, w, h} in canvas coordinates
         this.isSelecting = false;
@@ -38,6 +44,19 @@ class ImageEditor {
         this.lastDrawY = 0;
         this.lastMouseX = 0;
         this.lastMouseY = 0;
+
+        // Optimized Blur Buffers
+        this.blurBuffer = document.createElement('canvas'); // For grabbing a chunk
+        this.blurBufferCtx = this.blurBuffer.getContext('2d');
+
+        this.blurSmallBuffer = document.createElement('canvas'); // For downscaling
+        this.blurSmallBuffer.width = 32;
+        this.blurSmallBuffer.height = 32;
+        this.blurSmallBufferCtx = this.blurSmallBuffer.getContext('2d');
+        this.blurSmallBufferCtx.imageSmoothingEnabled = true;
+
+        this.blurMaskBuffer = document.createElement('canvas'); // For circular mask
+        this.blurMaskCtx = this.blurMaskBuffer.getContext('2d');
 
         this.setupCanvas();
         this.setupEventListeners();
@@ -141,6 +160,10 @@ class ImageEditor {
             this.overlayElement.style.left = '0';
             this.overlayElement.style.top = '0';
         }
+
+        if (this.onStateChange) {
+            this.onStateChange();
+        }
     }
 
     setupEventListeners() {
@@ -153,7 +176,7 @@ class ImageEditor {
         this.canvas.parentElement.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
 
         // Tools
-        const toolButtons = ['brush', 'picker', 'stamp', 'eraser', 'crop'];
+        const toolButtons = ['brush', 'picker', 'spray', 'blur', 'distort', 'stamp', 'eraser', 'crop'];
         toolButtons.forEach(tool => {
             const btn = document.getElementById(`${tool}-tool`);
             if (btn) btn.addEventListener('click', () => this.selectTool(tool));
@@ -243,6 +266,12 @@ class ImageEditor {
                 this.selectTool('eraser');
             } else if (e.key === '5' || e.key === 'c') {
                 this.selectTool('crop');
+            } else if (e.key === 'a' || e.key === '6') {
+                this.selectTool('spray');
+            } else if (e.key === 'b' || e.key === '7') {
+                this.selectTool('blur');
+            } else if (e.key === 'd' || e.key === '8') {
+                this.selectTool('distort');
             }
         });
     }
@@ -345,6 +374,21 @@ class ImageEditor {
                     this.lastDrawX = coords.x;
                     this.lastDrawY = coords.y;
                     this.drawPoint(coords.x, coords.y);
+                } else if (this.currentTool === 'spray') {
+                    this.isDrawing = true;
+                    this.lastDrawX = coords.x;
+                    this.lastDrawY = coords.y;
+                    this.startSpray(coords.x, coords.y);
+                } else if (this.currentTool === 'blur') {
+                    this.isDrawing = true;
+                    this.lastDrawX = coords.x;
+                    this.lastDrawY = coords.y;
+                    this.applyLocalBlur(coords.x, coords.y);
+                } else if (this.currentTool === 'distort') {
+                    this.isDrawing = true;
+                    this.lastDrawX = coords.x;
+                    this.lastDrawY = coords.y;
+                    this.applyLocalDistort(coords.x, coords.y);
                 } else if (this.currentTool === 'eraser') {
                     this.isDrawing = true;
                     this.lastDrawX = coords.x;
@@ -403,6 +447,14 @@ class ImageEditor {
                 this.eraseLine(this.lastDrawX, this.lastDrawY, coords.x, coords.y);
             } else if (this.currentTool === 'stamp' && this.cloneSource) {
                 this.stampLine(this.lastDrawX, this.lastDrawY, coords.x, coords.y);
+            } else if (this.currentTool === 'spray') {
+                // Just update position, the interval handles the drawing
+                // But we optionally spray along the line if mouse moves fast? 
+                // Classic paint just sprays at current pos.
+            } else if (this.currentTool === 'blur') {
+                this.blurLine(this.lastDrawX, this.lastDrawY, coords.x, coords.y);
+            } else if (this.currentTool === 'distort') {
+                this.distortLine(this.lastDrawX, this.lastDrawY, coords.x, coords.y);
             }
 
             this.lastDrawX = coords.x;
@@ -434,6 +486,9 @@ class ImageEditor {
 
         if (this.isDrawing) {
             this.isDrawing = false;
+            if (this.currentTool === 'spray') {
+                this.stopSpray();
+            }
             this.saveState();
         }
     }
@@ -563,6 +618,177 @@ class ImageEditor {
         }
     }
 
+    startSpray(x, y) {
+        if (this.sprayInterval) clearInterval(this.sprayInterval);
+
+        // Instant spray first tick
+        this.spray(x, y);
+
+        // Then interval
+        const fps = 30;
+        this.sprayInterval = setInterval(() => {
+            this.spray(this.lastDrawX, this.lastDrawY);
+        }, 1000 / fps);
+    }
+
+    stopSpray() {
+        if (this.sprayInterval) {
+            clearInterval(this.sprayInterval);
+            this.sprayInterval = null;
+        }
+    }
+
+    spray(x, y) {
+        const radius = this.brushSize / 2;
+        const area = Math.PI * radius * radius;
+        const dots = Math.max(1, Math.floor(area * 0.05)); // Density factor
+
+        this.ctx.fillStyle = this.brushColor;
+        this.ctx.globalAlpha = this.brushOpacity;
+
+        for (let i = 0; i < dots; i++) {
+            // Random point in circle
+            const angle = Math.random() * Math.PI * 2;
+            // Distribute uniformly in area (sqrt of random)
+            const r = Math.sqrt(Math.random()) * radius;
+
+            const dx = Math.cos(angle) * r;
+            const dy = Math.sin(angle) * r;
+
+            this.ctx.fillRect(Math.floor(x + dx), Math.floor(y + dy), 1, 1);
+        }
+
+        this.ctx.globalAlpha = 1;
+    }
+
+    blurLine(x1, y1, x2, y2) {
+        // Reduced frequency: step by half the brush size instead of 1/4
+        const stepSize = Math.max(1, this.brushSize / 2);
+        const steps = Math.ceil(Math.hypot(x2 - x1, y2 - y1) / stepSize);
+        for (let i = 0; i <= steps; i++) {
+            const t = steps > 0 ? i / steps : 0;
+            const x = x1 + (x2 - x1) * t;
+            const y = y1 + (y2 - y1) * t;
+            this.applyLocalBlur(x, y);
+        }
+    }
+
+    applyLocalBlur(x, y) {
+        const radius = this.brushSize / 2;
+        const brushSize = Math.ceil(radius * 2);
+
+        // Define source rectangle on main canvas
+        let sx = Math.floor(x - radius);
+        let sy = Math.floor(y - radius);
+        let sw = brushSize;
+        let sh = brushSize;
+
+        // Clipped source bounds
+        let csx = Math.max(0, sx);
+        let csy = Math.max(0, sy);
+        let csw = Math.min(this.canvas.width, sx + sw) - csx;
+        let csh = Math.min(this.canvas.height, sy + sh) - csy;
+
+        if (csw <= 0 || csh <= 0) return;
+
+        // Resize blurBuffer only if needed
+        if (this.blurBuffer.width < csw || this.blurBuffer.height < csh) {
+            this.blurBuffer.width = Math.max(csw, 128);
+            this.blurBuffer.height = Math.max(csh, 128);
+            this.blurBufferCtx.imageSmoothingEnabled = true;
+        }
+
+        // 1. Grab chunk from main canvas
+        this.blurBufferCtx.clearRect(0, 0, csw, csh);
+        this.blurBufferCtx.drawImage(this.canvas, csx, csy, csw, csh, 0, 0, csw, csh);
+
+        // 2. Perform downscale/upscale (already using pre-cached 32x32 filter)
+        // Down
+        this.blurSmallBufferCtx.drawImage(this.blurBuffer, 0, 0, csw, csh, 0, 0, 32, 32);
+
+        // Up back to blurBuffer (replaces chunk with blurry version)
+        this.blurBufferCtx.save();
+        this.blurBufferCtx.globalCompositeOperation = 'copy';
+        this.blurBufferCtx.drawImage(this.blurSmallBuffer, 0, 0, 32, 32, 0, 0, csw, csh);
+        this.blurBufferCtx.restore();
+
+        // 3. Draw back to main context using clipping for circular brush shape
+        // This is more robust than separate mask buffer because clip path handles edge offsets automatically
+        this.ctx.save();
+        this.ctx.beginPath();
+        this.ctx.arc(x, y, radius, 0, Math.PI * 2);
+        this.ctx.clip();
+
+        this.ctx.globalAlpha = this.brushOpacity;
+        this.ctx.drawImage(this.blurBuffer, 0, 0, csw, csh, csx, csy, csw, csh);
+        this.ctx.restore();
+    }
+
+    distortLine(x1, y1, x2, y2) {
+        const stepSize = Math.max(1, this.brushSize / 2);
+        const steps = Math.ceil(Math.hypot(x2 - x1, y2 - y1) / stepSize);
+        for (let i = 0; i <= steps; i++) {
+            const t = steps > 0 ? i / steps : 0;
+            const x = x1 + (x2 - x1) * t;
+            const y = y1 + (y2 - y1) * t;
+            this.applyLocalDistort(x, y);
+        }
+    }
+
+    applyLocalDistort(x, y) {
+        const radius = this.brushSize / 2;
+        const brushSize = Math.ceil(radius * 2);
+
+        // Define source rectangle
+        let sx = Math.floor(x - radius);
+        let sy = Math.floor(y - radius);
+
+        let csx = Math.max(0, sx);
+        let csy = Math.max(0, sy);
+        let csw = Math.min(this.canvas.width, sx + brushSize) - csx;
+        let csh = Math.min(this.canvas.height, sy + brushSize) - csy;
+
+        if (csw <= 0 || csh <= 0) return;
+
+        // Ensure buffer is ready
+        if (this.blurBuffer.width < csw || this.blurBuffer.height < csh) {
+            this.blurBuffer.width = Math.max(csw, 128);
+            this.blurBuffer.height = Math.max(csh, 128);
+        }
+
+        // 1. Grab chunk
+        this.blurBufferCtx.clearRect(0, 0, csw, csh);
+        this.blurBufferCtx.drawImage(this.canvas, csx, csy, csw, csh, 0, 0, csw, csh);
+
+        // 2. Pixelate (extreme downscale/upscale with smoothing off)
+        const blockSize = 24; // Fixed size for blockiness
+        this.blurSmallBufferCtx.imageSmoothingEnabled = false;
+        this.blurSmallBufferCtx.drawImage(this.blurBuffer, 0, 0, csw, csh, 0, 0, blockSize, blockSize);
+
+        this.blurBufferCtx.save();
+        this.blurBufferCtx.imageSmoothingEnabled = false;
+        this.blurBufferCtx.globalCompositeOperation = 'copy';
+        this.blurBufferCtx.drawImage(this.blurSmallBuffer, 0, 0, blockSize, blockSize, 0, 0, csw, csh);
+        this.blurBufferCtx.restore();
+
+        // 3. Draw back with Ghosting effect
+        this.ctx.save();
+        this.ctx.beginPath();
+        this.ctx.arc(x, y, radius, 0, Math.PI * 2);
+        this.ctx.clip();
+
+        // Layer 1: Base pixelated
+        this.ctx.globalAlpha = this.brushOpacity;
+        this.ctx.drawImage(this.blurBuffer, 0, 0, csw, csh, csx, csy, csw, csh);
+
+        // Layer 2: Offset Ghosting (doubling)
+        const offset = Math.max(2, this.brushSize / 10);
+        this.ctx.globalAlpha = this.brushOpacity * 0.5;
+        this.ctx.drawImage(this.blurBuffer, 0, 0, csw, csh, csx + offset, csy + offset, csw, csh);
+
+        this.ctx.restore();
+    }
+
     pickColor(coords) {
         try {
             const imageData = this.ctx.getImageData(Math.floor(coords.x), Math.floor(coords.y), 1, 1);
@@ -631,11 +857,19 @@ class ImageEditor {
     }
 
     updateUndoButton() {
+        if (this.onStateChange) {
+            this.onStateChange();
+            return;
+        }
         const undoBtn = document.getElementById('undo-btn');
         if (undoBtn) undoBtn.disabled = this.history.length <= 1;
     }
 
     updateSaveButton() {
+        if (this.onStateChange) {
+            this.onStateChange();
+            return;
+        }
         const saveBtn = document.getElementById('save-edit-btn');
         if (saveBtn) saveBtn.disabled = this.history.length <= 1;
     }
@@ -665,7 +899,7 @@ class ImageEditor {
             const formData = new FormData();
             formData.append('file', blob, this.currentFilename);
 
-            const response = await fetch(`/api/save/${encodeURIComponent(this.currentFilename)}?folder=${encodeURIComponent(this.currentFolder)}`, {
+            const response = await fetch(`/api/save/${encodeURIComponent(this.currentFilename)}?folder=${encodeURIComponent(this.currentFolder)}&subfolder=${encodeURIComponent(this.subfolder)}`, {
                 method: 'POST',
                 body: formData
             });

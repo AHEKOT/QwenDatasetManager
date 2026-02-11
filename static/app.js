@@ -10,7 +10,8 @@ let allFolders = []; // Store all folders for target selection
 let activeControlView = null; // Which control is shown in full preview (null = original image)
 let comparisonControlView = null; // Which control is shown in comparison view (null = hidden)
 let linkedDataset = null; // Linked dataset for synchronized operations
-let imageEditor = null; // Image editor instance
+let mainEditor = null; // Main editor instance
+let comparisonEditor = null; // Comparison editor instance
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -26,9 +27,12 @@ const closeBtn = document.getElementById('close-modal');
 const prevBtn = document.getElementById('prev-btn');
 const nextBtn = document.getElementById('next-btn');
 const toggleBtn = document.getElementById('toggle-overlay');
+const duplicateBtn = document.getElementById('duplicate-btn');
+const pixelmatorBtn = document.getElementById('pixelmator-btn');
 const deleteBtn = document.getElementById('delete-btn');
 const reshuffleBtn = document.getElementById('reshuffle-btn');
 const compressBtn = document.getElementById('compress-btn');
+const fitBtn = document.getElementById('fit-btn');
 const exportBtn = document.getElementById('export-btn');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
@@ -54,7 +58,24 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
 });
 
-// Global callback for editor to notify when image is saved
+
+
+
+// Sync Save and Undo buttons based on both editors
+function syncEditorButtons() {
+    const undoBtn = document.getElementById('undo-btn');
+    const saveBtn = document.getElementById('save-edit-btn');
+
+    const hasUndo = (mainEditor && mainEditor.history.length > 1) ||
+        (comparisonEditor && comparisonEditor.history.length > 1);
+
+    const hasChanges = (mainEditor && mainEditor.history.length > 1) ||
+        (comparisonEditor && comparisonEditor.history.length > 1);
+
+    if (undoBtn) undoBtn.disabled = !hasUndo;
+    if (saveBtn) saveBtn.disabled = !hasChanges;
+}
+
 // Global callback for editor to notify when image is saved
 window.onImageSaved = function (reloadList = false) {
     cacheBuster = Date.now();
@@ -403,33 +424,70 @@ function updatePreview() {
     }
 
     // Force canvas update if image is already loaded (e.g. toggling comparison)
-    if (imageEditor && previewImg.complete) {
-        setTimeout(() => imageEditor.updateCanvasSize(), 50);
+    if (mainEditor && previewImg.complete) {
+        setTimeout(() => mainEditor.fitToScreen(), 50);
+    }
+    if (comparisonEditor && comparisonImg.complete) {
+        setTimeout(() => comparisonEditor.fitToScreen(), 50);
     }
 
-    // Initialize canvas editor
+    // Initialize main canvas editor
     previewImg.onload = () => {
-
         const controlImg = new Image();
         controlImg.crossOrigin = 'anonymous';
         controlImg.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
         controlImg.onload = () => {
             const canvas = document.getElementById('edit-canvas');
-            if (!imageEditor) {
-                imageEditor = new ImageEditor(canvas, previewImg, controlImg, previewControl);
+            const subfolder = activeControlView || 'img';
+            if (!mainEditor) {
+                mainEditor = new ImageEditor(canvas, previewImg, controlImg, previewControl, subfolder);
+                mainEditor.onStateChange = syncEditorButtons;
             } else {
-                imageEditor.targetImageElement = previewImg;
-                imageEditor.controlImageElement = controlImg;
-                imageEditor.overlayElement = previewControl;
-                imageEditor.setupCanvas();
-                imageEditor.history = [];
-                imageEditor.saveState();
+                mainEditor.targetImageElement = previewImg;
+                mainEditor.controlImageElement = controlImg;
+                mainEditor.overlayElement = previewControl;
+                mainEditor.subfolder = subfolder;
+                mainEditor.onStateChange = syncEditorButtons;
+                mainEditor.setupCanvas();
+                mainEditor.history = [];
+                mainEditor.saveState();
             }
-            imageEditor.currentFilename = filename;
-            imageEditor.currentFolder = currentFolder;
-            imageEditor.updateSaveButton();
+            mainEditor.currentFilename = filename;
+            mainEditor.currentFolder = currentFolder;
+            mainEditor.updateSaveButton();
         };
     };
+
+    // Initialize comparison canvas editor if comparison mode is active
+    if (comparisonControlView) {
+        comparisonImg.onload = () => {
+            const comparisonCanvas = document.getElementById('comparison-canvas');
+            // For comparison editor, we don't have an overlay or control image to erase from (usually)
+            // But we can use the main img as the control source for stamp/eraser if we want? 
+            // For now, use comparisonImg itself as its own control.
+
+            if (!comparisonEditor) {
+                comparisonEditor = new ImageEditor(comparisonCanvas, comparisonImg, comparisonImg, null, comparisonControlView);
+                comparisonEditor.onStateChange = syncEditorButtons;
+            } else {
+                comparisonEditor.targetImageElement = comparisonImg;
+                comparisonEditor.controlImageElement = comparisonImg;
+                comparisonEditor.subfolder = comparisonControlView;
+                comparisonEditor.onStateChange = syncEditorButtons;
+                comparisonEditor.setupCanvas();
+                comparisonEditor.history = [];
+                comparisonEditor.saveState();
+            }
+            comparisonEditor.currentFilename = filename;
+            comparisonEditor.currentFolder = currentFolder;
+            comparisonEditor.updateSaveButton();
+        };
+    } else {
+        // Clear comparison editor if not in comparison mode
+        if (comparisonEditor) {
+            comparisonEditor.reset(); // Or hide?
+        }
+    }
 
     // Load control thumbnails
     loadControlThumbnails(filename);
@@ -604,6 +662,60 @@ async function transferCurrentImage() {
     }
 }
 
+// Duplicate current image set
+async function duplicateCurrentImage() {
+    if (images.length === 0) return;
+
+    const filename = images[currentIndex];
+
+    try {
+        duplicateBtn.disabled = true;
+        duplicateBtn.textContent = '...';
+
+        const response = await fetch('/api/augment/duplicate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                folder: currentFolder,
+                filename: filename
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Add new image to list immediately after current
+            const newIndex = currentIndex + 1;
+            images.splice(newIndex, 0, data.newFilename);
+
+            // Switch to it
+            currentIndex = newIndex;
+
+            // Render updated grid and preview
+            renderImageGrid();
+            updateImageCount();
+            updatePreview();
+
+            console.log('Duplicated to:', data.newFilename);
+        } else {
+            alert(`Failed to duplicate: ${data.error}`);
+        }
+
+    } catch (error) {
+        console.error('Duplicate failed:', error);
+        alert('Failed to duplicate. Check console.');
+    } finally {
+        duplicateBtn.disabled = false;
+        duplicateBtn.innerHTML = `
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                Duplicate
+            `;
+    }
+}
+
 // Delete current image set
 async function deleteCurrentImage() {
     if (images.length === 0) return;
@@ -702,6 +814,38 @@ async function reshuffleDataset() {
 }
 
 // Compress dataset
+async function fitDataset() {
+    if (!currentFolder) return;
+
+    if (!confirm('Resize/Letterbox all control images (Control1-3) to match primary images (img folder)?\nThis will add black bars if aspect ratios differ.')) return;
+
+    fitBtn.disabled = true;
+    fitBtn.textContent = 'Processing...';
+
+    try {
+        const response = await fetch(`/api/dataset/fit?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST'
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            alert(`Success!\nProcessed: ${data.processed} image sets\nUpdated (resized): ${data.updated} control images`);
+            // Cache buster and refresh if we are currently looking at optimized/resized images
+            cacheBuster = Date.now();
+            updatePreview();
+        } else {
+            alert(`Failed: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Fit dataset error:', error);
+        alert('Failed to process dataset');
+    } finally {
+        fitBtn.disabled = false;
+        fitBtn.textContent = 'Fit';
+    }
+}
+
 async function compressDataset() {
     if (!currentFolder) {
         alert('Please select a dataset folder first.');
@@ -861,6 +1005,41 @@ async function saveCurrentCaption() {
     }
 }
 
+// Open current image pair in Pixelmator Pro
+async function openInPixelmator() {
+    if (images.length === 0) return;
+
+    const filename = images[currentIndex];
+
+    try {
+        pixelmatorBtn.disabled = true;
+        pixelmatorBtn.classList.add('loading');
+
+        const response = await fetch('/api/open-in-pixelmator', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                folder: currentFolder,
+                filename: filename
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            console.log('Opened in Pixelmator Pro');
+        } else {
+            alert(`Failed to open in Pixelmator: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Pixelmator opening failed:', error);
+        alert('Failed to call Pixelmator API. Check console.');
+    } finally {
+        pixelmatorBtn.disabled = false;
+        pixelmatorBtn.classList.remove('loading');
+    }
+}
+
 // Event listeners
 function setupEventListeners() {
     // Folder selection
@@ -877,11 +1056,14 @@ function setupEventListeners() {
     prevBtn.addEventListener('click', showPrevious);
     nextBtn.addEventListener('click', showNext);
     toggleBtn.addEventListener('click', toggleOverlay);
+    duplicateBtn.addEventListener('click', duplicateCurrentImage);
+    pixelmatorBtn.addEventListener('click', openInPixelmator);
     deleteBtn.addEventListener('click', deleteCurrentImage);
     transferBtn.addEventListener('click', transferCurrentImage);
     saveCaptionBtn.addEventListener('click', saveCurrentCaption);
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
+    fitBtn.addEventListener('click', fitDataset);
     exportBtn.addEventListener('click', exportDataset);
 
     // Target dataset selection
@@ -944,10 +1126,13 @@ function setupEventListeners() {
                 toggleOverlay();
                 break;
             case 'ArrowUp':
-                e.preventDefault();
                 if (targetFolder) {
                     transferCurrentImage();
                 }
+                break;
+            case 'p':
+            case 'P':
+                openInPixelmator();
                 break;
         }
     });

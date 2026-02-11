@@ -19,8 +19,9 @@ class QwenDatasetLoader:
         return {
             "required": {
                 "dataset_path": ("STRING", {"default": "", "multiline": False}),
-                "mode": (["Manual", "List"],),
+                "mode": (["Manual", "List", "Random"],),
                 "manual_filename": ("STRING", {"default": "image_00001.png"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             }
         }
     
@@ -43,7 +44,7 @@ class QwenDatasetLoader:
         img = Image.new('RGB', size, (0, 0, 0))
         return self.pil_to_tensor(img)
         
-    def load_dataset(self, dataset_path, mode, manual_filename="image_00001.png"):
+    def load_dataset(self, dataset_path, mode, manual_filename="image_00001.png", seed=0):
         dataset_path = dataset_path.strip()
         
         # 1. Try absolute path
@@ -91,6 +92,10 @@ class QwenDatasetLoader:
                  if not found:
                      print(f"Available files: {all_files[:5]}...") # Debug info
                      raise ValueError(f"Filename '{manual_filename}' not found in dataset. Ensure exact match.")
+        elif mode == "Random":
+            import random
+            random.seed(seed)
+            files_to_process = [random.choice(all_files)]
         else: # List mode
             files_to_process = all_files
             

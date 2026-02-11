@@ -26,6 +26,7 @@ def save_image(filename):
     """Save an edited image to the dataset"""
     try:
         folder = request.args.get('folder')
+        subfolder = request.args.get('subfolder', 'img')
         if not folder:
             return jsonify({'error': 'Folder parameter is required'}), 400
             
@@ -37,8 +38,8 @@ def save_image(filename):
             return jsonify({'error': 'No selected file'}), 400
             
         # Construct path
-        # We are saving to the 'img' subfolder of the dataset
-        save_path = DATASETS_DIR / folder / 'img' / filename
+        # We save to the specified subfolder (default 'img')
+        save_path = DATASETS_DIR / folder / subfolder / filename
         
         if not save_path.parent.exists():
             return jsonify({'error': 'Dataset folder not found'}), 404
@@ -762,6 +763,247 @@ def augment_crop():
             'processed': processed_files
         })
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/augment/duplicate', methods=['POST'])
+def augment_duplicate():
+    """Duplicate the current image pair and caption"""
+    try:
+        data = request.get_json() or {}
+        folder_path = data.get('folder', '')
+        filename = data.get('filename', '')
+        
+        if not folder_path or not filename:
+             return jsonify({'error': 'Folder and filename are required'}), 400
+             
+        dataset_dir = DATASETS_DIR / folder_path
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+            
+        # Generate new unique basename
+        import string
+        chars = string.ascii_lowercase + string.digits
+        
+        def generate_unique_name():
+            existing_names = set()
+            img_dir = dataset_dir / 'img'
+            if img_dir.exists():
+                for f in img_dir.iterdir():
+                    existing_names.add(f.stem)
+            
+            while True:
+                name = ''.join(random.choices(chars, k=8))
+                if name not in existing_names:
+                    return name
+                    
+        new_basename = generate_unique_name()
+        
+        # Process each folder
+        folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
+        processed_files = []
+        
+        basename = os.path.splitext(filename)[0]
+        original_ext = os.path.splitext(filename)[1]
+        
+        for folder_name in folders_to_process:
+            src_folder = dataset_dir / folder_name
+            
+            # Find the file in this folder (might have different extension)
+            src_file = None
+            for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                temp_path = src_folder / f"{basename}{ext}"
+                if temp_path.exists():
+                    src_file = temp_path
+                    break
+            
+            if not src_file:
+                continue
+                
+            dest_file = src_folder / f"{new_basename}{src_file.suffix}"
+            shutil.copy2(src_file, dest_file)
+            processed_files.append(str(dest_file.relative_to(BASE_DIR)))
+            
+            # Handle Caption (only for img folder)
+            if folder_name == 'img':
+                txt_src = src_folder / f"{basename}.txt"
+                if txt_src.exists():
+                    txt_dest = src_folder / f"{new_basename}.txt"
+                    shutil.copy2(txt_src, txt_dest)
+
+        return jsonify({
+            'success': True,
+            'newBasename': new_basename,
+            'newFilename': f"{new_basename}{original_ext}",
+            'processed': processed_files
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/dataset/fit', methods=['POST'])
+def fit_dataset():
+    """Resize/Letterbox all control images to match their corresponding primary images (img folder)"""
+    folder_path = request.args.get('folder', '')
+    
+    try:
+        from PIL import Image, ImageOps
+        
+        dataset_dir = DATASETS_DIR / folder_path
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+            
+        img_dir = dataset_dir / 'img'
+        control_folders = ['Control1', 'Control2', 'Control3']
+        
+        if not img_dir.exists():
+            return jsonify({'error': 'Primary image directory (img) not found'}), 404
+            
+        processed_count = 0
+        updated_count = 0
+        
+        # Get all image files from img folder
+        primary_images = {}
+        for f in img_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                primary_images[f.stem] = f
+                
+        if not primary_images:
+            return jsonify({'error': 'No primary images found in img folder'}), 404
+            
+        for basename, primary_path in primary_images.items():
+            processed_count += 1
+            
+            # Get target size from primary image
+            with Image.open(primary_path) as p_img:
+                target_size = p_img.size  # (W, H)
+                
+            for ctrl_folder in control_folders:
+                ctrl_dir = dataset_dir / ctrl_folder
+                if not ctrl_dir.exists():
+                    continue
+                    
+                # Find matching control image (any common extension)
+                ctrl_path = None
+                for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                    temp_path = ctrl_dir / f"{basename}{ext}"
+                    if temp_path.exists():
+                        ctrl_path = temp_path
+                        break
+                
+                if not ctrl_path:
+                    continue
+                    
+                # Process the control image
+                with Image.open(ctrl_path) as c_img:
+                    # If already correct size, skip
+                    if c_img.size == target_size:
+                        continue
+                        
+                    # Calculate new size with letterboxing (preserving aspect ratio)
+                    # ImageOps.pad is perfect for this.
+                    # It creates a background of target_size and pastes the resized image centered with bars.
+                    # Default is centered, background color black.
+                    new_img = ImageOps.pad(c_img, target_size, color=(0, 0, 0), centering=(0.5, 0.5))
+                    
+                    # Save back to original path
+                    # We preserve the original format
+                    new_img.save(ctrl_path)
+                    updated_count += 1
+                    
+        return jsonify({
+            'success': True, 
+            'processed': processed_count, 
+            'updated': updated_count
+        })
+        
+    except ImportError:
+        return jsonify({'error': 'Pillow library not installed'}), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/open-in-pixelmator', methods=['POST'])
+def open_in_pixelmator():
+    """Open all images from a pair as layers in Pixelmator Pro using AppleScript"""
+    try:
+        data = request.get_json() or {}
+        folder_path = data.get('folder', '')
+        filename = data.get('filename', '')
+        
+        if not folder_path or not filename:
+             return jsonify({'error': 'Folder and filename are required'}), 400
+             
+        dataset_dir = DATASETS_DIR / folder_path
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+            
+        basename = os.path.splitext(filename)[0]
+        folders_to_check = ['img', 'Control1', 'Control2', 'Control3']
+        image_paths = []
+        
+        # Collect all existing images for this pair
+        for folder_name in folders_to_check:
+            folder = dataset_dir / folder_name
+            if not folder.exists():
+                continue
+                
+            for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                file_path = folder / f"{basename}{ext}"
+                if file_path.exists():
+                    image_paths.append(str(file_path.absolute()))
+                    break
+        
+        if not image_paths:
+            return jsonify({'error': 'No images found to open'}), 404
+            
+        # Reverse image_paths so the main image ('img') is added last 
+        # and appears as the top layer in Pixelmator Pro.
+        image_paths.reverse()
+        
+        paths_string = '", "'.join(image_paths)
+        
+        # AppleScript to open images as layers
+        # 1. Open first image to create document
+        # 2. Add remaining as image layers
+        applescript = f'''
+        set imgPaths to {{"{paths_string}"}}
+        set imgAliases to {{}}
+        repeat with p in imgPaths
+            set end of imgAliases to (POSIX file p) as alias
+        end repeat
+
+        tell application "Pixelmator Pro"
+            activate
+            open item 1 of imgAliases
+            set doc to front document
+            
+            repeat with i from 2 to (count of imgAliases)
+                set nextAlias to item i of imgAliases
+                tell doc
+                    make new image layer with properties {{file:nextAlias}}
+                end tell
+            end repeat
+        end tell
+        '''
+        
+        import subprocess
+        process = subprocess.Popen(['osascript', '-e', applescript], 
+                                   stdout=subprocess.PIPE, 
+                                   stderr=subprocess.PIPE, 
+                                   text=True)
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            return jsonify({'error': f'AppleScript failed: {stderr}'}), 500
+            
+        return jsonify({'success': True})
+        
     except Exception as e:
         import traceback
         traceback.print_exc()

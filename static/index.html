@@ -29,6 +29,13 @@
                     </svg>
                     Compress
                 </button>
+                <button id="fit-btn" class="action-btn" title="Resize/Letterbox controls to match img">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <path d="M7 10h10M7 14h10"></path>
+                    </svg>
+                    Fit
+                </button>
                 <button id="export-btn" class="action-btn export-btn" title="Export to AI-Toolkit format">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
@@ -87,14 +94,36 @@
                             </svg>
                             Picker
                         </button>
+                        <button class="tool-btn" id="spray-tool" title="Spray (A)" data-tool="spray">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M7 6c.55 0 1 .45 1 1v2c0 .55-.45 1-1 1s-1-.45-1-1V7c0-.55.45-1 1-1zm3.66 6.83l-1.42 1.41c-.63.63-.82 1.56-.53 2.38l1.45 4.19c.14.4.52.68.94.68.74 0 1.25-.76.99-1.45L11.1 17.5c-.09-.24-.04-.52.14-.7l.99-1.01-1.57-2.96zM18 4H5c-1.1 0-2 .9-2 2v6h2.24l2.43 4.54c-.21.11-.43.23-.62.39l-4.22 3.52c-.63.53-.41 1.55.42 1.55h11.5c.83 0 1.5-.67 1.5-1.5V6c0-1.1-.9-2-2-2zm-1 2h-3v3h3V6zm-5 0h-3v3h3V6z">
+                                </path>
+                            </svg>
+                            Spray
+                        </button>
                         <button class="tool-btn" id="stamp-tool" title="Clone Stamp (S)" data-tool="stamp">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                 <path
-                                    d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zm-5.04-6.71l-2.75 3.54h2.63l2.96 3.83c.52.68 1.53.71 2.08.05.54-.65.54-1.72 0-2.36L13.96 9.29z" />
+                                    d="M18 10h-1.26l-2.1-3.15c-.18-.28-.5-.45-.84-.45H9.2c-.34 0-.66.17-.84.45L6.26 10H5c-1.1 0-2 .9-2 2v6c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-6c0-1.1-.9-2-2-2zm-7 7c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z" />
                             </svg>
                             Stamp
                         </button>
-                        <button class="tool-btn" id="eraser-tool" title="Eraser (E)" data-tool="eraser">
+                        <button class="tool-btn" id="blur-tool" title="Blur (B)" data-tool="blur">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z" />
+                            </svg>
+                            Blur
+                        </button>
+                        <button class="tool-btn" id="distort-tool" title="Distort (D)" data-tool="distort">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-2h2v2zm0-4H7v-2h2v2zm0-4H7V7h2v2zm4 8h-2v-2h2v2zm0-4h-2v-2h2v2zm0-4h-2V7h2v2zm4 8h-2v-2h2v2zm0-4h-2v-2h2v2zm0-4h-2V7h2v2z" />
+                            </svg>
+                            Distort
+                        </button>
+                        <button class="tool-btn" id="eraser-tool" title="Eraser (E/4)" data-tool="eraser">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                 <path
                                     d="M16.24 3.56L21.19 8.5c.78.78.78 2.05 0 2.83L12.41 20.07c-.39.39-.9.58-1.41.58-.51 0-1.02-.19-1.41-.58l-8.16-8.16c-.78-.78-.78-2.05 0-2.83l4.95-4.95c.39-.39.9-.58 1.41-.58.51 0 1.02.19 1.41.58l.63.63 3.54-3.54c.39-.39.9-.58 1.41-.58.51 0 1.02.19 1.41.58zM5.41 20.41L12 13.82l7-7V20c0 .55-.45 1-1 1H5c-.55 0-1-.45-1-1v-2.59z" />
@@ -200,6 +229,7 @@
                 </div>
                 <div class="comparison-container" id="comparison-container">
                     <img id="comparison-img" src="" alt="Comparison">
+                    <canvas id="comparison-canvas"></canvas>
                 </div>
 
                 <div class="control-sidebar" id="control-sidebar">
@@ -257,6 +287,23 @@
                             <path d="M12 19V5M5 12l7-7 7 7"></path>
                         </svg>
                         Transfer (↑)
+                    </button>
+
+                    <button id="duplicate-btn" class="duplicate-btn" title="Duplicate Pair">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                        Duplicate
+                    </button>
+
+                    <button id="pixelmator-btn" class="action-btn" title="Open in Pixelmator Pro (P)">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+                        </svg>
+                        Pixelmator
                     </button>
 
                     <button id="delete-btn" class="delete-btn" title="Delete (Backspace)">

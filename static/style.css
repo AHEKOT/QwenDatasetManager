@@ -453,7 +453,8 @@ header h1 {
     z-index: 1;
 }
 
-#edit-canvas {
+#edit-canvas,
+#comparison-canvas {
     position: absolute;
     top: 0;
     left: 0;
@@ -463,7 +464,8 @@ header h1 {
     z-index: 10;
 }
 
-#edit-canvas.active {
+#edit-canvas.active,
+#comparison-canvas.active {
     display: block;
 }
 
@@ -563,6 +565,27 @@ header h1 {
 
 .toggle-btn.active {
     background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+}
+
+.duplicate-btn {
+    padding: 0.4rem 1rem;
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    border: none;
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.duplicate-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(59, 130, 246, 0.4);
 }
 
 .delete-btn {
