@@ -86,7 +86,7 @@ window.onImageSaved = function (reloadList = false) {
         loadImages(currentFolder);
     } else {
         // Just refresh the grid thumbnail for this image
-        const gridImg = document.querySelector(`.image-item:nth-child(${currentIndex + 1}) img`);
+        const gridImg = document.querySelector(`.image-item[data-index="${currentIndex}"] img`);
         if (gridImg) {
             const src = gridImg.src.split('?')[0];
             gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
@@ -309,11 +309,11 @@ function renderImageGrid() {
         return;
     }
 
-    imageGrid.innerHTML = '';
+    const fragment = document.createDocumentFragment();
     images.forEach((filename, index) => {
         const item = document.createElement('div');
         item.className = 'image-item';
-        item.onclick = () => openPreview(index);
+        item.dataset.index = index;
 
         const img = document.createElement('img');
         img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
@@ -326,8 +326,11 @@ function renderImageGrid() {
 
         item.appendChild(img);
         item.appendChild(filenameSpan);
-        imageGrid.appendChild(item);
+        fragment.appendChild(item);
     });
+
+    imageGrid.innerHTML = '';
+    imageGrid.appendChild(fragment);
 }
 
 // Update image count display
@@ -392,6 +395,11 @@ function updatePreview() {
         console.error('imageContainer not found');
         return;
     }
+
+    // Force-hide preview-img — it's only a data source for the canvas,
+    // never shown directly. Inline style ensures it works even with cached CSS.
+    previewImg.style.display = 'none';
+    comparisonImg.style.display = 'none';
 
     // Update comparison view FIRST - before changing src
     if (comparisonControlView) {
@@ -630,17 +638,25 @@ async function transferCurrentImage() {
             // Remove from images array (file was moved)
             images.splice(currentIndex, 1);
 
+            // Partial DOM update: remove the transferred element
+            const gridItem = imageGrid.querySelector(`.image-item[data-index="${currentIndex}"]`);
+            if (gridItem) {
+                gridItem.remove();
+                // Update indices for all subsequent items
+                const items = imageGrid.querySelectorAll('.image-item');
+                items.forEach((item, idx) => item.dataset.index = idx);
+            }
+
             // Update UI
             if (images.length === 0) {
                 closePreview();
-                renderImageGrid();
                 updateImageCount();
+                imageGrid.innerHTML = '<div class="empty-state"><p>📷 No images found in this folder</p></div>';
             } else {
                 if (currentIndex >= images.length) {
                     currentIndex = images.length - 1;
                 }
                 updatePreview();
-                renderImageGrid();
                 updateImageCount();
             }
 
@@ -737,18 +753,26 @@ async function deleteCurrentImage() {
             // Remove from images array
             images.splice(currentIndex, 1);
 
+            // Partial DOM update: remove the deleted element
+            const gridItem = imageGrid.querySelector(`.image-item[data-index="${currentIndex}"]`);
+            if (gridItem) {
+                gridItem.remove();
+                // Update indices for all subsequent items
+                const items = imageGrid.querySelectorAll('.image-item');
+                items.forEach((item, idx) => item.dataset.index = idx);
+            }
+
             // Update UI
             if (images.length === 0) {
                 closePreview();
-                renderImageGrid();
                 updateImageCount();
+                imageGrid.innerHTML = '<div class="empty-state"><p>📷 No images found in this folder</p></div>';
             } else {
                 // Adjust index if needed
                 if (currentIndex >= images.length) {
                     currentIndex = images.length - 1;
                 }
                 updatePreview();
-                renderImageGrid();
                 updateImageCount();
             }
 
@@ -1048,6 +1072,14 @@ function setupEventListeners() {
             createNewDataset();
         } else {
             loadImages(e.target.value);
+        }
+    });
+
+    // Image grid event delegation
+    imageGrid.addEventListener('click', (e) => {
+        const item = e.target.closest('.image-item');
+        if (item && item.dataset.index !== undefined) {
+            openPreview(parseInt(item.dataset.index));
         }
     });
 

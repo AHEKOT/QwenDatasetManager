@@ -144,6 +144,13 @@
                 <div class="panel-section" id="crop-settings-panel" style="display: none;">
                     <h3>Crop Settings</h3>
                     <div class="setting">
+                        <label for="crop-mode">Mode:</label>
+                        <select id="crop-mode" title="Choose the aspect ratio for cropping">
+                            <option value="keep">Keep Proportion</option>
+                            <option value="1:1">1:1 (Square)</option>
+                        </select>
+                    </div>
+                    <div class="setting">
                         <label for="crop-source-exception">Source Exception:</label>
                         <select id="crop-source-exception"
                             title="The selected folder will NOT be cropped (keeps original full image)">

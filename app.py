@@ -1,4 +1,5 @@
 from flask import Flask, send_from_directory, jsonify, request, send_file
+from concurrent.futures import ThreadPoolExecutor
 from flask_cors import CORS
 import os
 import random
@@ -340,16 +341,20 @@ def transfer_image(filename):
         
         def generate_unique_name(target_dataset_dir):
             """Generate a unique name that doesn't exist in target dataset"""
-            existing_names = set()
-            target_img_dir = target_dataset_dir / 'img'
-            if target_img_dir.exists():
-                for f in target_img_dir.iterdir():
-                    existing_names.add(f.stem)
-            
             while True:
                 import random
                 name = ''.join(random.choices(chars, k=8))
-                if name not in existing_names:
+                
+                # Efficient check: if any file with this stem exists in 'img'
+                # We check common extensions and the most likely .png
+                is_unique = True
+                target_img_dir = target_dataset_dir / 'img'
+                for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']:
+                    if (target_img_dir / f"{name}{ext}").exists():
+                        is_unique = False
+                        break
+                
+                if is_unique:
                     return name
         
         def transfer_from_dataset(src_folder, target_dataset_dir, src_basename):
@@ -508,56 +513,77 @@ def compress_dataset():
     
     try:
         from PIL import Image
-        
         dataset_dir = DATASETS_DIR / folder_path
         folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
         
-        compressed_count = 0
-        original_size = 0
-        new_size = 0
-        
+        # Collect all files to process
+        files_to_compress = []
         for folder_name in folders_to_process:
             folder = dataset_dir / folder_name
             if not folder.exists():
                 continue
-            
             for file_path in folder.iterdir():
                 if file_path.is_file() and file_path.suffix.lower() == '.png':
-                    try:
-                        original_size += file_path.stat().st_size
-                        
-                        # Open and re-save with compression
-                        img = Image.open(file_path)
-                        
-                        # Convert to RGB if necessary (PNG can have alpha)
-                        if img.mode in ('RGBA', 'LA', 'P'):
-                            # Keep alpha channel
-                            img.save(file_path, 'PNG', optimize=True, compress_level=9)
-                        else:
-                            img.save(file_path, 'PNG', optimize=True, compress_level=9)
-                        
-                        new_size += file_path.stat().st_size
-                        compressed_count += 1
-                        
-                    except Exception as e:
-                        print(f"Failed to compress {file_path}: {e}")
+                    files_to_compress.append(file_path)
+
+        if not files_to_compress:
+             return jsonify({
+                'success': True,
+                'compressed': 0,
+                'originalSizeMB': 0,
+                'newSizeMB': 0,
+                'savingsMB': 0,
+                'savingsPercent': 0
+            })
+
+        def compress_single_image(file_path):
+            try:
+                orig_size = file_path.stat().st_size
+                with Image.open(file_path) as img:
+                    # PNG optimization is already lossless, compress_level 9 is best
+                    img.save(file_path, 'PNG', optimize=True, compress_level=9)
+                new_size = file_path.stat().st_size
+                return True, orig_size, new_size
+            except Exception as e:
+                print(f"Failed to compress {file_path}: {e}")
+                return False, 0, 0
+
+        # Execute compression in parallel
+        # Use a pool size that's reasonable (max 16 or cpu_count)
+        import os
+        max_workers = min(16, (os.cpu_count() or 4) * 2)
+        
+        compressed_count = 0
+        original_total_size = 0
+        new_total_size = 0
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(compress_single_image, files_to_compress))
+            
+        for success, o_size, n_size in results:
+            if success:
+                compressed_count += 1
+                original_total_size += o_size
+                new_total_size += n_size
         
         # Calculate savings
-        savings_mb = (original_size - new_size) / (1024 * 1024)
-        savings_percent = ((original_size - new_size) / original_size * 100) if original_size > 0 else 0
+        savings_mb = (original_total_size - new_total_size) / (1024 * 1024)
+        savings_percent = ((original_total_size - new_total_size) / original_total_size * 100) if original_total_size > 0 else 0
         
         return jsonify({
             'success': True,
             'compressed': compressed_count,
-            'originalSizeMB': round(original_size / (1024 * 1024), 2),
-            'newSizeMB': round(new_size / (1024 * 1024), 2),
-        'savingsMB': round(savings_mb, 2),
+            'originalSizeMB': round(original_total_size / (1024 * 1024), 2),
+            'newSizeMB': round(new_total_size / (1024 * 1024), 2),
+            'savingsMB': round(savings_mb, 2),
             'savingsPercent': round(savings_percent, 1)
         })
         
     except ImportError:
         return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export', methods=['POST'])
@@ -656,28 +682,30 @@ def augment_crop():
             return jsonify({'error': 'Dataset not found'}), 404
             
         # Get crop coordinates
-        x = int(crop_data.get('x', 0))
-        y = int(crop_data.get('y', 0))
-        w = int(crop_data.get('w', 1))
-        h = int(crop_data.get('h', 1))
+        x_raw = int(crop_data.get('x', 0))
+        y_raw = int(crop_data.get('y', 0))
+        w_raw = int(crop_data.get('w', 1))
+        h_raw = int(crop_data.get('h', 1))
         
-        if w <= 0 or h <= 0:
+        if w_raw <= 0 or h_raw <= 0:
             return jsonify({'error': 'Invalid crop dimensions'}), 400
             
+        crop_mode = data.get('mode', 'keep')
+        
         # Generate new unique basename
         import string
         chars = string.ascii_lowercase + string.digits
         
         def generate_unique_name():
-            existing_names = set()
             img_dir = dataset_dir / 'img'
-            if img_dir.exists():
-                for f in img_dir.iterdir():
-                    existing_names.add(f.stem)
-            
             while True:
                 name = ''.join(random.choices(chars, k=8))
-                if name not in existing_names:
+                is_unique = True
+                for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']:
+                    if (img_dir / f"{name}{ext}").exists():
+                        is_unique = False
+                        break
+                if is_unique:
                     return name
                     
         new_basename = generate_unique_name()
@@ -690,6 +718,22 @@ def augment_crop():
         
         basename = os.path.splitext(filename)[0]
         original_ext = os.path.splitext(filename)[1]
+        
+        # We need the reference size from 'img' to know how to scale x, y, w, h
+        ref_w, ref_h = 1, 1
+        ref_img_path = None
+        for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+            temp_path = dataset_dir / 'img' / f"{basename}{ext}"
+            if temp_path.exists():
+                ref_img_path = temp_path
+                break
+                
+        if ref_img_path:
+            try:
+                with Image.open(ref_img_path) as ref_img:
+                    ref_w, ref_h = ref_img.size
+            except Exception:
+                pass
         
         for folder_name in folders_to_process:
             src_folder = dataset_dir / folder_name
@@ -705,10 +749,6 @@ def augment_crop():
             if not src_file:
                 continue
                 
-            # Determine logic: Copy original OR Crop & Resize
-            # If folder matches source_exception, we keep original (COPY)
-            # Otherwise we crop
-            
             dest_file = src_folder / f"{new_basename}{src_file.suffix}"
             
             if folder_name == source_exception:
@@ -719,9 +759,18 @@ def augment_crop():
                 try:
                     img = Image.open(src_file)
                     original_size = img.size # (width, height)
+                    cw, ch = original_size
+                    
+                    # Scale coordinates if this image has a different resolution from ref_img
+                    scale_x = cw / ref_w if ref_w > 0 else 1.0
+                    scale_y = ch / ref_h if ref_h > 0 else 1.0
+                    
+                    x = int(x_raw * scale_x)
+                    y = int(y_raw * scale_y)
+                    w = int(w_raw * scale_x)
+                    h = int(h_raw * scale_y)
                     
                     # Validate crop bounds
-                    cw, ch = original_size
                     cx = max(0, min(x, cw - 1))
                     cy = max(0, min(y, ch - 1))
                     cw_crop = min(w, cw - cx)
@@ -734,15 +783,14 @@ def augment_crop():
                         # Crop
                         cropped_img = img.crop((cx, cy, cx + cw_crop, cy + ch_crop))
                         
-                        # Resize back to original size
-                        resized_img = cropped_img.resize(original_size, Image.Resampling.LANCZOS)
+                        if crop_mode == '1:1':
+                            target_dim = max(cw_crop, ch_crop)
+                            final_img = cropped_img.resize((target_dim, target_dim), Image.Resampling.LANCZOS)
+                        else:
+                            # Keep Proportion mode: resize back to original_size (which perfectly preserves aspect ratio)
+                            final_img = cropped_img.resize(original_size, Image.Resampling.LANCZOS)
                         
-                        # Save
-                        # Preservation of format is handled by save() based on extension or img.format
-                        # If original was PNG with P mode (palette), we might want to convert to RGB/RGBA first to avoid issues with resizing?
-                        # But Image.open usually handles it.
-                        
-                        resized_img.save(dest_file)
+                        final_img.save(dest_file)
                 except Exception as e:
                     print(f"Error processing {src_file}: {e}")
                     # Fallback copy on error?
@@ -788,15 +836,15 @@ def augment_duplicate():
         chars = string.ascii_lowercase + string.digits
         
         def generate_unique_name():
-            existing_names = set()
             img_dir = dataset_dir / 'img'
-            if img_dir.exists():
-                for f in img_dir.iterdir():
-                    existing_names.add(f.stem)
-            
             while True:
                 name = ''.join(random.choices(chars, k=8))
-                if name not in existing_names:
+                is_unique = True
+                for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']:
+                    if (img_dir / f"{name}{ext}").exists():
+                        is_unique = False
+                        break
+                if is_unique:
                     return name
                     
         new_basename = generate_unique_name()
@@ -962,15 +1010,15 @@ def open_in_pixelmator():
         if not image_paths:
             return jsonify({'error': 'No images found to open'}), 404
             
-        # Reverse image_paths so the main image ('img') is added last 
-        # and appears as the top layer in Pixelmator Pro.
-        image_paths.reverse()
+        # We want 'img' to be the first one to open (sets canvas size)
+        # But we also want 'img' to be on top at the end.
         
         paths_string = '", "'.join(image_paths)
         
         # AppleScript to open images as layers
-        # 1. Open first image to create document
-        # 2. Add remaining as image layers
+        # 1. Open first image (img) to create document and set canvas size
+        # 2. Add remaining images as image layers (scale Control1 if needed)
+        # 3. Move 'img' to front and 'Control1' to second position
         applescript = f'''
         set imgPaths to {{"{paths_string}"}}
         set imgAliases to {{}}
@@ -982,13 +1030,31 @@ def open_in_pixelmator():
             activate
             open item 1 of imgAliases
             set doc to front document
+            set docWidth to width of doc
+            set docHeight to height of doc
             
             repeat with i from 2 to (count of imgAliases)
                 set nextAlias to item i of imgAliases
                 tell doc
-                    make new image layer with properties {{file:nextAlias}}
+                    set newLayer to make new image layer with properties {{file:nextAlias}}
+                    -- If this is Control1 (index 2 in imgPaths), scale it to doc size
+                    if i is 2 then
+                        set width of newLayer to docWidth
+                        set height of newLayer to docHeight
+                        set position of newLayer to {{0, 0}}
+                    end if
                 end tell
             end repeat
+            
+            -- Reorder so: [img, Control1, Control2, Control3] (top to bottom)
+            tell doc
+                move last layer to front -- Move 'img' to top
+                if (count of layers) > 1 then
+                    -- The first control image added (item 2 of imgAliases)
+                    -- ended up right above 'img', so now it's at the bottom.
+                    move last layer to after layer 1
+                end if
+            end tell
         end tell
         '''
         

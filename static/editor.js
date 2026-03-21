@@ -418,14 +418,23 @@ class ImageEditor {
         if (this.isSelecting && this.currentTool === 'crop') {
             const coords = this.getCanvasCoords(e);
 
-            // Constrain aspect ratio to image aspect ratio
-            const imgAspect = this.canvas.width / this.canvas.height;
-
             let w = coords.x - this.selectionStart.x;
-            // let h = coords.y - this.selectionStart.y;
+            let h;
 
-            // Force height based on width to maintain aspect
-            let h = w / imgAspect;
+            const cropModeSelect = document.getElementById('crop-mode');
+            const cropMode = cropModeSelect ? cropModeSelect.value : 'keep';
+
+            if (cropMode === '1:1') {
+                // 1:1 logic, consider dragging direction
+                const rawH = coords.y - this.selectionStart.y;
+                // Calculate height magnitude based on width magnitude to keep it square
+                h = Math.abs(w) * Math.sign(rawH || 1);
+            } else {
+                // Constrain aspect ratio to image aspect ratio
+                const imgAspect = this.canvas.width / this.canvas.height;
+                // Force height based on width to maintain aspect
+                h = w / imgAspect;
+            }
 
             this.selectionRect = {
                 x: this.selectionStart.x,
@@ -943,12 +952,16 @@ class ImageEditor {
         applyBtn.disabled = true;
         applyBtn.textContent = 'Creating...';
 
+        const cropModeSelect = document.getElementById('crop-mode');
+        const cropMode = cropModeSelect ? cropModeSelect.value : 'keep';
+
         try {
             const payload = {
                 folder: this.currentFolder,
                 filename: this.currentFilename,
                 crop: this.selectionRect,
-                sourceException: sourceException
+                sourceException: sourceException,
+                mode: cropMode
             };
 
             const response = await fetch('/api/augment/crop', {
