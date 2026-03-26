@@ -1097,6 +1097,7 @@ function setupEventListeners() {
     compressBtn.addEventListener('click', compressDataset);
     fitBtn.addEventListener('click', fitDataset);
     exportBtn.addEventListener('click', exportDataset);
+    document.getElementById('process-text-btn').addEventListener('click', openProcessTextModal);
 
     // Target dataset selection
     targetDatasetSelect.addEventListener('change', (e) => {
@@ -1175,4 +1176,250 @@ function setupEventListeners() {
             closePreview();
         }
     });
+
+    // Process Text modal: close on backdrop click
+    document.getElementById('process-text-modal').addEventListener('click', (e) => {
+        if (e.target === document.getElementById('process-text-modal')) {
+            closeProcessTextModal();
+        }
+    });
+}
+
+// ─── Process Text ──────────────────────────────────────────────────────────
+
+const ptModal       = document.getElementById('process-text-modal');
+const ptCloseBtn    = document.getElementById('pt-close-btn');
+const ptDropsEl     = document.getElementById('pt-drops');
+const ptSlotsBody   = document.getElementById('pt-slots-body');
+const ptTemplateEl  = document.getElementById('pt-template');
+const ptPreviewList = document.getElementById('pt-preview-list');
+const ptAddSlotBtn  = document.getElementById('pt-add-slot-btn');
+const ptRefreshBtn  = document.getElementById('pt-refresh-btn');
+const ptPreviewBtn  = document.getElementById('pt-preview-btn');
+const ptApplyBtn    = document.getElementById('pt-apply-btn');
+const ptSaveBtn     = document.getElementById('pt-save-config-btn');
+const ptLoadBtn     = document.getElementById('pt-load-config-btn');
+
+let ptPreviewDebounce = null;
+
+// ── Open / Close ─────────────────────────────────────────────────────────────
+
+async function openProcessTextModal() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+    ptModal.classList.add('active');
+    await ptLoadConfig();
+}
+
+function closeProcessTextModal() {
+    ptModal.classList.remove('active');
+}
+
+ptCloseBtn.addEventListener('click', closeProcessTextModal);
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ptModal.classList.contains('active')) {
+        closeProcessTextModal();
+    }
+});
+
+// ── Config helpers ────────────────────────────────────────────────────────────
+
+function ptGetConfig() {
+    const drops = ptDropsEl.value
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+    const slots = [];
+    ptSlotsBody.querySelectorAll('.pt-slot-row').forEach(row => {
+        const [nameEl, patternEl, transformEl] = row.querySelectorAll('input');
+        const name    = nameEl.value.trim();
+        const pattern = patternEl.value.trim();
+        const transform = transformEl.value.trim();
+        if (name && pattern) {
+            slots.push({ name, pattern, transform });
+        }
+    });
+
+    return {
+        drops,
+        slots,
+        template: ptTemplateEl.value
+    };
+}
+
+function ptSetConfig(cfg) {
+    ptDropsEl.value = (cfg.drops || []).join('\n');
+    ptTemplateEl.value = cfg.template || '';
+
+    ptSlotsBody.innerHTML = '';
+    (cfg.slots || []).forEach(slot => ptAddSlotRow(slot));
+}
+
+// ── Slot rows ─────────────────────────────────────────────────────────────────
+
+function ptAddSlotRow(slot = {}) {
+    const row = document.createElement('div');
+    row.className = 'pt-slot-row';
+    row.innerHTML = `
+        <input type="text"  class="pt-input pt-input-name"      placeholder="age"            value="${escHtml(slot.name      || '')}">
+        <input type="text"  class="pt-input pt-input-pattern"   placeholder="^(\\d+)yo$"     value="${escHtml(slot.pattern   || '')}">
+        <input type="text"  class="pt-input pt-input-transform" placeholder="$1yo"           value="${escHtml(slot.transform || '')}">
+        <button class="pt-del-slot-btn" title="Remove slot">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+        </button>`;
+    row.querySelector('.pt-del-slot-btn').addEventListener('click', () => row.remove());
+
+    // Auto-preview on change (debounced)
+    row.querySelectorAll('input').forEach(inp => {
+        inp.addEventListener('input', ptSchedulePreview);
+    });
+
+    ptSlotsBody.appendChild(row);
+}
+
+function escHtml(str) {
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+ptAddSlotBtn.addEventListener('click', () => ptAddSlotRow());
+
+// ── Save / Load config ────────────────────────────────────────────────────────
+
+async function ptSaveConfig() {
+    if (!currentFolder) return;
+    try {
+        const res = await fetch(`/api/process-text/config?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(ptGetConfig())
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+        ptShowStatus('Config saved.', 'success');
+    } catch (e) {
+        ptShowStatus('Save failed: ' + e.message, 'error');
+    }
+}
+
+async function ptLoadConfig() {
+    if (!currentFolder) return;
+    try {
+        const res  = await fetch(`/api/process-text/config?folder=${encodeURIComponent(currentFolder)}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        ptSetConfig(data);
+        ptSchedulePreview();
+    } catch (e) {
+        ptShowStatus('Load failed: ' + e.message, 'error');
+    }
+}
+
+ptSaveBtn.addEventListener('click', ptSaveConfig);
+ptLoadBtn.addEventListener('click', ptLoadConfig);
+
+// ── Preview ───────────────────────────────────────────────────────────────────
+
+function ptSchedulePreview() {
+    clearTimeout(ptPreviewDebounce);
+    ptPreviewDebounce = setTimeout(ptRunPreview, 600);
+}
+
+async function ptRunPreview() {
+    if (!currentFolder) return;
+    ptPreviewList.innerHTML = '<div class="pt-preview-empty pt-loading">Generating preview…</div>';
+    try {
+        const res  = await fetch('/api/process-text/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder: currentFolder, config: ptGetConfig(), count: 5 })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        if (!data.results.length) {
+            ptPreviewList.innerHTML = '<div class="pt-preview-empty">No caption files found in this dataset.</div>';
+            return;
+        }
+
+        const countEl = ptModal.querySelector('.pt-preview-count');
+        if (countEl) countEl.textContent = `(${data.results.length} samples)`;
+
+        ptPreviewList.innerHTML = data.results.map(r => `
+            <div class="pt-preview-item">
+                <div class="pt-preview-filename">${escHtml(r.filename)}</div>
+                <div class="pt-preview-row">
+                    <div class="pt-preview-col">
+                        <div class="pt-preview-label">Before</div>
+                        <div class="pt-preview-text pt-preview-before">${escHtml(r.original)}</div>
+                    </div>
+                    <div class="pt-preview-arrow">→</div>
+                    <div class="pt-preview-col">
+                        <div class="pt-preview-label">After</div>
+                        <div class="pt-preview-text pt-preview-after">${escHtml(r.processed)}</div>
+                    </div>
+                </div>
+            </div>`).join('');
+    } catch (e) {
+        ptPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(e.message)}</div>`;
+    }
+}
+
+ptRefreshBtn.addEventListener('click', ptRunPreview);
+ptPreviewBtn.addEventListener('click', ptRunPreview);
+ptDropsEl.addEventListener('input', ptSchedulePreview);
+ptTemplateEl.addEventListener('input', ptSchedulePreview);
+
+// ── Apply ─────────────────────────────────────────────────────────────────────
+
+ptApplyBtn.addEventListener('click', async () => {
+    if (!currentFolder) return;
+    const ok = confirm(
+        `Apply processing to ALL captions in "${currentFolder}"?\n\nThis will overwrite every .txt file. The operation cannot be undone.`
+    );
+    if (!ok) return;
+
+    ptApplyBtn.disabled = true;
+    ptApplyBtn.textContent = 'Applying…';
+
+    try {
+        const res  = await fetch('/api/process-text/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder: currentFolder, config: ptGetConfig() })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        const errMsg = data.errors?.length
+            ? `\n${data.errors.length} error(s): ${data.errors.map(e => e.file).join(', ')}`
+            : '';
+        ptShowStatus(`Done — ${data.processed} captions updated.${errMsg}`, data.errors?.length ? 'warning' : 'success');
+        ptRunPreview();
+    } catch (e) {
+        ptShowStatus('Apply failed: ' + e.message, 'error');
+    } finally {
+        ptApplyBtn.disabled = false;
+        ptApplyBtn.textContent = 'Apply to All';
+    }
+});
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+
+function ptShowStatus(msg, type = 'info') {
+    let bar = ptModal.querySelector('.pt-status-bar');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.className = 'pt-status-bar';
+        ptModal.querySelector('.pt-footer').prepend(bar);
+    }
+    bar.textContent = msg;
+    bar.dataset.type = type;
+    bar.classList.add('visible');
+    setTimeout(() => bar.classList.remove('visible'), 4000);
 }

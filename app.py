@@ -2,6 +2,8 @@ from flask import Flask, send_from_directory, jsonify, request, send_file
 from concurrent.futures import ThreadPoolExecutor
 from flask_cors import CORS
 import os
+import re
+import json
 import random
 import shutil
 import uuid
@@ -1074,6 +1076,270 @@ def open_in_pixelmator():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+# ─── Process Text ────────────────────────────────────────────────────────────
+
+def _apply_process_config(caption_text, config):
+    """Process a single caption string using the given config.
+
+    Steps:
+      1. Split on commas, strip whitespace from each tag.
+      2. Strip Stable-Diffusion weight syntax: (tag:1.0) → tag, (tag) → tag.
+      3. Drop tags matching any pattern in config['drops'].
+      4. Assign remaining tags to named slots via config['slots'] (first match wins).
+      5. Render config['template'] substituting {slot} values.
+         Optional blocks {? ... {slot} ... } are rendered only when every
+         referenced slot is filled; otherwise they collapse to ''.
+      6. Replace {remainder} with comma-joined unmatched tags.
+    """
+    drops = config.get('drops', [])
+    slots_cfg = config.get('slots', [])
+    template = config.get('template', '{remainder}')
+
+    # 1. Split
+    tags = [t.strip() for t in caption_text.split(',') if t.strip()]
+
+    # 2. Strip weight / paren syntax (re.DOTALL handles multiline tags)
+    cleaned = []
+    for tag in tags:
+        m = re.match(r'^\((.+?):\s*[\d.]+\s*\)$', tag, re.DOTALL)
+        if m:
+            tag = m.group(1).strip()
+        else:
+            m = re.match(r'^\((.+?)\)$', tag, re.DOTALL)
+            if m:
+                tag = m.group(1).strip()
+        # Collapse any internal newlines (from multiline paren tags)
+        tag = re.sub(r'\s*\n\s*', ' ', tag).strip()
+        # Strip stray unbalanced parens from comma-split inside (a, b, c) groups
+        if tag.startswith('(') and ')' not in tag:
+            tag = tag[1:].strip()
+        if tag.endswith(')') and '(' not in tag:
+            tag = tag[:-1].strip()
+        if tag:
+            cleaned.append(tag)
+
+    # 3. Drop
+    remaining = []
+    for tag in cleaned:
+        dropped = any(
+            p.strip() and re.search(p.strip(), tag, re.IGNORECASE)
+            for p in drops if p.strip()
+        )
+        if not dropped:
+            remaining.append(tag)
+
+    # 4. Slot assignment
+    slots = {}
+    unmatched = []
+    for tag in remaining:
+        matched = False
+        for slot in slots_cfg:
+            name = slot.get('name', '').strip()
+            pattern = slot.get('pattern', '').strip()
+            transform = slot.get('transform', '').strip()
+            if not name or not pattern:
+                continue
+            m = re.search(pattern, tag, re.IGNORECASE)
+            if m:
+                if name not in slots:          # first match wins
+                    if transform:
+                        value = transform
+                        for i, g in enumerate(m.groups(), 1):
+                            if g is not None:
+                                value = value.replace(f'${i}', g)
+                        value = value.replace('$0', m.group(0))
+                    else:
+                        value = tag
+                    slots[name] = value
+                matched = True
+                break
+        if not matched:
+            unmatched.append(tag)
+
+    # 5. Render template – optional blocks first
+    # Pattern matches {? ... } where content may contain simple {word} refs
+    def _render_optional(m):
+        inner = m.group(1)
+        refs = re.findall(r'\{(\w+)\}', inner)
+        if all(r in slots for r in refs):
+            result = inner
+            for r in refs:
+                result = result.replace(f'{{{r}}}', slots[r])
+            return result
+        return ''
+
+    result = re.sub(
+        r'\{\?([^{}]*(?:\{[^{}]+\}[^{}]*)*)\}',
+        _render_optional,
+        template
+    )
+
+    # Fill remaining {slot} placeholders
+    for name, value in slots.items():
+        result = result.replace(f'{{{name}}}', value)
+
+    # Remove any unfilled {slot} refs
+    result = re.sub(r'\{(?!remainder)\w+\}', '', result)
+
+    # Inject remainder
+    result = result.replace('{remainder}', ', '.join(unmatched))
+
+    # Tidy up whitespace / punctuation artifacts
+    result = re.sub(r'[ \t]+', ' ', result)
+    result = re.sub(r' +([,.])', r'\1', result)
+    result = re.sub(r'([,.]){2,}', r'\1', result)
+    result = re.sub(r',\s*\.', '.', result)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
+
+DEFAULT_PROCESS_CONFIG = {
+    "drops": [
+        "^masterpiece$",
+        "^solo$",
+        "^best quality$",
+        "^highres$",
+        r"^\d+girl$",
+        r"^\d+boy$",
+        r"\bbackground\b",
+        "^expressionless$",
+        "^human race$",
+        "^naked$",
+        "^nude$",
+        "^vagina$",
+        "^nipples?$"
+    ],
+    "slots": [
+        # Age: "18yo" → slot age = "18yo"
+        {"name": "age",
+         "pattern": r"^(\d+)yo$",
+         "transform": "$1yo"},
+
+        # Age-body descriptors like "teenager girl", "adult woman", "young_adult woman", "loli" —
+        # swallowed intentionally: they duplicate the numeric age and clutter remainder.
+        {"name": "age_body",
+         "pattern": r"^(?:loli|teenager|adult|young(?:_adult)?)(?:[\s_]\w+)*$",
+         "transform": "$0"},
+
+        # Hair colour: "purple hair" → "purple"
+        {"name": "hair",
+         "pattern": r"^([\w][\w\s-]*)\s+hair$",
+         "transform": "$1"},
+
+        # Eyes colour: "white eyes" → "white"
+        {"name": "eyes",
+         "pattern": r"^(\w+)\s+eyes$",
+         "transform": "$1"},
+
+        # Breasts / chest: "big breasts body" → "big breasts", "flat chest" → "flat chest"
+        # Group 1 = modifier(s), group 2 = body-part word; trailing " body" stripped.
+        {"name": "breasts",
+         "pattern": r"^([\w][\w\s-]*?)\s+(chest|breasts?|bust)(?:\s+body)?$",
+         "transform": "$1 $2"},
+
+        # Clothes: strips optional leading "wear[ing][ :] ", captures the rest.
+        # Handles both "wear white bra" and "wear: one-sleeve velvet corset with slanted hem skirt"
+        {"name": "clothes",
+         "pattern": r"^(?:wear(?:ing)?[:\s]\s*)?(.*(?:lingerie|dress|gown|shirt|pants|trousers|skirt|blouse|bra|panties|bikini|thong|uniform|coat|jacket|outfit|corset|turtleneck|bodysuit|robe|kimono|shorts|leggings|stockings|swimwear|hoodie|sweater).*)$",
+         "transform": "$1"},
+
+        # Location
+        {"name": "location",
+         "pattern": r"^(?:outdoor|indoor|beach|forest|room|street|park|city)$",
+         "transform": "$0"},
+
+        # Posing / action
+        {"name": "posing",
+         "pattern": r"^(?:posing|sitting|standing|lying|kneeling|crouching)$",
+         "transform": "$0"},
+
+        # NOTE: style, race, skin are intentionally NOT listed as slots.
+        # They fall through to {remainder} and are preserved in the output.
+    ],
+    "template": (
+        "{age} girl{? with {breasts}}{?, {hair} hair}{? and {eyes} eyes}"
+        "{?, {posing}}{? in {location}}.\n"
+        "{?She wears {clothes}.}\n"
+        "{remainder}"
+    )
+}
+
+
+@app.route('/api/process-text/config', methods=['GET', 'POST'])
+def process_text_config():
+    folder = request.args.get('folder', '')
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+
+    config_path = DATASETS_DIR / folder / '.process_config.json'
+
+    if request.method == 'GET':
+        if config_path.exists():
+            return jsonify(json.loads(config_path.read_text(encoding='utf-8')))
+        return jsonify(DEFAULT_PROCESS_CONFIG)
+
+    data = request.get_json() or {}
+    config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    return jsonify({'success': True})
+
+
+@app.route('/api/process-text/preview', methods=['POST'])
+def process_text_preview():
+    data = request.get_json() or {}
+    folder = data.get('folder', '')
+    config = data.get('config', {})
+    count = int(data.get('count', 5))
+
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+
+    img_dir = DATASETS_DIR / folder / 'img'
+    if not img_dir.exists():
+        return jsonify({'error': 'Dataset not found'}), 404
+
+    all_txt = [f for f in img_dir.iterdir() if f.suffix == '.txt']
+    txt_files = random.sample(all_txt, min(count, len(all_txt)))
+    results = []
+    for f in txt_files:
+        try:
+            original = f.read_text(encoding='utf-8').strip()
+            processed = _apply_process_config(original, config)
+            results.append({'filename': f.name, 'original': original, 'processed': processed})
+        except Exception as e:
+            results.append({'filename': f.name, 'original': '(read error)', 'processed': str(e)})
+
+    return jsonify({'results': results})
+
+
+@app.route('/api/process-text/apply', methods=['POST'])
+def process_text_apply():
+    data = request.get_json() or {}
+    folder = data.get('folder', '')
+    config = data.get('config', {})
+
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+
+    img_dir = DATASETS_DIR / folder / 'img'
+    if not img_dir.exists():
+        return jsonify({'error': 'Dataset not found'}), 404
+
+    txt_files = [f for f in img_dir.iterdir() if f.suffix == '.txt']
+    processed_count = 0
+    errors = []
+
+    for f in txt_files:
+        try:
+            original = f.read_text(encoding='utf-8').strip()
+            result = _apply_process_config(original, config)
+            f.write_text(result, encoding='utf-8')
+            processed_count += 1
+        except Exception as e:
+            errors.append({'file': f.name, 'error': str(e)})
+
+    return jsonify({'success': True, 'processed': processed_count, 'errors': errors})
+
 
 if __name__ == '__main__':
     print(f"Starting Dataset Manager...")

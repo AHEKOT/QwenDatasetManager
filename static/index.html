@@ -36,6 +36,14 @@
                     </svg>
                     Fit
                 </button>
+                <button id="process-text-btn" class="action-btn process-text-btn" title="Bulk process caption text">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 6h16M4 12h10M4 18h14"></path>
+                        <circle cx="20" cy="18" r="2"></circle>
+                        <path d="M20 16v-2"></path>
+                    </svg>
+                    Process Text
+                </button>
                 <button id="export-btn" class="action-btn export-btn" title="Export to AI-Toolkit format">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
@@ -332,6 +340,96 @@
                     </svg>
                 </button>
             </div>
+        </div>
+    </div>
+
+    <!-- Process Text Modal -->
+    <div id="process-text-modal" class="pt-modal">
+        <div class="pt-modal-content">
+
+            <div class="pt-header">
+                <div class="pt-header-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 6h16M4 12h10M4 18h14"></path>
+                        <circle cx="20" cy="18" r="2"></circle>
+                        <path d="M20 16v-2"></path>
+                    </svg>
+                    Process Text
+                </div>
+                <button id="pt-close-btn" class="pt-close-btn">✕</button>
+            </div>
+
+            <div class="pt-body">
+
+                <!-- ── Left: Config ── -->
+                <div class="pt-config">
+
+                    <!-- Drop patterns -->
+                    <section class="pt-section">
+                        <h3>Drop Patterns</h3>
+                        <p class="pt-hint">One regex per line — matching tags are removed entirely.</p>
+                        <textarea id="pt-drops" class="pt-textarea pt-drops-area" spellcheck="false" placeholder="^masterpiece$&#10;^solo$&#10;^\d+girl$"></textarea>
+                    </section>
+
+                    <!-- Slots table -->
+                    <section class="pt-section">
+                        <h3>Slots</h3>
+                        <p class="pt-hint">Tags matching a pattern are captured into a named slot. First match wins. <code>$1</code>, <code>$2</code>… refer to capture groups; <code>$0</code> = full match.</p>
+                        <div class="pt-slots-wrapper">
+                            <div class="pt-slots-head">
+                                <span>Slot name</span>
+                                <span>Regex pattern</span>
+                                <span>Transform</span>
+                                <span></span>
+                            </div>
+                            <div id="pt-slots-body" class="pt-slots-body"></div>
+                        </div>
+                        <button id="pt-add-slot-btn" class="pt-add-slot-btn">+ Add Slot</button>
+                    </section>
+
+                    <!-- Template -->
+                    <section class="pt-section">
+                        <h3>Template</h3>
+                        <p class="pt-hint">
+                            <code>{slot}</code> — slot value &nbsp;·&nbsp;
+                            <code>{?&nbsp;text&nbsp;{slot}&nbsp;}</code> — optional block (hidden if slot empty) &nbsp;·&nbsp;
+                            <code>{remainder}</code> — unmatched tags
+                        </p>
+                        <textarea id="pt-template" class="pt-textarea pt-template-area" spellcheck="false"></textarea>
+                    </section>
+
+                </div>
+
+                <!-- ── Right: Preview ── -->
+                <div class="pt-preview-panel">
+                    <div class="pt-preview-header">
+                        <h3>Preview <span class="pt-preview-count"></span></h3>
+                        <button id="pt-refresh-btn" class="pt-icon-btn" title="Refresh preview">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M23 4v6h-6M1 20v-6h6"></path>
+                                <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div id="pt-preview-list" class="pt-preview-list">
+                        <div class="pt-preview-empty">Configure slots and click Refresh to preview</div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Footer -->
+            <div class="pt-footer">
+                <div class="pt-footer-left">
+                    <button id="pt-load-config-btn" class="pt-btn pt-btn-ghost">Load Config</button>
+                    <button id="pt-save-config-btn" class="pt-btn pt-btn-ghost">Save Config</button>
+                </div>
+                <div class="pt-footer-right">
+                    <button id="pt-preview-btn" class="pt-btn pt-btn-secondary">Preview</button>
+                    <button id="pt-apply-btn" class="pt-btn pt-btn-primary">Apply to All</button>
+                </div>
+            </div>
+
         </div>
     </div>
 
