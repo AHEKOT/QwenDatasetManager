@@ -5,7 +5,26 @@ let images = [];
 let currentIndex = 0;
 let overlayActive = false;
 let opacityValue = 50; // Default 50%
-let cacheBuster = Date.now(); // For cache busting after reshuffle
+// Per-file cache busting: only files actually modified this session get &t=
+// dirtyFiles: Map<filename, timestamp> — individual edits/crops
+// folderBuster: string — bumped for bulk ops (reshuffle/compress/fit) that change all files
+const dirtyFiles = new Map();
+let folderBuster = '';
+
+function fileBuster(filename) {
+    if (dirtyFiles.has(filename)) return `&t=${dirtyFiles.get(filename)}`;
+    if (folderBuster) return `&t=${folderBuster}`;
+    return '';
+}
+
+function markDirty(filename) {
+    dirtyFiles.set(filename, Date.now());
+}
+
+function bumpFolderBuster() {
+    folderBuster = String(Date.now());
+    dirtyFiles.clear();
+}
 let allFolders = []; // Store all folders for target selection
 let activeControlView = null; // Which control is shown in full preview (null = original image)
 let comparisonControlView = null; // Which control is shown in comparison view (null = hidden)
@@ -53,9 +72,71 @@ const linkedIndicator = document.getElementById('linked-indicator');
 const unlinkBtn = document.getElementById('unlink-btn');
 
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    loadFolders();
+// ── Session persistence ────────────────────────────────────────────────────
+const SESSION_KEY = 'qdm_session';
+let _saveTimer = null;
+
+function saveAppState() {
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+        try {
+            localStorage.setItem(SESSION_KEY, JSON.stringify({
+                folder:               currentFolder,
+                filename:             images[currentIndex] || null,
+                modalOpen:            modal.classList.contains('active'),
+                opacityValue,
+                activeControlView,
+                comparisonControlView,
+            }));
+        } catch (e) { /* localStorage unavailable */ }
+    }, 200);
+}
+
+async function restoreAppState() {
+    try {
+        const raw = localStorage.getItem(SESSION_KEY);
+        if (!raw) return;
+        const s = JSON.parse(raw);
+        if (!s.folder) return;
+
+        // Only restore if folder still exists
+        if (!allFolders.some(f => f.path === s.folder)) return;
+
+        folderSelect.value = s.folder;
+        await loadImages(s.folder);
+
+        // Restore position by filename (robust against list reorder)
+        if (s.filename) {
+            const idx = images.indexOf(s.filename);
+            if (idx !== -1) currentIndex = idx;
+        }
+
+        // Restore opacity
+        if (s.opacityValue != null) {
+            opacityValue = s.opacityValue;
+            opacitySlider.value = opacityValue;
+            if (opacityValueDisplay) opacityValueDisplay.textContent = `${opacityValue}%`;
+        }
+
+        // Restore open modal — bypass openPreview() to avoid resetting control views
+        if (s.modalOpen && images.length > 0) {
+            activeControlView     = s.activeControlView     || null;
+            comparisonControlView = s.comparisonControlView || null;
+            updateTargetDatasetSelect();
+            updatePreview();
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+    } catch (e) {
+        console.warn('Failed to restore session state:', e);
+    }
+}
+// ──────────────────────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', async () => {
+    await loadFolders();
     setupEventListeners();
+    await restoreAppState();
 });
 
 
@@ -63,22 +144,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Sync Save and Undo buttons based on both editors
 function syncEditorButtons() {
-    const undoBtn = document.getElementById('undo-btn');
-    const saveBtn = document.getElementById('save-edit-btn');
-
-    const hasUndo = (mainEditor && mainEditor.history.length > 1) ||
-        (comparisonEditor && comparisonEditor.history.length > 1);
+    const undoBtn  = document.getElementById('undo-btn');
+    const resetBtn = document.getElementById('reset-edit-btn');
+    const saveBtn  = document.getElementById('save-edit-btn');
 
     const hasChanges = (mainEditor && mainEditor.history.length > 1) ||
         (comparisonEditor && comparisonEditor.history.length > 1);
 
-    if (undoBtn) undoBtn.disabled = !hasUndo;
-    if (saveBtn) saveBtn.disabled = !hasChanges;
+    [undoBtn, resetBtn, saveBtn].forEach(btn => {
+        if (btn) btn.classList.toggle('hidden', !hasChanges);
+    });
 }
 
 // Global callback for editor to notify when image is saved
 window.onImageSaved = function (reloadList = false) {
-    cacheBuster = Date.now();
+    const filename = images[currentIndex];
+    markDirty(filename);
     updatePreview();
 
     if (reloadList) {
@@ -89,7 +170,7 @@ window.onImageSaved = function (reloadList = false) {
         const gridImg = document.querySelector(`.image-item[data-index="${currentIndex}"] img`);
         if (gridImg) {
             const src = gridImg.src.split('?')[0];
-            gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+            gridImg.src = `${src}?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
         }
     }
 };
@@ -296,6 +377,7 @@ async function loadImages(folder) {
 
         renderImageGrid();
         updateImageCount();
+        saveAppState();
     } catch (error) {
         console.error('Failed to load images:', error);
         imageGrid.innerHTML = '<div class="empty-state"><p>❌ Failed to load images</p></div>';
@@ -316,7 +398,7 @@ function renderImageGrid() {
         item.dataset.index = index;
 
         const img = document.createElement('img');
-        img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+        img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
         img.alt = filename;
         img.loading = 'lazy';
 
@@ -349,6 +431,7 @@ function openPreview(index) {
     updatePreview();
     modal.classList.add('active');
     document.body.style.overflow = 'hidden';
+    saveAppState();
 }
 
 // Update target dataset dropdown (exclude current folder)
@@ -380,6 +463,7 @@ function closePreview() {
     previewImg.classList.remove('overlay-active');
     previewControl.classList.remove('active');
     toggleBtn.classList.remove('active');
+    saveAppState();
 }
 
 // Update preview with current image
@@ -388,7 +472,7 @@ function updatePreview() {
 
     const filename = images[currentIndex];
     const baseUrl = `/api/image`;
-    const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+    const folderParam = `?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
     const imageContainer = document.querySelector('.image-container');
 
     if (!imageContainer) {
@@ -519,7 +603,7 @@ function updatePreview() {
 // Load control thumbnails and check which exist
 function loadControlThumbnails(filename) {
     const baseUrl = `/api/image`;
-    const folderParam = `?folder=${encodeURIComponent(currentFolder)}&t=${cacheBuster}`;
+    const folderParam = `?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
 
     const controls = ['Control1', 'Control2', 'Control3'];
 
@@ -561,21 +645,26 @@ function showControlFullPreview(controlName) {
         comparisonControlView = controlName;
     }
     updatePreview();
+    saveAppState();
 }
 
 // Navigate to previous image
-function showPrevious() {
+async function showPrevious() {
     if (currentIndex > 0) {
+        if (!await checkUnsavedCaption()) return;
         currentIndex--;
         updatePreview();
+        saveAppState();
     }
 }
 
 // Navigate to next image
-function showNext() {
+async function showNext() {
     if (currentIndex < images.length - 1) {
+        if (!await checkUnsavedCaption()) return;
         currentIndex++;
         updatePreview();
+        saveAppState();
     }
 }
 
@@ -599,6 +688,7 @@ function toggleOverlay() {
 function updateOpacity(value) {
     opacityValue = parseInt(value);
     opacityValueDisplay.textContent = `${opacityValue}%`;
+    saveAppState();
 
     // Update canvas opacity if overlay is active
     if (overlayActive) {
@@ -816,8 +906,7 @@ async function reshuffleDataset() {
         const data = await response.json();
 
         if (data.success) {
-            // Update cache buster to force reload of images
-            cacheBuster = Date.now();
+            bumpFolderBuster();
             alert(`Successfully reshuffled ${data.count} images!`);
             loadImages(currentFolder); // Reload grid
         } else {
@@ -855,8 +944,7 @@ async function fitDataset() {
 
         if (data.success) {
             alert(`Success!\nProcessed: ${data.processed} image sets\nUpdated (resized): ${data.updated} control images`);
-            // Cache buster and refresh if we are currently looking at optimized/resized images
-            cacheBuster = Date.now();
+            bumpFolderBuster();
             updatePreview();
         } else {
             alert(`Failed: ${data.error}`);
@@ -895,7 +983,7 @@ async function compressDataset() {
         const data = await response.json();
 
         if (data.success) {
-            cacheBuster = Date.now();
+            bumpFolderBuster();
             alert(
                 `Compressed ${data.compressed} images!\n\n` +
                 `Original: ${data.originalSizeMB} MB\n` +
@@ -974,22 +1062,42 @@ async function exportDataset() {
 }
 
 // Load caption for current image
+// Track unsaved caption changes
+let captionDirty = false;
+
+function autoresizeCaption() {
+    captionText.style.height = 'auto';
+    captionText.style.height = captionText.scrollHeight + 'px';
+}
+
+// Returns false if navigation should be cancelled (user chose not to discard)
+async function checkUnsavedCaption() {
+    if (!captionDirty) return true;
+    const choice = confirm('Caption has unsaved changes.\n\nSave before continuing?');
+    if (choice) await saveCurrentCaption();
+    return true; // proceed either way after user acknowledged
+}
+
 async function loadCaption(filename) {
     try {
         captionText.value = 'Loading...';
+        captionDirty = false;
+        autoresizeCaption();
         const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`);
         const data = await response.json();
 
         if (data.error) {
             console.error('Error loading caption:', data.error);
             captionText.value = '';
-            return;
+        } else {
+            captionText.value = data.caption || '';
         }
-
-        captionText.value = data.caption || '';
+        captionDirty = false;
+        autoresizeCaption();
     } catch (error) {
         console.error('Failed to load caption:', error);
         captionText.value = '';
+        captionDirty = false;
     }
 }
 
@@ -1011,13 +1119,10 @@ async function saveCurrentCaption() {
         const data = await response.json();
 
         if (data.success) {
-            console.log('Caption saved successfully');
-            // Visual feedback
+            captionDirty = false;
             const originalBackground = saveCaptionBtn.style.background;
             saveCaptionBtn.style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
-            setTimeout(() => {
-                saveCaptionBtn.style.background = originalBackground;
-            }, 1000);
+            setTimeout(() => { saveCaptionBtn.style.background = originalBackground; }, 1000);
         } else {
             alert(`Failed to save caption: ${data.error}`);
         }
@@ -1093,6 +1198,11 @@ function setupEventListeners() {
     deleteBtn.addEventListener('click', deleteCurrentImage);
     transferBtn.addEventListener('click', transferCurrentImage);
     saveCaptionBtn.addEventListener('click', saveCurrentCaption);
+
+    captionText.addEventListener('input', () => {
+        captionDirty = true;
+        autoresizeCaption();
+    });
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
     fitBtn.addEventListener('click', fitDataset);

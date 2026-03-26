@@ -222,6 +222,8 @@ class ImageEditor {
         document.addEventListener('keydown', (e) => {
             // Only handle shortcuts if canvas is visible
             if (this.canvas.offsetParent === null) return;
+            // Don't steal keys when user is typing in an input or textarea
+            if (document.activeElement && (document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'INPUT')) return;
 
             if (e.ctrlKey && e.key === 'z') {
                 e.preventDefault();
