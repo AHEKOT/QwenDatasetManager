@@ -279,6 +279,7 @@ select:focus {
 .image-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-auto-rows: 220px;
   gap: 12px;
   animation: gridReveal 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -302,7 +303,6 @@ select:focus {
 
 .image-item {
   position: relative;
-  aspect-ratio: 1;
   border-radius: var(--radius-lg);
   overflow: hidden;
   background: var(--bg-elevated);
@@ -1528,6 +1528,292 @@ input[type="range"]::-moz-range-thumb {
   }
   .image-grid {
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    grid-auto-rows: 150px;
     gap: 8px;
   }
 }
+
+/* ─── Stitch Mode ────────────────────────────────────────────────── */
+
+.stitch-btn { color: #a8d8b0; border-color: rgba(168, 216, 176, 0.25); }
+.stitch-btn:hover { background: rgba(168, 216, 176, 0.1); border-color: rgba(168, 216, 176, 0.4); color: #c8f0d0; }
+.stitch-btn.active { background: rgba(168, 216, 176, 0.15); border-color: rgba(168, 216, 176, 0.5); color: #c8f0d0; box-shadow: 0 0 12px rgba(168, 216, 176, 0.2); }
+
+.stitch-bar {
+  display: flex;
+  align-items: center;
+  background: var(--bg-elevated);
+  border: 1px solid rgba(168, 216, 176, 0.25);
+  border-radius: var(--radius-md);
+  padding: 0.65rem 1rem;
+  margin-bottom: 1.25rem;
+  box-shadow: 0 4px 20px rgba(168, 216, 176, 0.08);
+}
+.stitch-bar.hidden { display: none; }
+
+.stitch-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.stitch-cancel-btn {
+  background: rgba(255, 71, 87, 0.1);
+  border: 1px solid rgba(255, 71, 87, 0.3);
+  color: var(--error);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.75rem;
+  font-size: 13px;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+.stitch-cancel-btn:hover { background: rgba(255, 71, 87, 0.2); }
+
+.stitch-config {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.stitch-config label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.stitch-config select {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  padding: 0.3rem 0.5rem;
+  cursor: pointer;
+}
+
+.stitch-dir-group { display: flex; gap: 4px; }
+.stitch-dir-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font);
+  font-size: 12px;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.stitch-dir-btn:hover { border-color: rgba(168, 216, 176, 0.4); color: var(--text-primary); }
+.stitch-dir-btn.active {
+  background: rgba(168, 216, 176, 0.15);
+  border-color: rgba(168, 216, 176, 0.5);
+  color: #c8f0d0;
+}
+
+.stitch-selection-info {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-left: auto;
+}
+.stitch-counter {
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.stitch-confirm-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(168, 216, 176, 0.15);
+  border: 1px solid rgba(168, 216, 176, 0.4);
+  border-radius: var(--radius-sm);
+  color: #c8f0d0;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+.stitch-confirm-btn:hover:not(:disabled) {
+  background: rgba(168, 216, 176, 0.25);
+  box-shadow: 0 0 12px rgba(168, 216, 176, 0.2);
+}
+.stitch-confirm-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* Stitch error modal */
+.stitch-error-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+.stitch-error-modal.hidden { display: none; }
+
+.stitch-error-content {
+  background: var(--bg-elevated);
+  border: 1px solid rgba(255, 71, 87, 0.4);
+  border-radius: var(--radius-lg);
+  padding: 2rem 2.5rem;
+  max-width: 380px;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,71,87,0.15);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+.stitch-error-icon { color: var(--error); }
+#stitch-error-msg {
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.6;
+}
+#stitch-error-close {
+  background: rgba(255, 71, 87, 0.12);
+  border: 1px solid rgba(255, 71, 87, 0.35);
+  border-radius: var(--radius-sm);
+  color: var(--error);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0.5rem 1.75rem;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+#stitch-error-close:hover { background: rgba(255, 71, 87, 0.22); }
+
+/* Invalid item highlight in stitch mode */
+.image-item.stitch-invalid {
+  border-color: var(--error) !important;
+  box-shadow: 0 0 0 2px rgba(255, 71, 87, 0.4), 0 0 16px rgba(255, 71, 87, 0.25) !important;
+}
+.image-item.stitch-invalid img { opacity: 0.7; }
+
+@keyframes stitch-invalid-shake {
+  0%, 100% { transform: translateX(0); }
+  20%       { transform: translateX(-6px); }
+  40%       { transform: translateX(6px); }
+  60%       { transform: translateX(-4px); }
+  80%       { transform: translateX(4px); }
+}
+.image-item.stitch-invalid { animation: stitch-invalid-shake 0.4s ease; }
+
+/* Stitch selected thumbnails row */
+.stitch-thumbs-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-height: 44px;
+}
+
+.stitch-thumb {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  overflow: visible;
+  flex-shrink: 0;
+}
+.stitch-thumb img {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(168, 216, 176, 0.5);
+  display: block;
+}
+.stitch-thumb-order {
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(168, 216, 176, 0.9);
+  color: #0a1a0c;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.stitch-thumb-remove {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 16px;
+  height: 16px;
+  background: var(--error);
+  border: none;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+  z-index: 3;
+  transition: transform var(--transition);
+}
+.stitch-thumb-remove:hover { transform: scale(1.2); }
+
+/* Hide selected grid items during stitch mode */
+.image-item.stitch-picked { display: none; }
+
+/* Grid in stitch selection mode */
+.image-grid.stitch-select-mode .image-item { cursor: crosshair; }
+.image-grid.stitch-select-mode .image-item:hover { border-color: rgba(168, 216, 176, 0.5); }
+
+.image-item.stitch-selected {
+  border-color: rgba(168, 216, 176, 0.7) !important;
+  box-shadow: 0 0 0 2px rgba(168, 216, 176, 0.35), inset 0 0 0 1px rgba(168, 216, 176, 0.2);
+}
+.image-item.stitch-selected img { opacity: 0.85; }
+
+.stitch-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
+  background: rgba(168, 216, 176, 0.9);
+  color: #0a1a0c;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  pointer-events: none;
+  z-index: 2;
+}
+
+@keyframes stitch-flash {
+  0%, 100% { box-shadow: none; }
+  40% { box-shadow: 0 0 0 3px rgba(168, 216, 176, 0.8), 0 0 20px rgba(168, 216, 176, 0.5); }
+}
+.image-item.stitch-new-flash { animation: stitch-flash 1.4s ease; }

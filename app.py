@@ -1341,6 +1341,119 @@ def process_text_apply():
     return jsonify({'success': True, 'processed': processed_count, 'errors': errors})
 
 
+@app.route('/api/stitch', methods=['POST'])
+def stitch_images():
+    """Stitch multiple image sets into a single new entry"""
+    try:
+        from PIL import Image
+        data = request.get_json() or {}
+        folder_path = data.get('folder', '')
+        filenames = data.get('filenames', [])   # ordered list
+        direction = data.get('direction', 'horizontal')  # horizontal | vertical
+        as_is_control = data.get('asIsControl', '')  # Control1/Control2/Control3 or ''
+
+        if not folder_path or len(filenames) < 2:
+            return jsonify({'error': 'Folder and at least 2 filenames are required'}), 400
+
+        dataset_dir = DATASETS_DIR / folder_path
+        if not dataset_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        # Generate unique basename
+        import string
+        chars = string.ascii_lowercase + string.digits
+
+        def generate_unique_name():
+            img_dir = dataset_dir / 'img'
+            while True:
+                name = ''.join(random.choices(chars, k=8))
+                if all(not (img_dir / f"{name}{ext}").exists()
+                       for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']):
+                    return name
+
+        new_basename = generate_unique_name()
+        subfolders = ['img', 'Control1', 'Control2', 'Control3']
+        processed = []
+
+        for subfolder in subfolders:
+            folder_dir = dataset_dir / subfolder
+            if not folder_dir.exists():
+                continue
+
+            # Collect existing source files in order
+            sources = [folder_dir / fn for fn in filenames if (folder_dir / fn).exists()]
+            if not sources:
+                continue
+
+            new_path = folder_dir / f"{new_basename}.png"
+
+            if subfolder == as_is_control:
+                # Keep first image as-is (no stitching); use copy (not copy2) to get fresh timestamps
+                shutil.copy(str(sources[0]), str(new_path))
+            else:
+                # Open all images for this subfolder
+                imgs = [Image.open(src).copy() for src in sources]
+
+                # Normalise to RGB (or RGBA if any source has alpha)
+                has_alpha = any(img.mode in ('RGBA', 'LA', 'PA') for img in imgs)
+                mode = 'RGBA' if has_alpha else 'RGB'
+                bg = (0, 0, 0, 255) if has_alpha else (0, 0, 0)
+                imgs = [img.convert(mode) for img in imgs]
+
+                if direction == 'grid2x2':
+                    # Arrange 4 images in a 2×2 grid: [0][1] / [2][3]
+                    if len(imgs) < 4:
+                        imgs += [Image.new(mode, imgs[0].size, bg)] * (4 - len(imgs))
+                    row_w = imgs[0].width + imgs[1].width
+                    row_h = max(imgs[0].height, imgs[1].height)
+                    bot_w = imgs[2].width + imgs[3].width
+                    bot_h = max(imgs[2].height, imgs[3].height)
+                    total_w = max(row_w, bot_w)
+                    total_h = row_h + bot_h
+                    canvas = Image.new(mode, (total_w, total_h), bg)
+                    canvas.paste(imgs[0], (0, 0))
+                    canvas.paste(imgs[1], (imgs[0].width, 0))
+                    canvas.paste(imgs[2], (0, row_h))
+                    canvas.paste(imgs[3], (imgs[2].width, row_h))
+                elif direction == 'horizontal':
+                    total_w = sum(img.width for img in imgs)
+                    max_h = max(img.height for img in imgs)
+                    canvas = Image.new(mode, (total_w, max_h), bg)
+                    x = 0
+                    for img in imgs:
+                        canvas.paste(img, (x, 0))
+                        x += img.width
+                else:  # vertical
+                    max_w = max(img.width for img in imgs)
+                    total_h = sum(img.height for img in imgs)
+                    canvas = Image.new(mode, (max_w, total_h), bg)
+                    y = 0
+                    for img in imgs:
+                        canvas.paste(img, (0, y))
+                        y += img.height
+
+                canvas.save(str(new_path), 'PNG')
+                for img in imgs:
+                    img.close()
+
+            processed.append(f"{subfolder}/{new_basename}.png")
+
+        # Copy caption from first filename
+        first_stem = os.path.splitext(filenames[0])[0]
+        txt_src = dataset_dir / 'img' / f"{first_stem}.txt"
+        if txt_src.exists():
+            shutil.copy(str(txt_src), str(dataset_dir / 'img' / f"{new_basename}.txt"))
+
+        return jsonify({'success': True, 'newFilename': f"{new_basename}.png", 'processed': processed})
+
+    except ImportError:
+        return jsonify({'error': 'Pillow library not installed'}), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")

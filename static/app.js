@@ -2,6 +2,11 @@
 let currentFolder = '';
 let targetFolder = ''; // For transfer functionality
 let images = [];
+
+// Stitch mode state
+let stitchMode = false;
+let stitchSelectedIndices = [];       // current round selection (indices)
+let stitchUsedFilenames = new Set();  // all filenames consumed across rounds this session
 let currentIndex = 0;
 let overlayActive = false;
 let opacityValue = 50; // Default 50%
@@ -401,10 +406,26 @@ function renderImageGrid() {
         img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
         img.alt = filename;
         img.loading = 'lazy';
+        img.addEventListener('load', () => {
+            const w = img.naturalWidth, h = img.naturalHeight;
+            if (h > w * 1.3) {
+                // tall: span as many rows as the ratio requires, min 2 max 5
+                const span = Math.min(5, Math.max(2, Math.round(h / w)));
+                item.style.gridRow = `span ${span}`;
+            } else if (w > h * 1.3) {
+                // wide: span as many columns as the ratio requires, min 2 max 4
+                const span = Math.min(4, Math.max(2, Math.round(w / h)));
+                item.style.gridColumn = `span ${span}`;
+            }
+        }, { once: true });
 
         const filenameSpan = document.createElement('span');
         filenameSpan.className = 'filename';
         filenameSpan.textContent = filename;
+
+        if (stitchMode && stitchUsedFilenames.has(filename)) {
+            item.classList.add('stitch-picked');
+        }
 
         item.appendChild(img);
         item.appendChild(filenameSpan);
@@ -1183,8 +1204,12 @@ function setupEventListeners() {
     // Image grid event delegation
     imageGrid.addEventListener('click', (e) => {
         const item = e.target.closest('.image-item');
-        if (item && item.dataset.index !== undefined) {
-            openPreview(parseInt(item.dataset.index));
+        if (!item || item.dataset.index === undefined) return;
+        const idx = parseInt(item.dataset.index);
+        if (stitchMode) {
+            toggleStitchSelection(idx);
+        } else {
+            openPreview(idx);
         }
     });
 
@@ -1208,6 +1233,30 @@ function setupEventListeners() {
     fitBtn.addEventListener('click', fitDataset);
     exportBtn.addEventListener('click', exportDataset);
     document.getElementById('process-text-btn').addEventListener('click', openProcessTextModal);
+    document.getElementById('stitch-btn').addEventListener('click', () => {
+        if (stitchMode) deactivateStitchMode();
+        else activateStitchMode();
+    });
+    document.getElementById('stitch-cancel-btn').addEventListener('click', deactivateStitchMode);
+    document.getElementById('stitch-confirm-btn').addEventListener('click', performStitch);
+    document.getElementById('stitch-error-close').addEventListener('click', hideStitchError);
+    document.getElementById('stitch-error-modal').addEventListener('click', (e) => {
+        if (e.target === document.getElementById('stitch-error-modal')) hideStitchError();
+    });
+    document.getElementById('stitch-count').addEventListener('change', updateStitchCounter);
+    document.querySelectorAll('.stitch-dir-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.stitch-dir-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const is2x2 = btn.dataset.dir === 'grid2x2';
+            const countEl = document.getElementById('stitch-count');
+            const countLabel = document.getElementById('stitch-count-label');
+            countEl.style.display = is2x2 ? 'none' : '';
+            countLabel.style.display = is2x2 ? 'none' : '';
+            if (is2x2) countEl.value = '4';
+            updateStitchCounter();
+        });
+    });
 
     // Target dataset selection
     targetDatasetSelect.addEventListener('change', (e) => {
@@ -1532,4 +1581,214 @@ function ptShowStatus(msg, type = 'info') {
     bar.dataset.type = type;
     bar.classList.add('visible');
     setTimeout(() => bar.classList.remove('visible'), 4000);
+}
+
+// ─── Stitch Mode ──────────────────────────────────────────────────────────────
+
+function activateStitchMode() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+    stitchMode = true;
+    stitchSelectedIndices = [];
+    document.getElementById('stitch-bar').classList.remove('hidden');
+    document.getElementById('stitch-btn').classList.add('active');
+    updateStitchCounter();
+    // Add selection-mode class to grid for cursor change
+    imageGrid.classList.add('stitch-select-mode');
+}
+
+function deactivateStitchMode() {
+    stitchMode = false;
+    stitchSelectedIndices = [];
+    stitchUsedFilenames.clear();
+    document.getElementById('stitch-bar').classList.add('hidden');
+    document.getElementById('stitch-btn').classList.remove('active');
+    imageGrid.classList.remove('stitch-select-mode');
+    // Restore all hidden/highlighted items
+    document.querySelectorAll('.image-item.stitch-picked, .image-item.stitch-invalid').forEach(el => {
+        el.classList.remove('stitch-picked', 'stitch-invalid');
+    });
+    // Clear thumbs row
+    document.getElementById('stitch-thumbs-row').innerHTML = '';
+}
+
+function showStitchError(msg, invalidItems = []) {
+    document.getElementById('stitch-error-msg').textContent = msg;
+    document.getElementById('stitch-error-modal').classList.remove('hidden');
+    invalidItems.forEach(el => {
+        el.classList.add('stitch-invalid');
+        // Auto-remove highlight after 4s
+        setTimeout(() => el.classList.remove('stitch-invalid'), 4000);
+    });
+}
+
+function hideStitchError() {
+    document.getElementById('stitch-error-modal').classList.add('hidden');
+}
+
+function getStitchCount() {
+    return parseInt(document.getElementById('stitch-count').value) || 3;
+}
+
+function updateStitchCounter() {
+    const count = getStitchCount();
+    const selected = stitchSelectedIndices.length;
+    document.getElementById('stitch-counter').textContent = `Click images to select (${selected} / ${count})`;
+    const confirmBtn = document.getElementById('stitch-confirm-btn');
+    confirmBtn.disabled = selected < count;
+}
+
+function toggleStitchSelection(index) {
+    const count = getStitchCount();
+    const item = imageGrid.querySelector(`.image-item[data-index="${index}"]`);
+    if (!item) return;
+
+    {
+        if (stitchSelectedIndices.length >= count) return; // already at max
+
+        // 2×2 mode: validate that image is square
+        const direction = document.querySelector('.stitch-dir-btn.active')?.dataset.dir;
+        if (direction === 'grid2x2') {
+            const img = item.querySelector('img');
+            if (img && img.naturalWidth && img.naturalHeight) {
+                const ratio = img.naturalWidth / img.naturalHeight;
+                if (ratio < 0.9 || ratio > 1.1) {
+                    const w = img.naturalWidth, h = img.naturalHeight;
+                    showStitchError(
+                        `Изображение «${images[index]}» не квадратное (${w}×${h}).\nРежим 2×2 требует квадратные изображения.`,
+                        [item]
+                    );
+                    return;
+                }
+            }
+        }
+
+        stitchSelectedIndices.push(index);
+        stitchUsedFilenames.add(images[index]);
+        // Hide the item from grid so user sees only remaining choices
+        item.classList.add('stitch-picked');
+        // Add thumbnail to stitch bar
+        addStitchThumb(index, stitchSelectedIndices.length);
+    }
+    updateStitchCounter();
+}
+
+function addStitchThumb(index, order) {
+    const filename = images[index];
+    const thumbRow = document.getElementById('stitch-thumbs-row');
+
+    const wrap = document.createElement('div');
+    wrap.className = 'stitch-thumb';
+    wrap.dataset.index = index;
+
+    const img = document.createElement('img');
+    img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`;
+    img.alt = filename;
+    img.title = filename;
+
+    const orderBadge = document.createElement('span');
+    orderBadge.className = 'stitch-thumb-order';
+    orderBadge.textContent = order;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'stitch-thumb-remove';
+    removeBtn.title = 'Remove from selection';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', () => removeStitchThumb(index));
+
+    wrap.appendChild(img);
+    wrap.appendChild(orderBadge);
+    wrap.appendChild(removeBtn);
+    thumbRow.appendChild(wrap);
+}
+
+function removeStitchThumb(index) {
+    const pos = stitchSelectedIndices.indexOf(index);
+    if (pos === -1) return;
+
+    // Restore grid item and remove from used set
+    const gridItem = imageGrid.querySelector(`.image-item[data-index="${index}"]`);
+    if (gridItem) gridItem.classList.remove('stitch-picked');
+    stitchUsedFilenames.delete(images[index]);
+
+    // Remove from selection
+    stitchSelectedIndices.splice(pos, 1);
+
+    // Remove thumb element
+    const thumbRow = document.getElementById('stitch-thumbs-row');
+    const thumb = thumbRow.querySelector(`.stitch-thumb[data-index="${index}"]`);
+    if (thumb) thumb.remove();
+
+    // Re-number remaining thumbs
+    thumbRow.querySelectorAll('.stitch-thumb').forEach((el, i) => {
+        const badge = el.querySelector('.stitch-thumb-order');
+        if (badge) badge.textContent = i + 1;
+    });
+
+    updateStitchCounter();
+}
+
+async function performStitch() {
+    const count = getStitchCount();
+    if (stitchSelectedIndices.length < count) return;
+
+    const direction = document.querySelector('.stitch-dir-btn.active')?.dataset.dir || 'horizontal';
+    const asIsControl = document.getElementById('stitch-asis-control').value;
+    const filenames = stitchSelectedIndices.map(i => images[i]);
+
+    const confirmBtn = document.getElementById('stitch-confirm-btn');
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Stitching...';
+
+    try {
+        const response = await fetch('/api/stitch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                folder: currentFolder,
+                filenames,
+                direction,
+                asIsControl
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Stay in stitch mode — just reset the current round selection
+            stitchSelectedIndices = [];
+            document.getElementById('stitch-thumbs-row').innerHTML = '';
+            updateStitchCounter();
+
+            bumpFolderBuster();
+            await loadImages(currentFolder);
+            // renderImageGrid already re-applies stitch-picked for stitchUsedFilenames
+
+            // Highlight the new stitched image
+            const newIdx = images.indexOf(data.newFilename);
+            if (newIdx !== -1) {
+                const newItem = imageGrid.querySelector(`.image-item[data-index="${newIdx}"]`);
+                if (newItem) {
+                    newItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    newItem.classList.add('stitch-new-flash');
+                    setTimeout(() => newItem.classList.remove('stitch-new-flash'), 1500);
+                }
+            }
+        } else {
+            alert(`Stitch failed: ${data.error || 'Unknown error'}`);
+        }
+    } catch (error) {
+        console.error('Stitch failed:', error);
+        alert('Stitch failed. Check console for details.');
+    } finally {
+        confirmBtn.disabled = false;
+        confirmBtn.innerHTML = `
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+            Create Stitch
+        `;
+    }
 }

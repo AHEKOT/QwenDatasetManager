@@ -36,6 +36,14 @@
                     </svg>
                     Fit
                 </button>
+                <button id="stitch-btn" class="action-btn stitch-btn" title="Stitch multiple images into one">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="2" y="5" width="8" height="14" rx="1"></rect>
+                        <rect x="14" y="5" width="8" height="14" rx="1"></rect>
+                        <path d="M10 12h4"></path>
+                    </svg>
+                    Stitch
+                </button>
                 <button id="process-text-btn" class="action-btn process-text-btn" title="Bulk process caption text">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M4 6h16M4 12h10M4 18h14"></path>
@@ -67,11 +75,79 @@
             </div>
         </header>
 
+        <!-- Stitch mode config bar -->
+        <div id="stitch-bar" class="stitch-bar hidden">
+            <div class="stitch-bar-inner">
+                <button id="stitch-cancel-btn" class="stitch-cancel-btn" title="Cancel stitch mode">✕ Cancel</button>
+                <div class="stitch-config">
+                    <label>Mode:</label>
+                    <div class="stitch-dir-group">
+                        <button class="stitch-dir-btn active" data-dir="horizontal" title="Stitch left to right">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="2" y="5" width="7" height="14" rx="1"></rect>
+                                <rect x="15" y="5" width="7" height="14" rx="1"></rect>
+                                <path d="M9 12h6"></path>
+                                <path d="M12 9l3 3-3 3"></path>
+                            </svg>
+                            Horizontal
+                        </button>
+                        <button class="stitch-dir-btn" data-dir="grid2x2" title="Arrange 4 images in a 2×2 grid">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="2" y="2" width="9" height="9" rx="1"></rect>
+                                <rect x="13" y="2" width="9" height="9" rx="1"></rect>
+                                <rect x="2" y="13" width="9" height="9" rx="1"></rect>
+                                <rect x="13" y="13" width="9" height="9" rx="1"></rect>
+                            </svg>
+                            2×2
+                        </button>
+                    </div>
+                    <label id="stitch-count-label">Images:</label>
+                    <select id="stitch-count">
+                        <option value="2">2</option>
+                        <option value="3" selected>3</option>
+                        <option value="4">4</option>
+                    </select>
+                    <label>As-is control:</label>
+                    <select id="stitch-asis-control">
+                        <option value="">Stitch all</option>
+                        <option value="Control1">Control 1</option>
+                        <option value="Control2">Control 2</option>
+                        <option value="Control3">Control 3</option>
+                    </select>
+                </div>
+                <div id="stitch-thumbs-row" class="stitch-thumbs-row"></div>
+                <div class="stitch-selection-info">
+                    <span id="stitch-counter" class="stitch-counter">Click images to select (0 / 3)</span>
+                    <button id="stitch-confirm-btn" class="stitch-confirm-btn" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg>
+                        Create Stitch
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <main id="image-grid" class="image-grid">
             <div class="empty-state">
                 <p>Select a dataset folder to view images</p>
             </div>
         </main>
+    </div>
+
+    <!-- Stitch validation error modal -->
+    <div id="stitch-error-modal" class="stitch-error-modal hidden">
+        <div class="stitch-error-content">
+            <div class="stitch-error-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+            </div>
+            <p id="stitch-error-msg"></p>
+            <button id="stitch-error-close">OK</button>
+        </div>
     </div>
 
     <!-- Fullscreen Preview Modal -->
