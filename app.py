@@ -512,8 +512,7 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
         ]
         set_tool_job_total(job_id, len(target_images))
 
-        processed_count = 0
-        for file_path in target_images:
+        def mirror_single_image(file_path):
             with Image.open(file_path) as img:
                 output, image_format = apply_dataset_mirror(
                     img,
@@ -527,8 +526,17 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
                 save_kwargs['optimize'] = True
 
             output.save(file_path, image_format, **save_kwargs)
-            processed_count += 1
-            increment_tool_job_progress(job_id, current_item=file_path.name)
+            return file_path.name
+
+        processed_count = 0
+        if target_images:
+            max_workers = min(16, (os.cpu_count() or 4) * 2, len(target_images)) or 1
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(mirror_single_image, file_path) for file_path in target_images]
+                for future in as_completed(futures):
+                    file_name = future.result()
+                    processed_count += 1
+                    increment_tool_job_progress(job_id, current_item=file_name)
 
         return {
             'processed': processed_count,
