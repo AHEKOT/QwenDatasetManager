@@ -351,6 +351,47 @@ def create_dataset():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/rename-dataset', methods=['POST'])
+def rename_dataset():
+    """Rename a dataset by renaming its root folder."""
+    try:
+        data = request.get_json() or {}
+        old_name = data.get('oldName', '').strip()
+        new_name = data.get('newName', '').strip()
+
+        if not old_name:
+            return jsonify({'error': 'Current dataset name is required'}), 400
+
+        if not new_name:
+            return jsonify({'error': 'New dataset name is required'}), 400
+
+        if not re.match(r'^[a-zA-Z0-9_-]+$', new_name):
+            return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
+
+        source_dir = DATASETS_DIR / old_name
+        target_dir = DATASETS_DIR / new_name
+
+        if not source_dir.exists() or not source_dir.is_dir():
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        if source_dir == target_dir:
+            return jsonify({'success': True, 'oldName': old_name, 'newName': new_name, 'path': new_name})
+
+        if target_dir.exists():
+            return jsonify({'error': f'Dataset "{new_name}" already exists'}), 400
+
+        source_dir.rename(target_dir)
+
+        return jsonify({
+            'success': True,
+            'oldName': old_name,
+            'newName': new_name,
+            'path': str(target_dir.relative_to(DATASETS_DIR))
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/compare-datasets', methods=['POST'])
 def compare_datasets():
     """Compare two datasets and find orphan files in linked dataset"""

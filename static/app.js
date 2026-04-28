@@ -10,6 +10,7 @@ let activeImportJobId = null;
 let activeImportButton = null;
 let activeImportCard = null;
 let importPollTimer = null;
+let datasetNameModalState = null;
 
 // Stitch mode state
 let stitchMode = false;
@@ -48,6 +49,16 @@ let comparisonEditor = null; // Comparison editor instance
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
 const refreshFoldersBtn = document.getElementById('refresh-folders-btn');
+const renameDatasetBtn = document.getElementById('rename-dataset-btn');
+const datasetNameModal = document.getElementById('dataset-name-modal');
+const datasetNameModalKicker = document.getElementById('dataset-name-modal-kicker');
+const datasetNameModalTitle = document.getElementById('dataset-name-modal-title');
+const datasetNameModalDescription = document.getElementById('dataset-name-modal-description');
+const datasetNameInput = document.getElementById('dataset-name-input');
+const datasetNameModalError = document.getElementById('dataset-name-modal-error');
+const datasetNameCloseBtn = document.getElementById('dataset-name-close-btn');
+const datasetNameCancelBtn = document.getElementById('dataset-name-cancel-btn');
+const datasetNameSubmitBtn = document.getElementById('dataset-name-submit-btn');
 const imageGrid = document.getElementById('image-grid');
 const imageCount = document.getElementById('image-count');
 const toolsBtn = document.getElementById('tools-btn');
@@ -57,6 +68,19 @@ const toolsCurrentFolder = document.getElementById('tools-current-folder');
 const toolsCurrentCount = document.getElementById('tools-current-count');
 const toolsNavButtons = Array.from(document.querySelectorAll('.tools-nav-btn'));
 const toolsDetailPanels = Array.from(document.querySelectorAll('.tools-detail-panel'));
+const toolProgressCards = new Map(
+    Array.from(document.querySelectorAll('[data-tool-progress]')).map((card) => [
+        card.dataset.toolProgress,
+        {
+            card,
+            title: card.querySelector('[data-tool-progress-title]'),
+            percent: card.querySelector('[data-tool-progress-percent]'),
+            fill: card.querySelector('[data-tool-progress-fill]'),
+            summary: card.querySelector('[data-tool-progress-summary]'),
+            details: card.querySelector('[data-tool-progress-details]')
+        }
+    ])
+);
 const modal = document.getElementById('preview-modal');
 const previewImg = document.getElementById('preview-img');
 const previewControl = document.getElementById('preview-control');
@@ -101,6 +125,18 @@ const importProgressFill = document.getElementById('import-progress-fill');
 const importProgressFolders = document.getElementById('import-progress-folders');
 const importResults = document.getElementById('import-results');
 const exportBtn = document.getElementById('export-btn');
+const exportModal = document.getElementById('export-modal');
+const exportPathInput = document.getElementById('export-path-input');
+const exportModalError = document.getElementById('export-modal-error');
+const exportCloseBtn = document.getElementById('export-close-btn');
+const exportCancelBtn = document.getElementById('export-cancel-btn');
+const exportSubmitBtn = document.getElementById('export-submit-btn');
+const exportProgressCard = document.getElementById('export-progress-card');
+const exportProgressTitle = document.getElementById('export-progress-title');
+const exportProgressPercent = document.getElementById('export-progress-percent');
+const exportProgressFill = document.getElementById('export-progress-fill');
+const exportProgressSummary = document.getElementById('export-progress-summary');
+const exportProgressDetails = document.getElementById('export-progress-details');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
 const targetDatasetSelect = document.getElementById('target-dataset-select');
@@ -124,6 +160,7 @@ const unlinkBtn = document.getElementById('unlink-btn');
 const SESSION_KEY = 'qdm_session';
 const IMPORT_CACHE_KEY = 'qdm_import_cache';
 let _saveTimer = null;
+let lastExportPath = '';
 
 function loadImportCache() {
     try {
@@ -356,9 +393,194 @@ async function refreshDatasetsView() {
     }
 }
 
+function closeDatasetNameModal(result = null) {
+    if (!datasetNameModalState) return;
+
+    const { resolve } = datasetNameModalState;
+    datasetNameModalState = null;
+    datasetNameModal.classList.add('hidden');
+    datasetNameModalError.textContent = '';
+    datasetNameModalError.classList.add('hidden');
+    document.body.style.overflow = '';
+    resolve(result);
+}
+
+function showDatasetNameError(message) {
+    datasetNameModalError.textContent = message;
+    datasetNameModalError.classList.remove('hidden');
+}
+
+function closeExportModal() {
+    exportModal.classList.add('hidden');
+    exportModalError.textContent = '';
+    exportModalError.classList.add('hidden');
+    document.body.style.overflow = '';
+}
+
+function showExportModalError(message) {
+    exportModalError.textContent = message;
+    exportModalError.classList.remove('hidden');
+}
+
+function renderExportProgress({
+    state = 'running',
+    title = 'Preparing export',
+    summary = '',
+    percent = 0,
+    details = [],
+    indeterminate = false,
+    visible = true
+} = {}) {
+    if (!visible) {
+        exportProgressCard.classList.add('hidden');
+        return;
+    }
+
+    exportProgressCard.classList.remove('hidden');
+    exportProgressCard.classList.toggle('is-running', state === 'running');
+    exportProgressCard.classList.toggle('is-success', state === 'success');
+    exportProgressCard.classList.toggle('is-error', state === 'error');
+    exportProgressTitle.textContent = title;
+    exportProgressSummary.textContent = summary;
+
+    const clampedPercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    exportProgressPercent.textContent = indeterminate ? '...' : `${clampedPercent.toFixed(0)}%`;
+    exportProgressFill.classList.toggle('is-indeterminate', indeterminate);
+    exportProgressFill.style.width = indeterminate ? '42%' : `${clampedPercent}%`;
+    exportProgressDetails.innerHTML = (details || [])
+        .filter((item) => item && item.label && item.value !== undefined && item.value !== null && item.value !== '')
+        .map((item) => `
+            <div class="tools-task-detail">
+                <span>${item.label}</span>
+                <strong>${item.value}</strong>
+            </div>
+        `)
+        .join('');
+}
+
+function openExportModal() {
+    if (!currentFolder) {
+        return;
+    }
+
+    exportPathInput.value = lastExportPath;
+    exportModalError.textContent = '';
+    exportModalError.classList.add('hidden');
+    renderExportProgress({ visible: false });
+    exportModal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+
+    requestAnimationFrame(() => {
+        exportPathInput.focus();
+        exportPathInput.select();
+    });
+}
+
+function openDatasetNameModal({ kicker, title, description, submitLabel, initialValue = '' }) {
+    if (datasetNameModalState) {
+        closeDatasetNameModal(null);
+    }
+
+    datasetNameModalKicker.textContent = kicker;
+    datasetNameModalTitle.textContent = title;
+    datasetNameModalDescription.textContent = description;
+    datasetNameSubmitBtn.textContent = submitLabel;
+    datasetNameInput.value = initialValue;
+    datasetNameModalError.textContent = '';
+    datasetNameModalError.classList.add('hidden');
+    datasetNameModal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+
+    const promise = new Promise((resolve) => {
+        datasetNameModalState = { resolve };
+    });
+
+    requestAnimationFrame(() => {
+        datasetNameInput.focus();
+        datasetNameInput.select();
+    });
+
+    return promise;
+}
+
+function submitDatasetNameModal() {
+    if (!datasetNameModalState) return;
+
+    const value = datasetNameInput.value.trim();
+    if (!value) {
+        showDatasetNameError('Dataset name is required.');
+        datasetNameInput.focus();
+        return;
+    }
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+        showDatasetNameError('Use only letters, numbers, underscores, and hyphens.');
+        datasetNameInput.focus();
+        return;
+    }
+
+    closeDatasetNameModal(value);
+}
+
+async function renameCurrentDataset() {
+    const selectedFolder = currentFolder || folderSelect.value;
+    if (!selectedFolder || selectedFolder === '__create_new__') {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    const currentName = selectedFolder.split('/').pop();
+    const newName = await openDatasetNameModal({
+        kicker: 'Dataset',
+        title: 'Rename Dataset',
+        description: 'Choose a clean dataset name. The manager will rename the dataset and its root folder without reloading the page.',
+        submitLabel: 'Rename Dataset',
+        initialValue: currentName
+    });
+    if (!newName) return;
+
+    const trimmedName = newName.trim();
+    if (!trimmedName) return;
+
+    try {
+        renameDatasetBtn.disabled = true;
+
+        const response = await fetch('/api/rename-dataset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oldName: selectedFolder, newName: trimmedName })
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            currentFolder = data.path;
+            if (linkedDataset === selectedFolder) {
+                linkedDataset = data.path;
+            }
+            await loadFolders();
+            folderSelect.value = data.path;
+            await loadImages(data.path);
+            saveAppState();
+        } else {
+            alert(`Failed to rename dataset: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Failed to rename dataset:', error);
+        alert('Failed to rename dataset. Check console for details.');
+    } finally {
+        renameDatasetBtn.disabled = false;
+    }
+}
+
 // Create new dataset
 async function createNewDataset() {
-    const name = prompt('Enter new dataset name (letters, numbers, underscores, hyphens only):');
+    const name = await openDatasetNameModal({
+        kicker: 'Dataset',
+        title: 'Create Dataset',
+        description: 'Create a new dataset with the standard Qwen folder layout. Use letters, numbers, underscores, and hyphens only.',
+        submitLabel: 'Create Dataset',
+        initialValue: ''
+    });
 
     if (!name) {
         folderSelect.value = '';
@@ -601,6 +823,57 @@ function setActionButtonBusy(button, busyLabel, isBusy) {
     setActionButtonLabel(button, isBusy ? busyLabel : button.dataset.defaultLabel || 'Action');
 }
 
+function renderToolProgress(toolName, {
+    state = 'running',
+    title = 'Working',
+    summary = '',
+    percent = 0,
+    details = [],
+    indeterminate = false,
+    visible = true
+} = {}) {
+    const parts = toolProgressCards.get(toolName);
+    if (!parts) return;
+
+    const { card, fill } = parts;
+
+    if (!visible) {
+        card.classList.add('hidden');
+        return;
+    }
+
+    card.classList.remove('hidden');
+    card.classList.toggle('is-running', state === 'running');
+    card.classList.toggle('is-success', state === 'success');
+    card.classList.toggle('is-error', state === 'error');
+    parts.title.textContent = title;
+    parts.summary.textContent = summary;
+
+    const clampedPercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    parts.percent.textContent = indeterminate ? '...' : `${clampedPercent.toFixed(0)}%`;
+    fill.classList.toggle('is-indeterminate', indeterminate);
+    fill.style.width = indeterminate ? '42%' : `${clampedPercent}%`;
+
+    parts.details.innerHTML = (details || [])
+        .filter((item) => item && item.label && item.value !== undefined && item.value !== null && item.value !== '')
+        .map((item) => `
+            <div class="tools-task-detail">
+                <span>${item.label}</span>
+                <strong>${item.value}</strong>
+            </div>
+        `)
+        .join('');
+}
+
+function showToolValidation(toolName, summary) {
+    renderToolProgress(toolName, {
+        state: 'error',
+        title: 'Cannot start',
+        summary,
+        percent: 100
+    });
+}
+
 function updateToolsContext() {
     if (!toolsCurrentFolder || !toolsCurrentCount) return;
 
@@ -797,13 +1070,14 @@ function renderImportProgress(job) {
     }
 
     importProgressCard.classList.remove('hidden');
-    importProgressTitle.textContent = `${job.sourceName} -> ${job.targetName}`;
-    importProgressSummary.textContent =
+    importProgressTitle.textContent = job.title || `${job.sourceName} -> ${job.targetName}`;
+    importProgressSummary.textContent = job.summary || (
         job.status === 'completed'
             ? `Import completed. Copied ${job.copiedFiles} of ${job.totalFiles} files.`
             : job.status === 'error'
                 ? `Import failed after copying ${job.copiedFiles} of ${job.totalFiles} files.`
-                : `Copying ${job.copiedFiles} of ${job.totalFiles} files${job.currentFolder ? ` • ${job.currentFolder}` : ''}`;
+                : `Copying ${job.copiedFiles} of ${job.totalFiles} files${job.currentFolder ? ` • ${job.currentFolder}` : ''}`
+    );
 
     const percent = Number(job.progressPercent || 0);
     importProgressPercent.textContent = `${percent.toFixed(1)}%`;
@@ -941,6 +1215,18 @@ async function scanImportDatasets() {
         importScanBtn.disabled = true;
         importScanBtn.textContent = 'Scanning...';
         setImportStatus('Scanning trainer export folders...', 'info');
+        renderImportProgress({
+            title: 'Scanning trainer export folders',
+            summary: `Inspecting ${path} for grouped trainer datasets. Results will appear below when the scan completes.`,
+            sourceName: 'scan',
+            targetName: path,
+            copiedFiles: 0,
+            totalFiles: 1,
+            progressPercent: 24,
+            currentFolder: null,
+            folderProgress: {},
+            status: 'scanning'
+        });
 
         const response = await fetch('/api/import/scan', {
             method: 'POST',
@@ -953,6 +1239,20 @@ async function scanImportDatasets() {
             importScanResults = data.datasets || [];
             persistImportResults(path, importScanResults);
             renderImportResults();
+            renderImportProgress({
+                title: 'Trainer scan complete',
+                summary: importScanResults.length
+                    ? `Found ${importScanResults.length} grouped trainer dataset${importScanResults.length !== 1 ? 's' : ''} at ${path}.`
+                    : `Scan finished for ${path}, but no grouped trainer datasets were detected.`,
+                sourceName: 'scan',
+                targetName: path,
+                copiedFiles: importScanResults.length,
+                totalFiles: Math.max(importScanResults.length, 1),
+                progressPercent: 100,
+                currentFolder: null,
+                folderProgress: {},
+                status: 'completed'
+            });
             setImportStatus(
                 importScanResults.length
                     ? `Found ${importScanResults.length} grouped trainer dataset${importScanResults.length !== 1 ? 's' : ''}.`
@@ -963,12 +1263,36 @@ async function scanImportDatasets() {
             importScanResults = [];
             clearPersistedImportResults(path);
             renderImportResults();
+            renderImportProgress({
+                title: 'Trainer scan failed',
+                summary: data.error || 'Failed to scan the trainer export folder.',
+                sourceName: 'scan',
+                targetName: path,
+                copiedFiles: 0,
+                totalFiles: 1,
+                progressPercent: 100,
+                currentFolder: null,
+                folderProgress: {},
+                status: 'error'
+            });
             setImportStatus(data.error || 'Failed to scan trainer folder.', 'error');
         }
     } catch (error) {
         console.error('Import scan failed:', error);
         importScanResults = [];
         renderImportResults();
+        renderImportProgress({
+            title: 'Trainer scan failed',
+            summary: 'The request failed before the server returned a scan result.',
+            sourceName: 'scan',
+            targetName: path,
+            copiedFiles: 0,
+            totalFiles: 1,
+            progressPercent: 100,
+            currentFolder: null,
+            folderProgress: {},
+            status: 'error'
+        });
         setImportStatus('Failed to scan trainer folder. Check console for details.', 'error');
     } finally {
         importScanBtn.disabled = false;
@@ -1516,21 +1840,23 @@ async function deleteCurrentImage() {
 // Reshuffle dataset
 async function reshuffleDataset() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        showToolValidation('reshuffle', 'Select a dataset before running reshuffle.');
         return;
     }
 
-    const confirmed = confirm(
-        'Are you sure you want to reshuffle all images?\n\n' +
-        'This will randomize the filenames (image_00001, image_00002...) ' +
-        'while keeping targets, controls, and captions synchronized.\n\n' +
-        'This action cannot be undone.'
-    );
-
-    if (!confirmed) return;
-
     try {
         setActionButtonBusy(reshuffleBtn, 'Shuffling...', true);
+        renderToolProgress('reshuffle', {
+            state: 'running',
+            title: 'Reshuffling dataset',
+            summary: 'Renaming targets, controls, and captions together. The window will keep showing progress until the server finishes.',
+            percent: 18,
+            indeterminate: true,
+            details: [
+                { label: 'Dataset', value: currentFolder },
+                { label: 'Image Sets', value: images.length }
+            ]
+        });
 
         const response = await fetch(`/api/reshuffle?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST'
@@ -1540,14 +1866,35 @@ async function reshuffleDataset() {
 
         if (data.success) {
             bumpFolderBuster();
-            alert(`Successfully reshuffled ${data.count} images!`);
-            loadImages(currentFolder); // Reload grid
+            renderToolProgress('reshuffle', {
+                state: 'success',
+                title: 'Reshuffle complete',
+                summary: `Finished renaming ${data.count} synchronized image sets in ${currentFolder}.`,
+                percent: 100,
+                details: [
+                    { label: 'Renamed Sets', value: data.count },
+                    { label: 'Dataset', value: currentFolder }
+                ]
+            });
+            loadImages(currentFolder);
         } else {
-            alert(`Failed to reshuffle: ${data.error}`);
+            renderToolProgress('reshuffle', {
+                state: 'error',
+                title: 'Reshuffle failed',
+                summary: data.error || 'The server could not reshuffle this dataset.',
+                percent: 100,
+                details: [{ label: 'Dataset', value: currentFolder }]
+            });
         }
     } catch (error) {
         console.error('Reshuffle failed:', error);
-        alert('Failed to reshuffle dataset. Check console for details.');
+        renderToolProgress('reshuffle', {
+            state: 'error',
+            title: 'Reshuffle failed',
+            summary: 'The request failed before the server returned a result.',
+            percent: 100,
+            details: [{ label: 'Dataset', value: currentFolder }]
+        });
     } finally {
         setActionButtonBusy(reshuffleBtn, 'Shuffling...', false);
     }
@@ -1555,11 +1902,23 @@ async function reshuffleDataset() {
 
 // Compress dataset
 async function fitDataset() {
-    if (!currentFolder) return;
-
-    if (!confirm('Resize/Letterbox all control images (Control1-3) to match primary images (img folder)?\nThis will add black bars if aspect ratios differ.')) return;
+    if (!currentFolder) {
+        showToolValidation('fit', 'Select a dataset before fitting controls to targets.');
+        return;
+    }
 
     setActionButtonBusy(fitBtn, 'Processing...', true);
+    renderToolProgress('fit', {
+        state: 'running',
+        title: 'Fitting controls to targets',
+        summary: 'Resizing and letterboxing control images to match the target canvas size.',
+        percent: 20,
+        indeterminate: true,
+        details: [
+            { label: 'Dataset', value: currentFolder },
+            { label: 'Target Images', value: images.length }
+        ]
+    });
 
     try {
         const response = await fetch(`/api/dataset/fit?folder=${encodeURIComponent(currentFolder)}`, {
@@ -1569,15 +1928,36 @@ async function fitDataset() {
         const data = await response.json();
 
         if (data.success) {
-            alert(`Success!\nProcessed: ${data.processed} image sets\nUpdated (resized): ${data.updated} control images`);
+            renderToolProgress('fit', {
+                state: 'success',
+                title: 'Fit complete',
+                summary: `Processed ${data.processed} image sets and updated ${data.updated} control images.`,
+                percent: 100,
+                details: [
+                    { label: 'Processed Sets', value: data.processed },
+                    { label: 'Updated Controls', value: data.updated }
+                ]
+            });
             bumpFolderBuster();
             updatePreview();
         } else {
-            alert(`Failed: ${data.error}`);
+            renderToolProgress('fit', {
+                state: 'error',
+                title: 'Fit failed',
+                summary: data.error || 'The server could not fit this dataset.',
+                percent: 100,
+                details: [{ label: 'Dataset', value: currentFolder }]
+            });
         }
     } catch (error) {
         console.error('Fit dataset error:', error);
-        alert('Failed to process dataset');
+        renderToolProgress('fit', {
+            state: 'error',
+            title: 'Fit failed',
+            summary: 'The request failed before the server returned a result.',
+            percent: 100,
+            details: [{ label: 'Dataset', value: currentFolder }]
+        });
     } finally {
         setActionButtonBusy(fitBtn, 'Processing...', false);
     }
@@ -1585,20 +1965,23 @@ async function fitDataset() {
 
 async function compressDataset() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        showToolValidation('compress', 'Select a dataset before running compression.');
         return;
     }
 
-    const confirmed = confirm(
-        'Compress all PNG images in this dataset?\n\n' +
-        'This will optimize PNG files for smaller size.\n' +
-        'Original quality will be preserved as much as possible.'
-    );
-
-    if (!confirmed) return;
-
     try {
         setActionButtonBusy(compressBtn, 'Compressing...', true);
+        renderToolProgress('compress', {
+            state: 'running',
+            title: 'Compressing PNG files',
+            summary: 'Optimizing dataset images for lower storage use while keeping the current folder layout.',
+            percent: 18,
+            indeterminate: true,
+            details: [
+                { label: 'Dataset', value: currentFolder },
+                { label: 'Target Images', value: images.length }
+            ]
+        });
 
         const response = await fetch(`/api/compress?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST'
@@ -1608,19 +1991,37 @@ async function compressDataset() {
 
         if (data.success) {
             bumpFolderBuster();
-            alert(
-                `Compressed ${data.compressed} images!\n\n` +
-                `Original: ${data.originalSizeMB} MB\n` +
-                `New: ${data.newSizeMB} MB\n` +
-                `Saved: ${data.savingsMB} MB (${data.savingsPercent}%)`
-            );
+            renderToolProgress('compress', {
+                state: 'success',
+                title: 'Compression complete',
+                summary: `Optimized ${data.compressed} images and reduced dataset size by ${data.savingsMB} MB.`,
+                percent: 100,
+                details: [
+                    { label: 'Compressed', value: data.compressed },
+                    { label: 'Original Size', value: `${data.originalSizeMB} MB` },
+                    { label: 'New Size', value: `${data.newSizeMB} MB` },
+                    { label: 'Savings', value: `${data.savingsMB} MB (${data.savingsPercent}%)` }
+                ]
+            });
             loadImages(currentFolder);
         } else {
-            alert(`Failed to compress: ${data.error}`);
+            renderToolProgress('compress', {
+                state: 'error',
+                title: 'Compression failed',
+                summary: data.error || 'The server could not compress this dataset.',
+                percent: 100,
+                details: [{ label: 'Dataset', value: currentFolder }]
+            });
         }
     } catch (error) {
         console.error('Compress failed:', error);
-        alert('Failed to compress dataset. Check console for details.');
+        renderToolProgress('compress', {
+            state: 'error',
+            title: 'Compression failed',
+            summary: 'The request failed before the server returned a result.',
+            percent: 100,
+            details: [{ label: 'Dataset', value: currentFolder }]
+        });
     } finally {
         setActionButtonBusy(compressBtn, 'Compressing...', false);
     }
@@ -1628,12 +2029,12 @@ async function compressDataset() {
 
 async function createBlurredDatasetCopy() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        showToolValidation('blur', 'Select a dataset before generating a blurred copy.');
         return;
     }
 
     if (!images.length) {
-        alert('This dataset has no target images to blur.');
+        showToolValidation('blur', 'This dataset has no target images to blur.');
         return;
     }
 
@@ -1642,7 +2043,19 @@ async function createBlurredDatasetCopy() {
     try {
         blurApplyBtn.disabled = true;
         blurRerollBtn.disabled = true;
-        blurApplyBtn.textContent = 'Creating...';
+        setActionButtonLabel(blurApplyBtn, 'Creating...');
+        renderToolProgress('blur', {
+            state: 'running',
+            title: 'Generating blurred copy',
+            summary: `Applying ${strength.toFixed(1)} px blur to targets and controls in a new dataset copy.`,
+            percent: 22,
+            indeterminate: true,
+            details: [
+                { label: 'Source Dataset', value: currentFolder },
+                { label: 'Blur Strength', value: `${strength.toFixed(1)} px` },
+                { label: 'Target Images', value: images.length }
+            ]
+        });
 
         const response = await fetch(`/api/dataset/blur?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST',
@@ -1656,29 +2069,50 @@ async function createBlurredDatasetCopy() {
             const selectedFolder = currentFolder;
             await loadFolders();
             folderSelect.value = selectedFolder;
-            alert(`Created ${data.targetFolder} with blur strength ${data.strength}. Processed ${data.processedImages} images.`);
-            closeToolsModal();
+            renderToolProgress('blur', {
+                state: 'success',
+                title: 'Blurred copy created',
+                summary: `Created ${data.targetFolder} and processed ${data.processedImages} images with the backend blur pipeline.`,
+                percent: 100,
+                details: [
+                    { label: 'Output Dataset', value: data.targetFolder },
+                    { label: 'Strength', value: `${Number(data.strength).toFixed(1)} px` },
+                    { label: 'Processed Images', value: data.processedImages }
+                ]
+            });
         } else {
-            alert(`Failed to create blurred dataset: ${data.error}`);
+            renderToolProgress('blur', {
+                state: 'error',
+                title: 'Blur generation failed',
+                summary: data.error || 'The server could not generate the blurred dataset.',
+                percent: 100,
+                details: [{ label: 'Source Dataset', value: currentFolder }]
+            });
         }
     } catch (error) {
         console.error('Blur dataset failed:', error);
-        alert('Failed to create blurred dataset. Check console for details.');
+        renderToolProgress('blur', {
+            state: 'error',
+            title: 'Blur generation failed',
+            summary: 'The request failed before the server returned a result.',
+            percent: 100,
+            details: [{ label: 'Source Dataset', value: currentFolder }]
+        });
     } finally {
         blurApplyBtn.disabled = false;
         blurRerollBtn.disabled = false;
-        blurApplyBtn.textContent = blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy';
+        setActionButtonLabel(blurApplyBtn, blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy');
     }
 }
 
 async function createMirroredDatasetCopy() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        showToolValidation('mirror', 'Select a dataset before generating a mirrored copy.');
         return;
     }
 
     if (!images.length) {
-        alert('This dataset has no target images to mirror.');
+        showToolValidation('mirror', 'This dataset has no target images to mirror.');
         return;
     }
 
@@ -1686,14 +2120,26 @@ async function createMirroredDatasetCopy() {
     const vertical = mirrorVerticalInput.checked;
     const excludedControls = getMirrorExcludedControls();
     if (!horizontal && !vertical) {
-        alert('Select at least one mirror direction.');
+        showToolValidation('mirror', 'Select at least one mirror direction.');
         return;
     }
 
     try {
         mirrorApplyBtn.disabled = true;
         mirrorRerollBtn.disabled = true;
-        mirrorApplyBtn.textContent = 'Creating...';
+        setActionButtonLabel(mirrorApplyBtn, 'Creating...');
+        renderToolProgress('mirror', {
+            state: 'running',
+            title: 'Generating mirrored copy',
+            summary: 'Applying the selected mirror directions and copying excluded controls unchanged into the new dataset.',
+            percent: 22,
+            indeterminate: true,
+            details: [
+                { label: 'Source Dataset', value: currentFolder },
+                { label: 'Directions', value: [horizontal ? 'Horizontal' : null, vertical ? 'Vertical' : null].filter(Boolean).join(' + ') },
+                { label: 'Excluded Controls', value: excludedControls.length ? excludedControls.join(', ') : 'None' }
+            ]
+        });
 
         const response = await fetch(`/api/dataset/mirror?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST',
@@ -1707,18 +2153,39 @@ async function createMirroredDatasetCopy() {
             const selectedFolder = currentFolder;
             await loadFolders();
             folderSelect.value = selectedFolder;
-            alert(`Created ${data.targetFolder}. Processed ${data.processed} images.`);
-            closeToolsModal();
+            renderToolProgress('mirror', {
+                state: 'success',
+                title: 'Mirrored copy created',
+                summary: `Created ${data.targetFolder} and processed ${data.processed} images with the selected mirror settings.`,
+                percent: 100,
+                details: [
+                    { label: 'Output Dataset', value: data.targetFolder },
+                    { label: 'Processed Images', value: data.processed },
+                    { label: 'Excluded Controls', value: excludedControls.length ? excludedControls.join(', ') : 'None' }
+                ]
+            });
         } else {
-            alert(`Failed to create mirrored dataset: ${data.error}`);
+            renderToolProgress('mirror', {
+                state: 'error',
+                title: 'Mirror generation failed',
+                summary: data.error || 'The server could not generate the mirrored dataset.',
+                percent: 100,
+                details: [{ label: 'Source Dataset', value: currentFolder }]
+            });
         }
     } catch (error) {
         console.error('Mirror dataset failed:', error);
-        alert('Failed to create mirrored dataset. Check console for details.');
+        renderToolProgress('mirror', {
+            state: 'error',
+            title: 'Mirror generation failed',
+            summary: 'The request failed before the server returned a result.',
+            percent: 100,
+            details: [{ label: 'Source Dataset', value: currentFolder }]
+        });
     } finally {
         mirrorApplyBtn.disabled = false;
         mirrorRerollBtn.disabled = false;
-        mirrorApplyBtn.textContent = mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy';
+        setActionButtonLabel(mirrorApplyBtn, mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy');
         updateMirrorPreview(false);
     }
 }
@@ -1726,25 +2193,36 @@ async function createMirroredDatasetCopy() {
 // Export to AI-Toolkit format
 async function exportDataset() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        showExportModalError('Select a dataset folder first.');
         return;
     }
 
-    const exportPath = prompt(
-        'Enter the export path:\n\n' +
-        'Folders will be created as:\n' +
-        `• ${currentFolder}_img\n` +
-        `• ${currentFolder}_ctr1\n` +
-        `• ${currentFolder}_ctr2\n` +
-        `• ${currentFolder}_ctr3\n\n` +
-        '(Empty folders will be skipped)'
-    );
-
-    if (!exportPath) return;
+    const exportPath = exportPathInput.value.trim();
+    if (!exportPath) {
+        showExportModalError('Export path is required.');
+        exportPathInput.focus();
+        return;
+    }
 
     try {
+        lastExportPath = exportPath;
+        exportModalError.textContent = '';
+        exportModalError.classList.add('hidden');
         exportBtn.disabled = true;
-        exportBtn.textContent = 'Exporting...';
+        exportSubmitBtn.disabled = true;
+        setActionButtonLabel(exportBtn, 'Exporting...');
+        setActionButtonLabel(exportSubmitBtn, 'Exporting...');
+        renderExportProgress({
+            state: 'running',
+            title: 'Exporting dataset',
+            summary: `Creating trainer export folders for ${currentFolder} inside ${exportPath}.`,
+            percent: 22,
+            indeterminate: true,
+            details: [
+                { label: 'Dataset', value: currentFolder },
+                { label: 'Export Root', value: exportPath }
+            ]
+        });
 
         const response = await fetch(`/api/export?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST',
@@ -1755,24 +2233,48 @@ async function exportDataset() {
         const data = await response.json();
 
         if (data.success) {
-            const summary = Object.entries(data.exported)
-                .map(([folder, info]) => `${folder}: ${info.files} files`)
-                .join('\n');
-            alert(`Export complete!\n\nPath: ${data.exportPath}\n\n${summary}`);
+            renderExportProgress({
+                state: 'success',
+                title: 'Export complete',
+                summary: `Finished exporting ${currentFolder}. The trainer folders are ready at the selected root path.`,
+                percent: 100,
+                details: [
+                    { label: 'Export Path', value: data.exportPath },
+                    ...Object.entries(data.exported).map(([folder, info]) => ({
+                        label: folder,
+                        value: `${info.files} files`
+                    }))
+                ]
+            });
         } else {
-            alert(`Failed to export: ${data.error}`);
+            renderExportProgress({
+                state: 'error',
+                title: 'Export failed',
+                summary: data.error || 'The server could not export this dataset.',
+                percent: 100,
+                details: [
+                    { label: 'Dataset', value: currentFolder },
+                    { label: 'Export Root', value: exportPath }
+                ]
+            });
         }
     } catch (error) {
         console.error('Export failed:', error);
-        alert('Failed to export dataset. Check console for details.');
+        renderExportProgress({
+            state: 'error',
+            title: 'Export failed',
+            summary: 'The request failed before the server returned an export result.',
+            percent: 100,
+            details: [
+                { label: 'Dataset', value: currentFolder },
+                { label: 'Export Root', value: exportPath }
+            ]
+        });
     } finally {
         exportBtn.disabled = false;
-        exportBtn.innerHTML = `
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
-            </svg>
-            Export
-        `;
+        exportSubmitBtn.disabled = false;
+        setActionButtonLabel(exportBtn, 'Export');
+        setActionButtonLabel(exportSubmitBtn, 'Export Dataset');
     }
 }
 
@@ -1925,6 +2427,20 @@ function setupEventListeners() {
     toolsBtn.addEventListener('click', openToolsModal);
     toolsCloseBtn.addEventListener('click', closeToolsModal);
     refreshFoldersBtn.addEventListener('click', refreshDatasetsView);
+    renameDatasetBtn.addEventListener('click', renameCurrentDataset);
+    datasetNameCloseBtn.addEventListener('click', () => closeDatasetNameModal(null));
+    datasetNameCancelBtn.addEventListener('click', () => closeDatasetNameModal(null));
+    datasetNameSubmitBtn.addEventListener('click', submitDatasetNameModal);
+    datasetNameInput.addEventListener('input', () => {
+        datasetNameModalError.textContent = '';
+        datasetNameModalError.classList.add('hidden');
+    });
+    datasetNameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            submitDatasetNameModal();
+        }
+    });
     toolsNavButtons.forEach((button) => {
         button.addEventListener('click', () => {
             setToolsView(button.dataset.toolView, { forceRefresh: button.dataset.toolView === 'blur' || button.dataset.toolView === 'mirror' });
@@ -1963,7 +2479,20 @@ function setupEventListeners() {
             scanImportDatasets();
         }
     });
-    exportBtn.addEventListener('click', exportDataset);
+    exportBtn.addEventListener('click', openExportModal);
+    exportCloseBtn.addEventListener('click', closeExportModal);
+    exportCancelBtn.addEventListener('click', closeExportModal);
+    exportSubmitBtn.addEventListener('click', exportDataset);
+    exportPathInput.addEventListener('input', () => {
+        exportModalError.textContent = '';
+        exportModalError.classList.add('hidden');
+    });
+    exportPathInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            exportDataset();
+        }
+    });
     document.getElementById('process-text-btn').addEventListener('click', openProcessTextModal);
     document.getElementById('stitch-btn').addEventListener('click', () => {
         if (stitchMode) deactivateStitchMode();
@@ -2067,9 +2596,33 @@ function setupEventListeners() {
         }
     });
 
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !datasetNameModal.classList.contains('hidden')) {
+            closeDatasetNameModal(null);
+        }
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !exportModal.classList.contains('hidden')) {
+            closeExportModal();
+        }
+    });
+
     toolsModal.addEventListener('click', (e) => {
         if (e.target === toolsModal) {
             closeToolsModal();
+        }
+    });
+
+    datasetNameModal.addEventListener('click', (e) => {
+        if (e.target === datasetNameModal) {
+            closeDatasetNameModal(null);
+        }
+    });
+
+    exportModal.addEventListener('click', (e) => {
+        if (e.target === exportModal) {
+            closeExportModal();
         }
     });
 

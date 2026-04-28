@@ -25,6 +25,12 @@
                         <path d="M20.49 15a9 9 0 0 1-14.13 3.36L1 14"></path>
                     </svg>
                 </button>
+                <button id="rename-dataset-btn" class="action-btn refresh-btn" title="Rename current dataset">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 20h4l10.5-10.5a2.12 2.12 0 0 0-3-3L5 17v3"></path>
+                        <path d="M13.5 6.5l4 4"></path>
+                    </svg>
+                </button>
                 <button id="tools-btn" class="action-btn tools-btn" title="Open dataset tools">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="3"></circle>
@@ -52,7 +58,7 @@
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
                     </svg>
-                    Export
+                    <span data-button-label>Export</span>
                 </button>
 
                 <!-- Link Dataset Controls -->
@@ -225,6 +231,18 @@
                                     <span data-button-label>Reshuffle Dataset</span>
                                 </button>
                             </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="reshuffle">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Run the utility to see progress and the final summary here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
+                            </div>
                         </section>
 
                         <section class="tools-detail-panel hidden" data-tool-panel="compress">
@@ -255,6 +273,18 @@
                                     <span data-button-label>Compress Dataset</span>
                                 </button>
                             </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="compress">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Compression progress and savings will be shown here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
+                            </div>
                         </section>
 
                         <section class="tools-detail-panel hidden" data-tool-panel="fit">
@@ -284,6 +314,18 @@
                                 <button id="fit-btn" class="action-btn export-btn" title="Resize/Letterbox controls to match img" data-default-label="Fit">
                                     <span data-button-label>Fit Controls To Targets</span>
                                 </button>
+                            </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="fit">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Fit progress and resize summary will appear here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
                             </div>
                         </section>
 
@@ -318,6 +360,18 @@
                             <div class="tools-blur-actions">
                                 <button id="blur-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
                                 <button id="blur-apply-btn" class="action-btn export-btn" data-default-label="Create Blurred Copy">Create Blurred Copy</button>
+                            </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="blur">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Blur generation status and the created dataset name will be shown here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
                             </div>
                         </section>
 
@@ -381,6 +435,18 @@
                                 <button id="mirror-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
                                 <button id="mirror-apply-btn" class="action-btn export-btn" data-default-label="Create Mirrored Copy">Create Mirrored Copy</button>
                             </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="mirror">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Mirror generation status and output details will be shown here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
+                            </div>
                         </section>
 
                         <section class="tools-detail-panel hidden" data-tool-panel="import">
@@ -420,6 +486,68 @@
                         </section>
                     </div>
                 </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Modal -->
+    <div id="export-modal" class="dataset-name-modal hidden">
+        <div class="dataset-name-modal-content export-modal-content">
+            <div class="dataset-name-modal-header">
+                <div>
+                    <span class="dataset-name-modal-kicker">Export</span>
+                    <h2>Export Dataset</h2>
+                    <p>Choose the root export path. The app will create trainer-style folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, and <strong>dataset_ctr3</strong>. Empty folders are skipped.</p>
+                </div>
+                <button id="export-close-btn" class="dataset-name-close-btn" title="Close">✕</button>
+            </div>
+
+            <div class="dataset-name-modal-body export-modal-body">
+                <label for="export-path-input">Export Path</label>
+                <input id="export-path-input" class="dataset-name-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/export/root">
+                <p id="export-modal-error" class="dataset-name-modal-error hidden"></p>
+
+                <div id="export-progress-card" class="tools-task-card hidden">
+                    <div class="tools-task-head">
+                        <strong id="export-progress-title">Ready</strong>
+                        <span id="export-progress-percent">0%</span>
+                    </div>
+                    <div class="tools-task-bar">
+                        <div id="export-progress-fill" class="tools-task-fill"></div>
+                    </div>
+                    <p id="export-progress-summary" class="tools-task-summary">Export progress and the resulting folder summary will be shown here.</p>
+                    <div id="export-progress-details" class="tools-task-details"></div>
+                </div>
+            </div>
+
+            <div class="dataset-name-modal-footer">
+                <button id="export-cancel-btn" class="action-btn">Cancel</button>
+                <button id="export-submit-btn" class="action-btn export-btn">Export Dataset</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dataset Name Modal -->
+    <div id="dataset-name-modal" class="dataset-name-modal hidden">
+        <div class="dataset-name-modal-content">
+            <div class="dataset-name-modal-header">
+                <div>
+                    <span id="dataset-name-modal-kicker" class="dataset-name-modal-kicker">Dataset</span>
+                    <h2 id="dataset-name-modal-title">Rename Dataset</h2>
+                    <p id="dataset-name-modal-description">Enter a dataset name using letters, numbers, underscores, and hyphens only.</p>
+                </div>
+                <button id="dataset-name-close-btn" class="dataset-name-close-btn" title="Close">✕</button>
+            </div>
+
+            <div class="dataset-name-modal-body">
+                <label for="dataset-name-input">Dataset Name</label>
+                <input id="dataset-name-input" class="dataset-name-input" type="text" autocomplete="off" spellcheck="false">
+                <p id="dataset-name-modal-error" class="dataset-name-modal-error hidden"></p>
+            </div>
+
+            <div class="dataset-name-modal-footer">
+                <button id="dataset-name-cancel-btn" class="action-btn">Cancel</button>
+                <button id="dataset-name-submit-btn" class="action-btn export-btn">Save</button>
             </div>
         </div>
     </div>
