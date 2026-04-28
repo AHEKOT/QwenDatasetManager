@@ -152,6 +152,21 @@ select:focus {
   min-width: 240px;
 }
 
+.refresh-btn {
+  padding: 0.55rem;
+  min-width: 44px;
+  justify-content: center;
+  color: var(--accent-hover);
+  border-color: rgba(184, 169, 232, 0.28);
+  background: rgba(184, 169, 232, 0.08);
+}
+
+.refresh-btn:hover {
+  background: rgba(184, 169, 232, 0.18);
+  border-color: rgba(184, 169, 232, 0.4);
+  box-shadow: 0 10px 24px rgba(184, 169, 232, 0.12);
+}
+
 /* ─── Image Count ────────────────────────────────────────────────── */
 .image-count {
   padding: 0.45rem 0.9rem;

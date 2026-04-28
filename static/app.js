@@ -47,6 +47,7 @@ let comparisonEditor = null; // Comparison editor instance
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
+const refreshFoldersBtn = document.getElementById('refresh-folders-btn');
 const imageGrid = document.getElementById('image-grid');
 const imageCount = document.getElementById('image-count');
 const toolsBtn = document.getElementById('tools-btn');
@@ -327,6 +328,31 @@ async function loadFolders() {
         });
     } catch (error) {
         console.error('Failed to load folders:', error);
+    }
+}
+
+async function refreshDatasetsView() {
+    const selectedFolder = currentFolder || folderSelect.value;
+
+    try {
+        refreshFoldersBtn.disabled = true;
+        await loadFolders();
+
+        if (selectedFolder && allFolders.some(folder => folder.path === selectedFolder)) {
+            folderSelect.value = selectedFolder;
+            await loadImages(selectedFolder);
+        } else if (selectedFolder) {
+            folderSelect.value = '';
+            currentFolder = '';
+            images = [];
+            imageGrid.innerHTML = '<div class="empty-state"><p>📁 Select a dataset folder to view images</p></div>';
+            updateImageCount();
+            updateToolsContext();
+        }
+    } catch (error) {
+        console.error('Failed to refresh datasets view:', error);
+    } finally {
+        refreshFoldersBtn.disabled = false;
     }
 }
 
@@ -1898,6 +1924,7 @@ function setupEventListeners() {
     });
     toolsBtn.addEventListener('click', openToolsModal);
     toolsCloseBtn.addEventListener('click', closeToolsModal);
+    refreshFoldersBtn.addEventListener('click', refreshDatasetsView);
     toolsNavButtons.forEach((button) => {
         button.addEventListener('click', () => {
             setToolsView(button.dataset.toolView, { forceRefresh: button.dataset.toolView === 'blur' || button.dataset.toolView === 'mirror' });
