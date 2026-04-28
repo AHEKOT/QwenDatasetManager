@@ -7,6 +7,7 @@ import json
 import random
 import shutil
 import uuid
+import threading
 from pathlib import Path
 
 app = Flask(__name__, static_folder='static')
@@ -17,6 +18,8 @@ BASE_DIR = Path(__file__).parent
 DATASETS_DIR = BASE_DIR / 'Datasets'
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 DATASET_IMAGE_FOLDERS = ('img', 'Control1', 'Control2', 'Control3')
+IMPORT_JOBS = {}
+IMPORT_JOBS_LOCK = threading.Lock()
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
@@ -38,6 +41,25 @@ def apply_dataset_blur(image, strength, image_format=None):
     output = image.copy()
     if strength > 0:
         output = output.filter(ImageFilter.GaussianBlur(radius=strength))
+
+    normalized_format = (image_format or '').upper()
+    if normalized_format == 'JPG':
+        normalized_format = 'JPEG'
+
+    if normalized_format == 'JPEG' and output.mode in ('RGBA', 'LA'):
+        output = output.convert('RGB')
+
+    return output, normalized_format
+
+
+def apply_dataset_mirror(image, horizontal=False, vertical=False, image_format=None):
+    from PIL import ImageOps
+
+    output = image.copy()
+    if horizontal:
+        output = ImageOps.mirror(output)
+    if vertical:
+        output = ImageOps.flip(output)
 
     normalized_format = (image_format or '').upper()
     if normalized_format == 'JPG':
@@ -110,6 +132,129 @@ def scan_exported_dataset_groups(scan_dir):
 
     results.sort(key=lambda item: item['sourceName'].lower())
     return results
+
+
+def build_import_plan(dataset, target_dir):
+    folder_mapping = {
+        'img': 'img',
+        'Control1': 'Control1',
+        'Control2': 'Control2',
+        'Control3': 'Control3'
+    }
+
+    folder_plans = []
+    total_files = 0
+    for source_folder_name, target_folder_name in folder_mapping.items():
+        source_info = dataset['folders'].get(source_folder_name)
+        if not source_info:
+            continue
+
+        source_dir = Path(source_info['path'])
+        destination_dir = target_dir / target_folder_name
+        directories = []
+        files = []
+
+        for path in source_dir.rglob('*'):
+            relative_path = path.relative_to(source_dir)
+            destination_path = destination_dir / relative_path
+            if path.is_dir():
+                directories.append(destination_path)
+            else:
+                files.append((path, destination_path))
+
+        folder_plans.append({
+            'sourceFolder': source_folder_name,
+            'targetFolder': target_folder_name,
+            'sourceDir': source_dir,
+            'destinationDir': destination_dir,
+            'directories': directories,
+            'files': files
+        })
+        total_files += len(files)
+
+    return folder_plans, total_files
+
+
+def update_import_job(job_id, **changes):
+    with IMPORT_JOBS_LOCK:
+        job = IMPORT_JOBS.get(job_id)
+        if not job:
+            return None
+        job.update(changes)
+        return dict(job)
+
+
+def increment_import_job_progress(job_id, folder_name, copied_delta=1):
+    with IMPORT_JOBS_LOCK:
+        job = IMPORT_JOBS.get(job_id)
+        if not job:
+            return
+
+        job['copiedFiles'] += copied_delta
+        job['currentFolder'] = folder_name
+        if folder_name in job['folderProgress']:
+            job['folderProgress'][folder_name]['copied'] += copied_delta
+
+        total = job['totalFiles']
+        job['progressPercent'] = round((job['copiedFiles'] / total) * 100, 1) if total else 100.0
+
+
+def run_import_job(job_id, folder_plans, target_dir):
+    try:
+        for folder_name in DATASET_IMAGE_FOLDERS:
+            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+
+        update_import_job(job_id, status='running', started=True)
+
+        def copy_single_file(source_path, destination_path, folder_name):
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(source_path, destination_path)
+            except OSError:
+                shutil.copy(source_path, destination_path)
+            increment_import_job_progress(job_id, folder_name)
+
+        def copy_folder(folder_plan):
+            destination_dir = folder_plan['destinationDir']
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            for directory in folder_plan['directories']:
+                directory.mkdir(parents=True, exist_ok=True)
+
+            files = folder_plan['files']
+            if not files:
+                return
+
+            max_workers = min(8, max(1, len(files)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(copy_single_file, source_path, destination_path, folder_plan['targetFolder'])
+                    for source_path, destination_path in files
+                ]
+                for future in futures:
+                    future.result()
+
+        folder_workers = min(len(folder_plans), 4) or 1
+        with ThreadPoolExecutor(max_workers=folder_workers) as executor:
+            futures = [executor.submit(copy_folder, folder_plan) for folder_plan in folder_plans]
+            for future in futures:
+                future.result()
+
+        update_import_job(
+            job_id,
+            status='completed',
+            currentFolder=None,
+            progressPercent=100.0,
+            finished=True
+        )
+    except Exception as e:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        update_import_job(
+            job_id,
+            status='error',
+            currentFolder=None,
+            error=str(e),
+            finished=True
+        )
 
 @app.route('/')
 def index():
@@ -788,6 +933,86 @@ def blur_dataset():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/dataset/mirror', methods=['POST'])
+def mirror_dataset():
+    """Create a mirrored copy of a dataset with a -mirror suffix."""
+    folder_path = request.args.get('folder', '')
+    data = request.get_json() or {}
+    target_dir = None
+
+    try:
+        from PIL import Image
+
+        if not folder_path:
+            return jsonify({'error': 'Dataset folder is required'}), 400
+
+        horizontal = bool(data.get('horizontal'))
+        vertical = bool(data.get('vertical'))
+        excluded_controls = set(data.get('excludedControls') or [])
+        if not horizontal and not vertical:
+            return jsonify({'error': 'Select at least one mirror direction'}), 400
+
+        invalid_controls = excluded_controls - {'Control1', 'Control2', 'Control3'}
+        if invalid_controls:
+            return jsonify({'error': 'Invalid excluded controls specified'}), 400
+
+        source_dir = DATASETS_DIR / folder_path
+        if not source_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        source_images = list(iter_dataset_images(source_dir))
+        if not source_images:
+            return jsonify({'error': 'No images found in dataset'}), 404
+
+        target_dir = source_dir.parent / f"{source_dir.name}-mirror"
+        if target_dir.exists():
+            return jsonify({'error': f'Dataset "{target_dir.name}" already exists'}), 400
+
+        shutil.copytree(source_dir, target_dir)
+
+        processed_count = 0
+        for file_path in iter_dataset_images(target_dir):
+            folder_name = file_path.parent.name
+            if folder_name in excluded_controls:
+                continue
+
+            with Image.open(file_path) as img:
+                output, image_format = apply_dataset_mirror(
+                    img,
+                    horizontal=horizontal,
+                    vertical=vertical,
+                    image_format=img.format or file_path.suffix.lstrip('.')
+                )
+
+            save_kwargs = {}
+            if image_format == 'PNG':
+                save_kwargs['optimize'] = True
+
+            output.save(file_path, image_format, **save_kwargs)
+            processed_count += 1
+
+        return jsonify({
+            'success': True,
+            'processed': processed_count,
+            'horizontal': horizontal,
+            'vertical': vertical,
+            'excludedControls': sorted(excluded_controls),
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name
+        })
+
+    except ImportError:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
+    except Exception as e:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/import/scan', methods=['POST'])
 def scan_import_datasets():
     """Scan an external trainer export folder for reverse-exported datasets."""
@@ -813,9 +1038,9 @@ def scan_import_datasets():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/import/dataset', methods=['POST'])
-def import_external_dataset():
-    """Import one reverse-exported dataset group into the local Datasets folder."""
+@app.route('/api/import/dataset/start', methods=['POST'])
+def import_external_dataset_start():
+    """Start importing one reverse-exported dataset group into the local Datasets folder."""
     data = request.get_json() or {}
     base_path = (data.get('basePath') or '').strip()
     source_name = (data.get('sourceName') or '').strip()
@@ -844,48 +1069,60 @@ def import_external_dataset():
         if target_dir.exists():
             return jsonify({'error': f'Dataset "{target_name}" already exists'}), 400
 
-        for folder_name in DATASET_IMAGE_FOLDERS:
-            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+        folder_plans, total_files = build_import_plan(dataset, target_dir)
+        if total_files == 0:
+            return jsonify({'error': 'No files found to import'}), 404
 
-        imported_files = 0
-        source_folder_map = dataset['folders']
-        for source_folder_name, target_folder_name in {
-            'img': 'img',
-            'Control1': 'Control1',
-            'Control2': 'Control2',
-            'Control3': 'Control3'
-        }.items():
-            source_info = source_folder_map.get(source_folder_name)
-            if not source_info:
-                continue
+        job_id = uuid.uuid4().hex
+        folder_progress = {
+            folder_plan['targetFolder']: {
+                'total': len(folder_plan['files']),
+                'copied': 0
+            }
+            for folder_plan in folder_plans
+        }
 
-            source_dir = Path(source_info['path'])
-            destination_dir = target_dir / target_folder_name
-            for path in source_dir.rglob('*'):
-                relative_path = path.relative_to(source_dir)
-                destination_path = destination_dir / relative_path
+        with IMPORT_JOBS_LOCK:
+            IMPORT_JOBS[job_id] = {
+                'jobId': job_id,
+                'status': 'queued',
+                'sourceName': source_name,
+                'targetName': target_name,
+                'copiedFiles': 0,
+                'totalFiles': total_files,
+                'progressPercent': 0.0,
+                'currentFolder': None,
+                'folderProgress': folder_progress,
+                'error': None,
+                'started': False,
+                'finished': False
+            }
 
-                if path.is_dir():
-                    destination_path.mkdir(parents=True, exist_ok=True)
-                    continue
-
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.copy2(path, destination_path)
-                except OSError:
-                    shutil.copy(path, destination_path)
-                imported_files += 1
+        worker = threading.Thread(target=run_import_job, args=(job_id, folder_plans, target_dir), daemon=True)
+        worker.start()
 
         return jsonify({
             'success': True,
+            'jobId': job_id,
             'sourceName': source_name,
             'targetName': target_name,
-            'importedFiles': imported_files
+            'totalFiles': total_files,
+            'folderProgress': folder_progress
         })
     except Exception as e:
         if 'target_dir' in locals() and target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/import/status/<job_id>')
+def import_external_dataset_status(job_id):
+    """Return the current status of a background dataset import job."""
+    with IMPORT_JOBS_LOCK:
+        job = IMPORT_JOBS.get(job_id)
+        if not job:
+            return jsonify({'error': 'Import job not found'}), 404
+        return jsonify(job)
 
 @app.route('/api/export', methods=['POST'])
 def export_dataset():

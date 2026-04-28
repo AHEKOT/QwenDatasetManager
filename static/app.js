@@ -3,8 +3,13 @@ let currentFolder = '';
 let targetFolder = ''; // For transfer functionality
 let images = [];
 let blurPreviewFilename = '';
+let mirrorPreviewFilename = '';
 let importScanResults = [];
 let currentToolsView = 'blur';
+let activeImportJobId = null;
+let activeImportButton = null;
+let activeImportCard = null;
+let importPollTimer = null;
 
 // Stitch mode state
 let stitchMode = false;
@@ -74,9 +79,25 @@ const blurPreviewEmpty = document.getElementById('blur-preview-empty');
 const blurPreviewName = document.getElementById('blur-preview-name');
 const blurRerollBtn = document.getElementById('blur-reroll-btn');
 const blurApplyBtn = document.getElementById('blur-apply-btn');
+const mirrorHorizontalInput = document.getElementById('mirror-horizontal');
+const mirrorVerticalInput = document.getElementById('mirror-vertical');
+const mirrorExcludeControl1Input = document.getElementById('mirror-exclude-control1');
+const mirrorExcludeControl2Input = document.getElementById('mirror-exclude-control2');
+const mirrorExcludeControl3Input = document.getElementById('mirror-exclude-control3');
+const mirrorPreviewImage = document.getElementById('mirror-preview-image');
+const mirrorPreviewEmpty = document.getElementById('mirror-preview-empty');
+const mirrorPreviewName = document.getElementById('mirror-preview-name');
+const mirrorRerollBtn = document.getElementById('mirror-reroll-btn');
+const mirrorApplyBtn = document.getElementById('mirror-apply-btn');
 const importPathInput = document.getElementById('import-path-input');
 const importScanBtn = document.getElementById('import-scan-btn');
 const importStatus = document.getElementById('import-status');
+const importProgressCard = document.getElementById('import-progress-card');
+const importProgressTitle = document.getElementById('import-progress-title');
+const importProgressSummary = document.getElementById('import-progress-summary');
+const importProgressPercent = document.getElementById('import-progress-percent');
+const importProgressFill = document.getElementById('import-progress-fill');
+const importProgressFolders = document.getElementById('import-progress-folders');
 const importResults = document.getElementById('import-results');
 const exportBtn = document.getElementById('export-btn');
 const opacitySlider = document.getElementById('opacity-slider');
@@ -100,7 +121,82 @@ const unlinkBtn = document.getElementById('unlink-btn');
 // Initialize
 // ── Session persistence ────────────────────────────────────────────────────
 const SESSION_KEY = 'qdm_session';
+const IMPORT_CACHE_KEY = 'qdm_import_cache';
 let _saveTimer = null;
+
+function loadImportCache() {
+    try {
+        const raw = localStorage.getItem(IMPORT_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        return parsed;
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveImportCache(cache) {
+    try {
+        localStorage.setItem(IMPORT_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) {
+        /* localStorage unavailable */
+    }
+}
+
+function persistImportPath(path) {
+    const cache = loadImportCache() || {};
+    cache.path = path;
+    if (cache.cachedPath && cache.cachedPath !== path) {
+        delete cache.cachedPath;
+        delete cache.results;
+        delete cache.cachedAt;
+    }
+    saveImportCache(cache);
+}
+
+function persistImportResults(path, results) {
+    const cache = loadImportCache() || {};
+    cache.path = path;
+    cache.cachedPath = path;
+    cache.results = results;
+    cache.cachedAt = Date.now();
+    saveImportCache(cache);
+}
+
+function clearPersistedImportResults(path) {
+    const cache = loadImportCache() || {};
+    cache.path = path;
+    delete cache.cachedPath;
+    delete cache.results;
+    delete cache.cachedAt;
+    saveImportCache(cache);
+}
+
+function restoreImportState() {
+    const cache = loadImportCache();
+    if (!cache) {
+        renderImportResults();
+        return;
+    }
+
+    if (typeof cache.path === 'string') {
+        importPathInput.value = cache.path;
+    }
+
+    if (cache.cachedPath && cache.cachedPath === importPathInput.value.trim() && Array.isArray(cache.results)) {
+        importScanResults = cache.results;
+        renderImportResults();
+        const cachedDate = cache.cachedAt ? new Date(cache.cachedAt) : null;
+        const cachedLabel = cachedDate && !Number.isNaN(cachedDate.getTime())
+            ? `Loaded cached scan from ${cachedDate.toLocaleString()}. Press Scan to refresh.`
+            : 'Loaded cached scan. Press Scan to refresh.';
+        setImportStatus(cachedLabel, importScanResults.length ? 'success' : 'warning');
+        return;
+    }
+
+    renderImportResults();
+}
 
 function saveAppState() {
     clearTimeout(_saveTimer);
@@ -162,6 +258,7 @@ async function restoreAppState() {
 document.addEventListener('DOMContentLoaded', async () => {
     await loadFolders();
     setupEventListeners();
+    restoreImportState();
     await restoreAppState();
 });
 
@@ -502,6 +599,10 @@ function setToolsView(viewName, options = {}) {
     if (viewName === 'blur') {
         updateBlurPreview(Boolean(options.forceRefresh));
     }
+
+    if (viewName === 'mirror') {
+        updateMirrorPreview(Boolean(options.forceRefresh));
+    }
 }
 
 function pickBlurPreviewFilename(forceNew = false) {
@@ -515,6 +616,19 @@ function pickBlurPreviewFilename(forceNew = false) {
     }
 
     return blurPreviewFilename;
+}
+
+function pickMirrorPreviewFilename(forceNew = false) {
+    if (!images.length) {
+        mirrorPreviewFilename = '';
+        return '';
+    }
+
+    if (!mirrorPreviewFilename || forceNew || !images.includes(mirrorPreviewFilename)) {
+        mirrorPreviewFilename = images[Math.floor(Math.random() * images.length)];
+    }
+
+    return mirrorPreviewFilename;
 }
 
 function updateBlurPreview(forceNew = false) {
@@ -538,6 +652,40 @@ function updateBlurPreview(forceNew = false) {
     blurApplyBtn.disabled = false;
 }
 
+function updateMirrorPreview(forceNew = false) {
+    const filename = pickMirrorPreviewFilename(forceNew);
+    const horizontal = mirrorHorizontalInput.checked;
+    const vertical = mirrorVerticalInput.checked;
+
+    if (!filename || !currentFolder) {
+        mirrorPreviewName.textContent = 'No image selected';
+        mirrorPreviewImage.classList.add('hidden');
+        mirrorPreviewImage.removeAttribute('src');
+        mirrorPreviewEmpty.classList.remove('hidden');
+        mirrorApplyBtn.disabled = true;
+        return;
+    }
+
+    mirrorPreviewName.textContent = filename;
+    mirrorPreviewImage.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
+
+    const transforms = [];
+    if (horizontal) transforms.push('scaleX(-1)');
+    if (vertical) transforms.push('scaleY(-1)');
+    mirrorPreviewImage.style.transform = transforms.join(' ') || 'none';
+    mirrorPreviewImage.classList.remove('hidden');
+    mirrorPreviewEmpty.classList.add('hidden');
+    mirrorApplyBtn.disabled = !horizontal && !vertical;
+}
+
+function getMirrorExcludedControls() {
+    const excludedControls = [];
+    if (mirrorExcludeControl1Input.checked) excludedControls.push('Control1');
+    if (mirrorExcludeControl2Input.checked) excludedControls.push('Control2');
+    if (mirrorExcludeControl3Input.checked) excludedControls.push('Control3');
+    return excludedControls;
+}
+
 function openToolsModal() {
     if (!currentFolder) {
         alert('Please select a dataset folder first.');
@@ -558,6 +706,146 @@ function closeToolsModal() {
 function setImportStatus(message, type = 'info') {
     importStatus.textContent = message;
     importStatus.dataset.type = type;
+}
+
+function clearImportPolling() {
+    if (importPollTimer) {
+        clearTimeout(importPollTimer);
+        importPollTimer = null;
+    }
+}
+
+function releaseImportButton() {
+    if (!activeImportButton) return;
+    activeImportButton.disabled = false;
+    activeImportButton.textContent = 'Import Dataset';
+    activeImportButton = null;
+}
+
+function renderActiveImportCardProgress(job) {
+    if (!activeImportCard) return;
+
+    let progressBlock = activeImportCard.querySelector('.import-card-progress');
+    if (!job) {
+        if (progressBlock) progressBlock.remove();
+        activeImportCard.classList.remove('import-card-running', 'import-card-completed', 'import-card-error');
+        return;
+    }
+
+    if (!progressBlock) {
+        progressBlock = document.createElement('div');
+        progressBlock.className = 'import-card-progress';
+        activeImportCard.appendChild(progressBlock);
+    }
+
+    activeImportCard.classList.toggle('import-card-running', job.status !== 'completed' && job.status !== 'error');
+    activeImportCard.classList.toggle('import-card-completed', job.status === 'completed');
+    activeImportCard.classList.toggle('import-card-error', job.status === 'error');
+
+    const percent = Number(job.progressPercent || 0);
+    const summary = job.status === 'completed'
+        ? `Imported ${job.copiedFiles}/${job.totalFiles} files successfully.`
+        : job.status === 'error'
+            ? (job.error || `Import failed after ${job.copiedFiles}/${job.totalFiles} files.`)
+            : `Copying ${job.copiedFiles}/${job.totalFiles} files${job.currentFolder ? ` • ${job.currentFolder}` : ''}`;
+
+    progressBlock.innerHTML = `
+        <div class="import-card-progress-head">
+            <strong>${job.targetName}</strong>
+            <span>${percent.toFixed(1)}%</span>
+        </div>
+        <div class="import-card-progress-bar">
+            <div class="import-card-progress-fill" style="width: ${Math.max(0, Math.min(100, percent))}%"></div>
+        </div>
+        <p class="import-card-progress-text">${summary}</p>
+    `;
+}
+
+function renderImportProgress(job) {
+    if (!job) {
+        importProgressCard.classList.add('hidden');
+        importProgressFill.style.width = '0%';
+        importProgressFolders.innerHTML = '';
+        renderActiveImportCardProgress(null);
+        return;
+    }
+
+    importProgressCard.classList.remove('hidden');
+    importProgressTitle.textContent = `${job.sourceName} -> ${job.targetName}`;
+    importProgressSummary.textContent =
+        job.status === 'completed'
+            ? `Import completed. Copied ${job.copiedFiles} of ${job.totalFiles} files.`
+            : job.status === 'error'
+                ? `Import failed after copying ${job.copiedFiles} of ${job.totalFiles} files.`
+                : `Copying ${job.copiedFiles} of ${job.totalFiles} files${job.currentFolder ? ` • ${job.currentFolder}` : ''}`;
+
+    const percent = Number(job.progressPercent || 0);
+    importProgressPercent.textContent = `${percent.toFixed(1)}%`;
+    importProgressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+
+    const folderProgress = job.folderProgress || {};
+    importProgressFolders.innerHTML = Object.entries(folderProgress)
+        .map(([folderName, folderJob]) => {
+            const total = folderJob.total || 0;
+            const copied = folderJob.copied || 0;
+            const width = total ? Math.min(100, (copied / total) * 100) : 100;
+            return `
+                <div class="import-progress-folder">
+                    <strong>${folderName}</strong>
+                    <div class="import-progress-folder-bar">
+                        <div class="import-progress-folder-fill" style="width: ${width}%"></div>
+                    </div>
+                    <span>${copied}/${total}</span>
+                </div>
+            `;
+        })
+        .join('');
+
+    renderActiveImportCardProgress(job);
+}
+
+async function pollImportJob(jobId) {
+    try {
+        const response = await fetch(`/api/import/status/${encodeURIComponent(jobId)}`);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            activeImportJobId = null;
+            releaseImportButton();
+            setImportStatus(data.error || 'Failed to read import progress.', 'error');
+            return;
+        }
+
+        renderImportProgress(data);
+
+        if (data.status === 'completed') {
+            activeImportJobId = null;
+            if (activeImportButton) {
+                activeImportButton.disabled = false;
+                activeImportButton.textContent = 'Imported';
+            }
+            await loadFolders();
+            setImportStatus(`Imported ${data.sourceName} as ${data.targetName}. Copied ${data.copiedFiles}/${data.totalFiles} files.`, 'success');
+            return;
+        }
+
+        if (data.status === 'error') {
+            activeImportJobId = null;
+            if (activeImportButton) {
+                activeImportButton.disabled = false;
+                activeImportButton.textContent = 'Retry Import';
+            }
+            setImportStatus(data.error || 'Import failed.', 'error');
+            return;
+        }
+
+        importPollTimer = setTimeout(() => pollImportJob(jobId), 350);
+    } catch (error) {
+        console.error('Import progress polling failed:', error);
+        activeImportJobId = null;
+        releaseImportButton();
+        setImportStatus('Failed to update import progress. Check console for details.', 'error');
+    }
 }
 
 function renderImportResults() {
@@ -622,6 +910,8 @@ async function scanImportDatasets() {
     }
 
     try {
+        persistImportPath(path);
+        clearPersistedImportResults(path);
         importScanBtn.disabled = true;
         importScanBtn.textContent = 'Scanning...';
         setImportStatus('Scanning trainer export folders...', 'info');
@@ -635,6 +925,7 @@ async function scanImportDatasets() {
         const data = await response.json();
         if (data.success) {
             importScanResults = data.datasets || [];
+            persistImportResults(path, importScanResults);
             renderImportResults();
             setImportStatus(
                 importScanResults.length
@@ -644,6 +935,7 @@ async function scanImportDatasets() {
             );
         } else {
             importScanResults = [];
+            clearPersistedImportResults(path);
             renderImportResults();
             setImportStatus(data.error || 'Failed to scan trainer folder.', 'error');
         }
@@ -670,12 +962,31 @@ async function importTrainerDataset(sourceName, targetName, button) {
         return;
     }
 
-    try {
-        button.disabled = true;
-        button.textContent = 'Importing...';
-        setImportStatus(`Importing ${sourceName} as ${targetName}...`, 'info');
+    if (activeImportJobId) {
+        setImportStatus('Wait for the current import to finish before starting another one.', 'warning');
+        return;
+    }
 
-        const response = await fetch('/api/import/dataset', {
+    try {
+        clearImportPolling();
+        activeImportButton = button;
+        activeImportCard = button.closest('.import-dataset-card');
+        button.disabled = true;
+        button.textContent = 'Starting...';
+        setImportStatus(`Starting import for ${sourceName} as ${targetName}...`, 'info');
+        renderImportProgress({
+            sourceName,
+            targetName,
+            copiedFiles: 0,
+            totalFiles: 0,
+            progressPercent: 0,
+            currentFolder: null,
+            folderProgress: {},
+            status: 'queued'
+        });
+        activeImportCard?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+        const response = await fetch('/api/import/dataset/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -687,19 +998,33 @@ async function importTrainerDataset(sourceName, targetName, button) {
 
         const data = await response.json();
         if (data.success) {
-            await loadFolders();
-            setImportStatus(`Imported ${data.sourceName} as ${data.targetName}. Copied ${data.importedFiles} files.`, 'success');
-            alert(`Imported ${data.targetName} successfully.`);
+            activeImportJobId = data.jobId;
+            button.textContent = 'Importing...';
+            renderImportProgress({
+                sourceName: data.sourceName,
+                targetName: data.targetName,
+                copiedFiles: 0,
+                totalFiles: data.totalFiles,
+                progressPercent: 0,
+                currentFolder: null,
+                folderProgress: data.folderProgress || {},
+                status: 'queued'
+            });
+            setImportStatus(`Import job started for ${data.targetName}.`, 'info');
+            pollImportJob(data.jobId);
         } else {
+            activeImportJobId = null;
+            releaseImportButton();
+            renderImportProgress(null);
+            if (activeImportButton) activeImportButton.textContent = 'Retry Import';
             setImportStatus(data.error || 'Failed to import dataset.', 'error');
-            alert(`Failed to import dataset: ${data.error}`);
         }
     } catch (error) {
         console.error('Import dataset failed:', error);
+        activeImportJobId = null;
+        releaseImportButton();
+        renderImportProgress(null);
         setImportStatus('Failed to import dataset. Check console for details.', 'error');
-    } finally {
-        button.disabled = false;
-        button.textContent = 'Import Dataset';
     }
 }
 
@@ -1320,6 +1645,58 @@ async function createBlurredDatasetCopy() {
     }
 }
 
+async function createMirroredDatasetCopy() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    if (!images.length) {
+        alert('This dataset has no target images to mirror.');
+        return;
+    }
+
+    const horizontal = mirrorHorizontalInput.checked;
+    const vertical = mirrorVerticalInput.checked;
+    const excludedControls = getMirrorExcludedControls();
+    if (!horizontal && !vertical) {
+        alert('Select at least one mirror direction.');
+        return;
+    }
+
+    try {
+        mirrorApplyBtn.disabled = true;
+        mirrorRerollBtn.disabled = true;
+        mirrorApplyBtn.textContent = 'Creating...';
+
+        const response = await fetch(`/api/dataset/mirror?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ horizontal, vertical, excludedControls })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            const selectedFolder = currentFolder;
+            await loadFolders();
+            folderSelect.value = selectedFolder;
+            alert(`Created ${data.targetFolder}. Processed ${data.processed} images.`);
+            closeToolsModal();
+        } else {
+            alert(`Failed to create mirrored dataset: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Mirror dataset failed:', error);
+        alert('Failed to create mirrored dataset. Check console for details.');
+    } finally {
+        mirrorApplyBtn.disabled = false;
+        mirrorRerollBtn.disabled = false;
+        mirrorApplyBtn.textContent = mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy';
+        updateMirrorPreview(false);
+    }
+}
+
 // Export to AI-Toolkit format
 async function exportDataset() {
     if (!currentFolder) {
@@ -1523,7 +1900,7 @@ function setupEventListeners() {
     toolsCloseBtn.addEventListener('click', closeToolsModal);
     toolsNavButtons.forEach((button) => {
         button.addEventListener('click', () => {
-            setToolsView(button.dataset.toolView, { forceRefresh: button.dataset.toolView === 'blur' });
+            setToolsView(button.dataset.toolView, { forceRefresh: button.dataset.toolView === 'blur' || button.dataset.toolView === 'mirror' });
         });
     });
     reshuffleBtn.addEventListener('click', reshuffleDataset);
@@ -1532,7 +1909,27 @@ function setupEventListeners() {
     blurStrengthInput.addEventListener('input', () => updateBlurPreview(false));
     blurRerollBtn.addEventListener('click', () => updateBlurPreview(true));
     blurApplyBtn.addEventListener('click', createBlurredDatasetCopy);
+    mirrorHorizontalInput.addEventListener('change', () => updateMirrorPreview(false));
+    mirrorVerticalInput.addEventListener('change', () => updateMirrorPreview(false));
+    mirrorExcludeControl1Input.addEventListener('change', () => updateMirrorPreview(false));
+    mirrorExcludeControl2Input.addEventListener('change', () => updateMirrorPreview(false));
+    mirrorExcludeControl3Input.addEventListener('change', () => updateMirrorPreview(false));
+    mirrorRerollBtn.addEventListener('click', () => updateMirrorPreview(true));
+    mirrorApplyBtn.addEventListener('click', createMirroredDatasetCopy);
     importScanBtn.addEventListener('click', scanImportDatasets);
+    importPathInput.addEventListener('input', () => {
+        const nextPath = importPathInput.value.trim();
+        persistImportPath(nextPath);
+
+        const cache = loadImportCache();
+        if (!cache?.cachedPath || cache.cachedPath !== nextPath) {
+            importScanResults = [];
+            renderImportResults();
+            if (nextPath) {
+                setImportStatus('Path updated. Press Scan to build a fresh cache for this folder.', 'info');
+            }
+        }
+    });
     importPathInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
             e.preventDefault();

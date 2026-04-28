@@ -176,6 +176,10 @@
                             <strong>Blur</strong>
                             <span>Create a blurred copy with live preview before generation.</span>
                         </button>
+                        <button class="tools-nav-btn" data-tool-view="mirror" role="tab" aria-selected="false">
+                            <strong>Mirror</strong>
+                            <span>Flip every target and control image horizontally, vertically, or both into a new dataset copy.</span>
+                        </button>
                         <button class="tools-nav-btn" data-tool-view="import" role="tab" aria-selected="false">
                             <strong>Import</strong>
                             <span>Scan trainer export folders and rebuild grouped datasets inside this manager.</span>
@@ -309,6 +313,68 @@
                             </div>
                         </section>
 
+                        <section class="tools-detail-panel hidden" data-tool-panel="mirror">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Mirror</h3>
+                                    <p>Create a mirrored dataset copy with the suffix <strong>-mirror</strong>. You can flip horizontally, vertically, or both at once.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-toggle-grid">
+                                <label class="tools-toggle-card">
+                                    <input id="mirror-horizontal" type="checkbox" checked>
+                                    <span class="tools-toggle-card-body">
+                                        <strong>Horizontal</strong>
+                                        <span>Mirror left-to-right across every image in the dataset.</span>
+                                    </span>
+                                </label>
+                                <label class="tools-toggle-card">
+                                    <input id="mirror-vertical" type="checkbox">
+                                    <span class="tools-toggle-card-body">
+                                        <strong>Vertical</strong>
+                                        <span>Flip top-to-bottom. Can be combined with horizontal mirroring.</span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <div class="tools-setting-stack">
+                                <label>Do Not Mirror These Controls</label>
+                                <div class="tools-mirror-exclusions">
+                                    <label class="tools-chip-toggle">
+                                        <input id="mirror-exclude-control1" type="checkbox">
+                                        <span>Control1</span>
+                                    </label>
+                                    <label class="tools-chip-toggle">
+                                        <input id="mirror-exclude-control2" type="checkbox">
+                                        <span>Control2</span>
+                                    </label>
+                                    <label class="tools-chip-toggle">
+                                        <input id="mirror-exclude-control3" type="checkbox">
+                                        <span>Control3</span>
+                                    </label>
+                                </div>
+                                <p class="tools-inline-hint">Selected controls are copied into the new <strong>-mirror</strong> dataset without flipping. The target image is always mirrored.</p>
+                            </div>
+
+                            <div class="tools-preview-card">
+                                <div class="tools-preview-meta">
+                                    <span>Random target preview</span>
+                                    <span id="mirror-preview-name">No image selected</span>
+                                </div>
+                                <div class="tools-preview-frame">
+                                    <div id="mirror-preview-empty" class="tools-preview-empty">Select a dataset with target images to preview the mirror transform.</div>
+                                    <img id="mirror-preview-image" class="hidden" src="" alt="Mirror preview sample">
+                                </div>
+                                <p class="tools-preview-hint">The preview reflects the exact mirror directions selected above. The generated copy applies the same transform to targets and controls.</p>
+                            </div>
+
+                            <div class="tools-blur-actions">
+                                <button id="mirror-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
+                                <button id="mirror-apply-btn" class="action-btn export-btn" data-default-label="Create Mirrored Copy">Create Mirrored Copy</button>
+                            </div>
+                        </section>
+
                         <section class="tools-detail-panel hidden" data-tool-panel="import">
                             <div class="tools-panel-heading">
                                 <div>
@@ -324,6 +390,20 @@
                                     <button id="import-scan-btn" class="action-btn" data-default-label="Scan">Scan</button>
                                 </div>
                                 <p id="import-status" class="tools-inline-hint">Groups are detected from folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, <strong>dataset_ctr3</strong>.</p>
+                            </div>
+
+                            <div id="import-progress-card" class="import-progress-card hidden">
+                                <div class="import-progress-head">
+                                    <div>
+                                        <strong id="import-progress-title">Preparing import</strong>
+                                        <p id="import-progress-summary">Waiting for background job to start.</p>
+                                    </div>
+                                    <span id="import-progress-percent" class="import-progress-percent">0%</span>
+                                </div>
+                                <div class="import-progress-bar">
+                                    <div id="import-progress-fill" class="import-progress-fill"></div>
+                                </div>
+                                <div id="import-progress-folders" class="import-progress-folders"></div>
                             </div>
 
                             <div id="import-results" class="import-results empty">

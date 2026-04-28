@@ -612,7 +612,7 @@ select:focus {
   max-width: 100%;
   max-height: 440px;
   object-fit: contain;
-  transition: filter 0.14s linear;
+  transition: filter 0.14s linear, transform 0.18s ease;
 }
 
 .tools-preview-empty {
@@ -634,6 +634,89 @@ select:focus {
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
+}
+
+.tools-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+}
+
+.tools-toggle-card {
+  display: block;
+  cursor: pointer;
+}
+
+.tools-toggle-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tools-toggle-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 1rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  transition: all var(--transition);
+}
+
+.tools-toggle-card-body strong {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.tools-toggle-card-body span {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.tools-toggle-card input:checked + .tools-toggle-card-body {
+  border-color: var(--accent-border);
+  background: linear-gradient(180deg, rgba(255, 143, 163, 0.12), rgba(184, 169, 232, 0.08));
+  box-shadow: 0 10px 28px rgba(255, 143, 163, 0.08);
+}
+
+.tools-mirror-exclusions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.tools-chip-toggle {
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.tools-chip-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tools-chip-toggle span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 96px;
+  padding: 0.55rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  transition: all var(--transition);
+}
+
+.tools-chip-toggle input:checked + span {
+  border-color: rgba(255, 170, 0, 0.32);
+  background: rgba(255, 170, 0, 0.12);
+  color: #ffd37a;
 }
 
 .tools-action-footer {
@@ -695,6 +778,96 @@ select:focus {
 .tools-inline-hint[data-type="warning"] { color: var(--warning); }
 .tools-inline-hint[data-type="error"] { color: var(--error); }
 
+.import-progress-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 1rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(184, 169, 232, 0.22);
+  background: linear-gradient(180deg, rgba(184, 169, 232, 0.08), rgba(255, 143, 163, 0.05));
+}
+
+.import-progress-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.import-progress-head strong {
+  display: block;
+  margin-bottom: 0.2rem;
+  font-size: 14px;
+}
+
+.import-progress-head p {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.import-progress-percent {
+  font-family: var(--font-mono);
+  color: var(--accent-hover);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.import-progress-bar {
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.import-progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-lavender));
+  box-shadow: 0 0 18px rgba(255, 143, 163, 0.28);
+  transition: width 0.2s ease;
+}
+
+.import-progress-folders {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.import-progress-folder {
+  display: grid;
+  grid-template-columns: 110px 1fr auto;
+  gap: 0.75rem;
+  align-items: center;
+  font-size: 12px;
+}
+
+.import-progress-folder strong {
+  color: var(--text-primary);
+}
+
+.import-progress-folder-bar {
+  height: 7px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.import-progress-folder-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(255, 143, 163, 0.8), rgba(184, 169, 232, 0.85));
+  transition: width 0.2s ease;
+}
+
+.import-progress-folder span {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
 .import-results {
   display: grid;
   gap: 0.9rem;
@@ -720,6 +893,19 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 0.8rem;
+}
+
+.import-dataset-card.import-card-running {
+  border-color: rgba(184, 169, 232, 0.28);
+  box-shadow: 0 0 0 1px rgba(184, 169, 232, 0.08);
+}
+
+.import-dataset-card.import-card-completed {
+  border-color: rgba(0, 214, 143, 0.26);
+}
+
+.import-dataset-card.import-card-error {
+  border-color: rgba(255, 71, 87, 0.3);
 }
 
 .import-dataset-head {
@@ -789,6 +975,55 @@ select:focus {
 
 .import-target-row .tools-text-input {
   font-family: var(--font);
+}
+
+.import-card-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.8rem 0.9rem;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.import-card-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.import-card-progress-head strong {
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.import-card-progress-head span {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--accent-hover);
+}
+
+.import-card-progress-bar {
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.import-card-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-lavender));
+  transition: width 0.2s ease;
+}
+
+.import-card-progress-text {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
 }
 
 /* ─── Image Grid ─────────────────────────────────────────────────── */
@@ -2056,15 +2291,28 @@ input[type="range"]::-moz-range-thumb {
     grid-template-columns: 1fr;
   }
 
+  .tools-toggle-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tools-mirror-exclusions {
+    width: 100%;
+  }
+
   .tools-setting-row,
   .tools-preview-meta,
   .tools-blur-actions,
   .tools-inline-actions,
   .import-dataset-head,
+  .import-progress-head,
   .import-target-row,
   .import-folder-row {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .import-progress-folder {
+    grid-template-columns: 1fr;
   }
 
   .tools-range-wrap {
