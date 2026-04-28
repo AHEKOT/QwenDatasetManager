@@ -114,6 +114,10 @@ const mirrorPreviewEmpty = document.getElementById('mirror-preview-empty');
 const mirrorPreviewName = document.getElementById('mirror-preview-name');
 const mirrorRerollBtn = document.getElementById('mirror-reroll-btn');
 const mirrorApplyBtn = document.getElementById('mirror-apply-btn');
+const mergePrimaryName = document.getElementById('merge-primary-name');
+const mergeSecondarySelect = document.getElementById('merge-secondary-select');
+const mergeTargetNameInput = document.getElementById('merge-target-name');
+const mergeApplyBtn = document.getElementById('merge-apply-btn');
 const importPathInput = document.getElementById('import-path-input');
 const importScanBtn = document.getElementById('import-scan-btn');
 const importStatus = document.getElementById('import-status');
@@ -161,6 +165,8 @@ const SESSION_KEY = 'qdm_session';
 const IMPORT_CACHE_KEY = 'qdm_import_cache';
 let _saveTimer = null;
 let lastExportPath = '';
+const toolPollTimers = new Map();
+const toolJobContexts = new Map();
 
 function loadImportCache() {
     try {
@@ -839,6 +845,7 @@ function renderToolProgress(toolName, {
 
     if (!visible) {
         card.classList.add('hidden');
+        card.dataset.autoRevealed = '';
         return;
     }
 
@@ -863,6 +870,15 @@ function renderToolProgress(toolName, {
             </div>
         `)
         .join('');
+
+    if (state === 'running' && card.dataset.autoRevealed !== 'true') {
+        card.dataset.autoRevealed = 'true';
+        card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    if (state !== 'running') {
+        card.dataset.autoRevealed = '';
+    }
 }
 
 function showToolValidation(toolName, summary) {
@@ -874,11 +890,280 @@ function showToolValidation(toolName, summary) {
     });
 }
 
+function clearToolPolling(toolName) {
+    const timer = toolPollTimers.get(toolName);
+    if (timer) {
+        clearTimeout(timer);
+        toolPollTimers.delete(toolName);
+    }
+}
+
+function renderToolJobState(toolName, job) {
+    const context = toolJobContexts.get(toolName) || {};
+    const total = Number(job.totalItems || 0);
+    const processed = Number(job.processedItems || 0);
+    const percent = Number(job.progressPercent || 0);
+    const currentItem = job.currentItem || 'Preparing...';
+    const result = job.result || {};
+
+    if (job.status === 'error') {
+        const baseDetails = {
+            reshuffle: [{ label: 'Dataset', value: context.folderPath }],
+            compress: [{ label: 'Dataset', value: context.folderPath }],
+            fit: [{ label: 'Dataset', value: context.folderPath }],
+            blur: [{ label: 'Source Dataset', value: context.folderPath }],
+            mirror: [{ label: 'Source Dataset', value: context.folderPath }],
+            merge: [
+                { label: 'Primary', value: context.primaryFolder },
+                { label: 'Secondary', value: context.secondaryFolder },
+                { label: 'Output Name', value: context.targetName }
+            ]
+        };
+
+        renderToolProgress(toolName, {
+            state: 'error',
+            title: `${toolName[0].toUpperCase()}${toolName.slice(1)} failed`,
+            summary: job.error || 'The background job failed.',
+            percent: 100,
+            details: baseDetails[toolName] || []
+        });
+        return;
+    }
+
+    if (job.status === 'completed') {
+        const completedStates = {
+            reshuffle: {
+                title: 'Reshuffle complete',
+                summary: `Finished renaming ${result.count} synchronized image sets in ${context.folderPath}.`,
+                details: [
+                    { label: 'Renamed Sets', value: result.count },
+                    { label: 'Files Renamed', value: result.filesRenamed },
+                    { label: 'Dataset', value: context.folderPath }
+                ]
+            },
+            compress: {
+                title: 'Compression complete',
+                summary: `Optimized ${result.compressed} images and reduced dataset size by ${result.savingsMB} MB.`,
+                details: [
+                    { label: 'Compressed', value: result.compressed },
+                    { label: 'Original Size', value: `${result.originalSizeMB} MB` },
+                    { label: 'New Size', value: `${result.newSizeMB} MB` },
+                    { label: 'Savings', value: `${result.savingsMB} MB (${result.savingsPercent}%)` }
+                ]
+            },
+            fit: {
+                title: 'Fit complete',
+                summary: `Processed ${result.processed} image sets and updated ${result.updated} control images.`,
+                details: [
+                    { label: 'Processed Sets', value: result.processed },
+                    { label: 'Updated Controls', value: result.updated }
+                ]
+            },
+            blur: {
+                title: 'Blurred copy created',
+                summary: `Created ${result.targetFolder} and processed ${result.processed} images with the backend blur pipeline.`,
+                details: [
+                    { label: 'Output Dataset', value: result.targetFolder },
+                    { label: 'Strength', value: `${Number(result.strength).toFixed(1)} px` },
+                    { label: 'Processed Images', value: result.processed }
+                ]
+            },
+            mirror: {
+                title: 'Mirrored copy created',
+                summary: `Created ${result.targetFolder} and processed ${result.processed} images with the selected mirror settings.`,
+                details: [
+                    { label: 'Output Dataset', value: result.targetFolder },
+                    { label: 'Processed Images', value: result.processed },
+                    { label: 'Excluded Controls', value: (result.excludedControls || []).length ? result.excludedControls.join(', ') : 'None' }
+                ]
+            },
+            merge: {
+                title: 'Merge complete',
+                summary: `Created ${result.targetName} from two source datasets without changing the originals.`,
+                details: [
+                    { label: 'Output Dataset', value: result.targetName },
+                    { label: 'Primary Sets Copied', value: result.primaryCount },
+                    { label: 'Secondary Sets Copied', value: result.secondaryCount },
+                    { label: 'Total Sets', value: result.totalCount }
+                ]
+            }
+        };
+
+        const view = completedStates[toolName];
+        renderToolProgress(toolName, {
+            state: 'success',
+            title: view.title,
+            summary: view.summary,
+            percent: 100,
+            details: view.details
+        });
+        return;
+    }
+
+    const runningStates = {
+        reshuffle: {
+            title: 'Reshuffling dataset',
+            summary: total ? `Renamed ${processed}/${total} image sets${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Preparing filenames for reshuffle...',
+            details: [
+                { label: 'Dataset', value: context.folderPath },
+                { label: 'Progress', value: total ? `${processed}/${total} sets` : 'Preparing' },
+                { label: 'Files Renamed', value: job.metrics?.filesRenamed ?? 0 }
+            ]
+        },
+        compress: {
+            title: 'Compressing PNG files',
+            summary: total ? `Compressed ${processed}/${total} PNG files${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Collecting PNG files to compress...',
+            details: [
+                { label: 'Dataset', value: context.folderPath },
+                { label: 'Progress', value: total ? `${processed}/${total} files` : 'Preparing' },
+                { label: 'Original Size', value: job.metrics?.originalTotalSize ? `${(job.metrics.originalTotalSize / (1024 * 1024)).toFixed(2)} MB` : '0.00 MB' },
+                { label: 'New Size', value: job.metrics?.newTotalSize ? `${(job.metrics.newTotalSize / (1024 * 1024)).toFixed(2)} MB` : '0.00 MB' }
+            ]
+        },
+        fit: {
+            title: 'Fitting controls to targets',
+            summary: total ? `Processed ${processed}/${total} target image sets${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Preparing target/control pairs...',
+            details: [
+                { label: 'Dataset', value: context.folderPath },
+                { label: 'Progress', value: total ? `${processed}/${total} sets` : 'Preparing' },
+                { label: 'Updated Controls', value: job.metrics?.updated ?? 0 }
+            ]
+        },
+        blur: {
+            title: 'Generating blurred copy',
+            summary: total ? `Blurred ${processed}/${total} images${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Preparing dataset copy for blur...',
+            details: [
+                { label: 'Source Dataset', value: context.folderPath },
+                { label: 'Blur Strength', value: `${Number(context.strength || 0).toFixed(1)} px` },
+                { label: 'Progress', value: total ? `${processed}/${total} images` : 'Preparing' }
+            ]
+        },
+        mirror: {
+            title: 'Generating mirrored copy',
+            summary: total ? `Mirrored ${processed}/${total} images${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Preparing dataset copy for mirror...',
+            details: [
+                { label: 'Source Dataset', value: context.folderPath },
+                { label: 'Directions', value: [context.horizontal ? 'Horizontal' : null, context.vertical ? 'Vertical' : null].filter(Boolean).join(' + ') },
+                { label: 'Progress', value: total ? `${processed}/${total} images` : 'Preparing' },
+                { label: 'Excluded Controls', value: (context.excludedControls || []).length ? context.excludedControls.join(', ') : 'None' }
+            ]
+        },
+        merge: {
+            title: 'Merging datasets',
+            summary: total ? `Copied ${processed}/${total} synchronized image sets${job.currentItem ? ` • ${currentItem}` : ''}.` : 'Preparing merged dataset structure...',
+            details: [
+                { label: 'Primary', value: context.primaryFolder },
+                { label: 'Secondary', value: context.secondaryFolder },
+                { label: 'Progress', value: total ? `${processed}/${total} sets` : 'Preparing' },
+                { label: 'Primary Copied', value: job.metrics?.primaryCount ?? 0 },
+                { label: 'Secondary Copied', value: job.metrics?.secondaryCount ?? 0 },
+                { label: 'Output Name', value: context.targetName }
+            ]
+        }
+    };
+
+    const view = runningStates[toolName];
+    renderToolProgress(toolName, {
+        state: 'running',
+        title: view.title,
+        summary: view.summary,
+        percent,
+        details: view.details,
+        indeterminate: total === 0
+    });
+}
+
+async function pollToolJob(toolName, jobId, { onComplete, onFinally } = {}) {
+    try {
+        const response = await fetch(`/api/tool-jobs/status/${encodeURIComponent(jobId)}`);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            renderToolProgress(toolName, {
+                state: 'error',
+                title: `${toolName[0].toUpperCase()}${toolName.slice(1)} failed`,
+                summary: data.error || 'Failed to read tool progress.',
+                percent: 100
+            });
+            onFinally?.();
+            return;
+        }
+
+        renderToolJobState(toolName, data);
+
+        if (data.status === 'completed') {
+            await onComplete?.(data);
+            onFinally?.();
+            return;
+        }
+
+        if (data.status === 'error') {
+            onFinally?.();
+            return;
+        }
+
+        clearToolPolling(toolName);
+        toolPollTimers.set(toolName, setTimeout(() => pollToolJob(toolName, jobId, { onComplete, onFinally }), 200));
+    } catch (error) {
+        console.error(`${toolName} progress polling failed:`, error);
+        renderToolProgress(toolName, {
+            state: 'error',
+            title: `${toolName[0].toUpperCase()}${toolName.slice(1)} failed`,
+            summary: 'Failed to update progress. Check console for details.',
+            percent: 100
+        });
+        onFinally?.();
+    }
+}
+
+async function startToolJob(toolName, payload, { onComplete, onFinally } = {}) {
+    clearToolPolling(toolName);
+
+    const response = await fetch('/api/tool-jobs/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: toolName, payload })
+    });
+
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        throw new Error(data.error || 'Failed to start background job.');
+    }
+
+    await pollToolJob(toolName, data.jobId, { onComplete, onFinally });
+}
+
 function updateToolsContext() {
     if (!toolsCurrentFolder || !toolsCurrentCount) return;
 
     toolsCurrentFolder.textContent = currentFolder || 'No dataset';
     toolsCurrentCount.textContent = `${images.length} image${images.length !== 1 ? 's' : ''}`;
+
+    if (mergePrimaryName) {
+        mergePrimaryName.textContent = currentFolder || 'No dataset selected';
+    }
+
+    updateMergeOptions();
+}
+
+function updateMergeOptions() {
+    if (!mergeSecondarySelect) return;
+
+    const previousValue = mergeSecondarySelect.value;
+    mergeSecondarySelect.innerHTML = '<option value="">-- Select second dataset --</option>';
+
+    allFolders
+        .filter((folder) => folder.path !== currentFolder)
+        .forEach((folder) => {
+            const option = document.createElement('option');
+            option.value = folder.path;
+            option.textContent = folder.name;
+            mergeSecondarySelect.appendChild(option);
+        });
+
+    if (previousValue && Array.from(mergeSecondarySelect.options).some((option) => option.value === previousValue)) {
+        mergeSecondarySelect.value = previousValue;
+    }
 }
 
 function setToolsView(viewName, options = {}) {
@@ -901,6 +1186,13 @@ function setToolsView(viewName, options = {}) {
 
     if (viewName === 'mirror') {
         updateMirrorPreview(Boolean(options.forceRefresh));
+    }
+
+    if (viewName === 'merge') {
+        updateMergeOptions();
+        if (!mergeTargetNameInput.value && currentFolder) {
+            mergeTargetNameInput.value = `${currentFolder}_merged`;
+        }
     }
 }
 
@@ -1846,57 +2138,30 @@ async function reshuffleDataset() {
 
     try {
         setActionButtonBusy(reshuffleBtn, 'Shuffling...', true);
-        renderToolProgress('reshuffle', {
-            state: 'running',
-            title: 'Reshuffling dataset',
-            summary: 'Renaming targets, controls, and captions together. The window will keep showing progress until the server finishes.',
-            percent: 18,
-            indeterminate: true,
-            details: [
-                { label: 'Dataset', value: currentFolder },
-                { label: 'Image Sets', value: images.length }
-            ]
+        toolJobContexts.set('reshuffle', { folderPath: currentFolder });
+        await startToolJob('reshuffle', { folderPath: currentFolder }, {
+            onComplete: async () => {
+                bumpFolderBuster();
+                await loadImages(currentFolder);
+            },
+            onFinally: () => {
+                setActionButtonBusy(reshuffleBtn, 'Shuffling...', false);
+            }
         });
-
-        const response = await fetch(`/api/reshuffle?folder=${encodeURIComponent(currentFolder)}`, {
-            method: 'POST'
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            bumpFolderBuster();
-            renderToolProgress('reshuffle', {
-                state: 'success',
-                title: 'Reshuffle complete',
-                summary: `Finished renaming ${data.count} synchronized image sets in ${currentFolder}.`,
-                percent: 100,
-                details: [
-                    { label: 'Renamed Sets', value: data.count },
-                    { label: 'Dataset', value: currentFolder }
-                ]
-            });
-            loadImages(currentFolder);
-        } else {
-            renderToolProgress('reshuffle', {
-                state: 'error',
-                title: 'Reshuffle failed',
-                summary: data.error || 'The server could not reshuffle this dataset.',
-                percent: 100,
-                details: [{ label: 'Dataset', value: currentFolder }]
-            });
-        }
+        return;
     } catch (error) {
         console.error('Reshuffle failed:', error);
         renderToolProgress('reshuffle', {
             state: 'error',
             title: 'Reshuffle failed',
-            summary: 'The request failed before the server returned a result.',
+            summary: error.message || 'The request failed before the server started the job.',
             percent: 100,
             details: [{ label: 'Dataset', value: currentFolder }]
         });
     } finally {
-        setActionButtonBusy(reshuffleBtn, 'Shuffling...', false);
+        if (reshuffleBtn.disabled) {
+            setActionButtonBusy(reshuffleBtn, 'Shuffling...', false);
+        }
     }
 }
 
@@ -1908,58 +2173,35 @@ async function fitDataset() {
     }
 
     setActionButtonBusy(fitBtn, 'Processing...', true);
-    renderToolProgress('fit', {
-        state: 'running',
-        title: 'Fitting controls to targets',
-        summary: 'Resizing and letterboxing control images to match the target canvas size.',
-        percent: 20,
-        indeterminate: true,
-        details: [
-            { label: 'Dataset', value: currentFolder },
-            { label: 'Target Images', value: images.length }
-        ]
-    });
 
     try {
-        const response = await fetch(`/api/dataset/fit?folder=${encodeURIComponent(currentFolder)}`, {
-            method: 'POST'
+        toolJobContexts.set('fit', { folderPath: currentFolder });
+        await startToolJob('fit', { folderPath: currentFolder }, {
+            onComplete: async () => {
+                bumpFolderBuster();
+                if (modal.classList.contains('active')) {
+                    updatePreview();
+                }
+                await loadImages(currentFolder);
+            },
+            onFinally: () => {
+                setActionButtonBusy(fitBtn, 'Processing...', false);
+            }
         });
-
-        const data = await response.json();
-
-        if (data.success) {
-            renderToolProgress('fit', {
-                state: 'success',
-                title: 'Fit complete',
-                summary: `Processed ${data.processed} image sets and updated ${data.updated} control images.`,
-                percent: 100,
-                details: [
-                    { label: 'Processed Sets', value: data.processed },
-                    { label: 'Updated Controls', value: data.updated }
-                ]
-            });
-            bumpFolderBuster();
-            updatePreview();
-        } else {
-            renderToolProgress('fit', {
-                state: 'error',
-                title: 'Fit failed',
-                summary: data.error || 'The server could not fit this dataset.',
-                percent: 100,
-                details: [{ label: 'Dataset', value: currentFolder }]
-            });
-        }
+        return;
     } catch (error) {
         console.error('Fit dataset error:', error);
         renderToolProgress('fit', {
             state: 'error',
             title: 'Fit failed',
-            summary: 'The request failed before the server returned a result.',
+            summary: error.message || 'The request failed before the server started the job.',
             percent: 100,
             details: [{ label: 'Dataset', value: currentFolder }]
         });
     } finally {
-        setActionButtonBusy(fitBtn, 'Processing...', false);
+        if (fitBtn.disabled) {
+            setActionButtonBusy(fitBtn, 'Processing...', false);
+        }
     }
 }
 
@@ -1971,59 +2213,30 @@ async function compressDataset() {
 
     try {
         setActionButtonBusy(compressBtn, 'Compressing...', true);
-        renderToolProgress('compress', {
-            state: 'running',
-            title: 'Compressing PNG files',
-            summary: 'Optimizing dataset images for lower storage use while keeping the current folder layout.',
-            percent: 18,
-            indeterminate: true,
-            details: [
-                { label: 'Dataset', value: currentFolder },
-                { label: 'Target Images', value: images.length }
-            ]
+        toolJobContexts.set('compress', { folderPath: currentFolder });
+        await startToolJob('compress', { folderPath: currentFolder }, {
+            onComplete: async () => {
+                bumpFolderBuster();
+                await loadImages(currentFolder);
+            },
+            onFinally: () => {
+                setActionButtonBusy(compressBtn, 'Compressing...', false);
+            }
         });
-
-        const response = await fetch(`/api/compress?folder=${encodeURIComponent(currentFolder)}`, {
-            method: 'POST'
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            bumpFolderBuster();
-            renderToolProgress('compress', {
-                state: 'success',
-                title: 'Compression complete',
-                summary: `Optimized ${data.compressed} images and reduced dataset size by ${data.savingsMB} MB.`,
-                percent: 100,
-                details: [
-                    { label: 'Compressed', value: data.compressed },
-                    { label: 'Original Size', value: `${data.originalSizeMB} MB` },
-                    { label: 'New Size', value: `${data.newSizeMB} MB` },
-                    { label: 'Savings', value: `${data.savingsMB} MB (${data.savingsPercent}%)` }
-                ]
-            });
-            loadImages(currentFolder);
-        } else {
-            renderToolProgress('compress', {
-                state: 'error',
-                title: 'Compression failed',
-                summary: data.error || 'The server could not compress this dataset.',
-                percent: 100,
-                details: [{ label: 'Dataset', value: currentFolder }]
-            });
-        }
+        return;
     } catch (error) {
         console.error('Compress failed:', error);
         renderToolProgress('compress', {
             state: 'error',
             title: 'Compression failed',
-            summary: 'The request failed before the server returned a result.',
+            summary: error.message || 'The request failed before the server started the job.',
             percent: 100,
             details: [{ label: 'Dataset', value: currentFolder }]
         });
     } finally {
-        setActionButtonBusy(compressBtn, 'Compressing...', false);
+        if (compressBtn.disabled) {
+            setActionButtonBusy(compressBtn, 'Compressing...', false);
+        }
     }
 }
 
@@ -2044,64 +2257,35 @@ async function createBlurredDatasetCopy() {
         blurApplyBtn.disabled = true;
         blurRerollBtn.disabled = true;
         setActionButtonLabel(blurApplyBtn, 'Creating...');
-        renderToolProgress('blur', {
-            state: 'running',
-            title: 'Generating blurred copy',
-            summary: `Applying ${strength.toFixed(1)} px blur to targets and controls in a new dataset copy.`,
-            percent: 22,
-            indeterminate: true,
-            details: [
-                { label: 'Source Dataset', value: currentFolder },
-                { label: 'Blur Strength', value: `${strength.toFixed(1)} px` },
-                { label: 'Target Images', value: images.length }
-            ]
+        toolJobContexts.set('blur', { folderPath: currentFolder, strength });
+        await startToolJob('blur', { folderPath: currentFolder, strength }, {
+            onComplete: async () => {
+                const selectedFolder = currentFolder;
+                await loadFolders();
+                folderSelect.value = selectedFolder;
+            },
+            onFinally: () => {
+                blurApplyBtn.disabled = false;
+                blurRerollBtn.disabled = false;
+                setActionButtonLabel(blurApplyBtn, blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy');
+            }
         });
-
-        const response = await fetch(`/api/dataset/blur?folder=${encodeURIComponent(currentFolder)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ strength })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            const selectedFolder = currentFolder;
-            await loadFolders();
-            folderSelect.value = selectedFolder;
-            renderToolProgress('blur', {
-                state: 'success',
-                title: 'Blurred copy created',
-                summary: `Created ${data.targetFolder} and processed ${data.processedImages} images with the backend blur pipeline.`,
-                percent: 100,
-                details: [
-                    { label: 'Output Dataset', value: data.targetFolder },
-                    { label: 'Strength', value: `${Number(data.strength).toFixed(1)} px` },
-                    { label: 'Processed Images', value: data.processedImages }
-                ]
-            });
-        } else {
-            renderToolProgress('blur', {
-                state: 'error',
-                title: 'Blur generation failed',
-                summary: data.error || 'The server could not generate the blurred dataset.',
-                percent: 100,
-                details: [{ label: 'Source Dataset', value: currentFolder }]
-            });
-        }
+        return;
     } catch (error) {
         console.error('Blur dataset failed:', error);
         renderToolProgress('blur', {
             state: 'error',
             title: 'Blur generation failed',
-            summary: 'The request failed before the server returned a result.',
+            summary: error.message || 'The request failed before the server started the job.',
             percent: 100,
             details: [{ label: 'Source Dataset', value: currentFolder }]
         });
     } finally {
-        blurApplyBtn.disabled = false;
-        blurRerollBtn.disabled = false;
-        setActionButtonLabel(blurApplyBtn, blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy');
+        if (blurApplyBtn.disabled) {
+            blurApplyBtn.disabled = false;
+            blurRerollBtn.disabled = false;
+            setActionButtonLabel(blurApplyBtn, blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy');
+        }
     }
 }
 
@@ -2128,65 +2312,95 @@ async function createMirroredDatasetCopy() {
         mirrorApplyBtn.disabled = true;
         mirrorRerollBtn.disabled = true;
         setActionButtonLabel(mirrorApplyBtn, 'Creating...');
-        renderToolProgress('mirror', {
-            state: 'running',
-            title: 'Generating mirrored copy',
-            summary: 'Applying the selected mirror directions and copying excluded controls unchanged into the new dataset.',
-            percent: 22,
-            indeterminate: true,
-            details: [
-                { label: 'Source Dataset', value: currentFolder },
-                { label: 'Directions', value: [horizontal ? 'Horizontal' : null, vertical ? 'Vertical' : null].filter(Boolean).join(' + ') },
-                { label: 'Excluded Controls', value: excludedControls.length ? excludedControls.join(', ') : 'None' }
-            ]
+        toolJobContexts.set('mirror', { folderPath: currentFolder, horizontal, vertical, excludedControls });
+        await startToolJob('mirror', { folderPath: currentFolder, horizontal, vertical, excludedControls }, {
+            onComplete: async () => {
+                const selectedFolder = currentFolder;
+                await loadFolders();
+                folderSelect.value = selectedFolder;
+            },
+            onFinally: () => {
+                mirrorApplyBtn.disabled = false;
+                mirrorRerollBtn.disabled = false;
+                setActionButtonLabel(mirrorApplyBtn, mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy');
+                updateMirrorPreview(false);
+            }
         });
-
-        const response = await fetch(`/api/dataset/mirror?folder=${encodeURIComponent(currentFolder)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ horizontal, vertical, excludedControls })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            const selectedFolder = currentFolder;
-            await loadFolders();
-            folderSelect.value = selectedFolder;
-            renderToolProgress('mirror', {
-                state: 'success',
-                title: 'Mirrored copy created',
-                summary: `Created ${data.targetFolder} and processed ${data.processed} images with the selected mirror settings.`,
-                percent: 100,
-                details: [
-                    { label: 'Output Dataset', value: data.targetFolder },
-                    { label: 'Processed Images', value: data.processed },
-                    { label: 'Excluded Controls', value: excludedControls.length ? excludedControls.join(', ') : 'None' }
-                ]
-            });
-        } else {
-            renderToolProgress('mirror', {
-                state: 'error',
-                title: 'Mirror generation failed',
-                summary: data.error || 'The server could not generate the mirrored dataset.',
-                percent: 100,
-                details: [{ label: 'Source Dataset', value: currentFolder }]
-            });
-        }
+        return;
     } catch (error) {
         console.error('Mirror dataset failed:', error);
         renderToolProgress('mirror', {
             state: 'error',
             title: 'Mirror generation failed',
-            summary: 'The request failed before the server returned a result.',
+            summary: error.message || 'The request failed before the server started the job.',
             percent: 100,
             details: [{ label: 'Source Dataset', value: currentFolder }]
         });
     } finally {
-        mirrorApplyBtn.disabled = false;
-        mirrorRerollBtn.disabled = false;
-        setActionButtonLabel(mirrorApplyBtn, mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy');
-        updateMirrorPreview(false);
+        if (mirrorApplyBtn.disabled) {
+            mirrorApplyBtn.disabled = false;
+            mirrorRerollBtn.disabled = false;
+            setActionButtonLabel(mirrorApplyBtn, mirrorApplyBtn.dataset.defaultLabel || 'Create Mirrored Copy');
+            updateMirrorPreview(false);
+        }
+    }
+}
+
+async function createMergedDataset() {
+    if (!currentFolder) {
+        showToolValidation('merge', 'Select the primary dataset before running merge.');
+        return;
+    }
+
+    const secondaryFolder = mergeSecondarySelect.value;
+    const targetName = mergeTargetNameInput.value.trim();
+
+    if (!secondaryFolder) {
+        showToolValidation('merge', 'Choose the second dataset to merge with the active one.');
+        return;
+    }
+
+    if (!targetName) {
+        showToolValidation('merge', 'Enter the name for the new merged dataset.');
+        mergeTargetNameInput.focus();
+        return;
+    }
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(targetName)) {
+        showToolValidation('merge', 'The new dataset name can only contain letters, numbers, underscores, and hyphens.');
+        mergeTargetNameInput.focus();
+        return;
+    }
+
+    try {
+        setActionButtonBusy(mergeApplyBtn, 'Merging...', true);
+        toolJobContexts.set('merge', { primaryFolder: currentFolder, secondaryFolder, targetName });
+        await startToolJob('merge', { primaryFolder: currentFolder, secondaryFolder, targetName }, {
+            onComplete: async () => {
+                await loadFolders();
+            },
+            onFinally: () => {
+                setActionButtonBusy(mergeApplyBtn, 'Merging...', false);
+            }
+        });
+        return;
+    } catch (error) {
+        console.error('Merge dataset failed:', error);
+        renderToolProgress('merge', {
+            state: 'error',
+            title: 'Merge failed',
+            summary: error.message || 'The request failed before the server started the job.',
+            percent: 100,
+            details: [
+                { label: 'Primary', value: currentFolder },
+                { label: 'Secondary', value: secondaryFolder },
+                { label: 'Output Name', value: targetName }
+            ]
+        });
+    } finally {
+        if (mergeApplyBtn.disabled) {
+            setActionButtonBusy(mergeApplyBtn, 'Merging...', false);
+        }
     }
 }
 
@@ -2459,6 +2673,18 @@ function setupEventListeners() {
     mirrorExcludeControl3Input.addEventListener('change', () => updateMirrorPreview(false));
     mirrorRerollBtn.addEventListener('click', () => updateMirrorPreview(true));
     mirrorApplyBtn.addEventListener('click', createMirroredDatasetCopy);
+    mergeApplyBtn.addEventListener('click', createMergedDataset);
+    mergeSecondarySelect.addEventListener('change', () => {
+        if (!mergeTargetNameInput.value.trim() && currentFolder && mergeSecondarySelect.value) {
+            mergeTargetNameInput.value = `${currentFolder}_merged`;
+        }
+    });
+    mergeTargetNameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            createMergedDataset();
+        }
+    });
     importScanBtn.addEventListener('click', scanImportDatasets);
     importPathInput.addEventListener('input', () => {
         const nextPath = importPathInput.value.trim();

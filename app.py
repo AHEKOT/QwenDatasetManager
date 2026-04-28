@@ -1,5 +1,5 @@
 from flask import Flask, send_from_directory, jsonify, request, send_file
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask_cors import CORS
 import os
 import re
@@ -20,6 +20,8 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 DATASET_IMAGE_FOLDERS = ('img', 'Control1', 'Control2', 'Control3')
 IMPORT_JOBS = {}
 IMPORT_JOBS_LOCK = threading.Lock()
+TOOL_JOBS = {}
+TOOL_JOBS_LOCK = threading.Lock()
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
@@ -69,6 +71,22 @@ def apply_dataset_mirror(image, horizontal=False, vertical=False, image_format=N
         output = output.convert('RGB')
 
     return output, normalized_format
+
+
+def generate_unique_dataset_basename(target_dataset_dir):
+    chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+    target_img_dir = target_dataset_dir / 'img'
+
+    while True:
+        name = ''.join(random.choices(chars, k=8))
+        is_unique = True
+        for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']:
+            if (target_img_dir / f"{name}{ext}").exists():
+                is_unique = False
+                break
+
+        if is_unique:
+            return name
 
 
 def scan_exported_dataset_groups(scan_dir):
@@ -252,6 +270,459 @@ def run_import_job(job_id, folder_plans, target_dir):
             job_id,
             status='error',
             currentFolder=None,
+            error=str(e),
+            finished=True
+        )
+
+
+def update_tool_job(job_id, **changes):
+    with TOOL_JOBS_LOCK:
+        job = TOOL_JOBS.get(job_id)
+        if not job:
+            return None
+        job.update(changes)
+        return dict(job)
+
+
+def set_tool_job_total(job_id, total_items):
+    with TOOL_JOBS_LOCK:
+        job = TOOL_JOBS.get(job_id)
+        if not job:
+            return
+        job['totalItems'] = total_items
+        job['progressPercent'] = round((job['processedItems'] / total_items) * 100, 1) if total_items else 100.0
+
+
+def increment_tool_job_progress(job_id, processed_delta=1, current_item=None, metrics=None):
+    with TOOL_JOBS_LOCK:
+        job = TOOL_JOBS.get(job_id)
+        if not job:
+            return
+
+        job['processedItems'] += processed_delta
+        if current_item is not None:
+            job['currentItem'] = current_item
+
+        if metrics:
+            for key, value in metrics.items():
+                job['metrics'][key] = value
+
+        total = job['totalItems']
+        job['progressPercent'] = round((job['processedItems'] / total) * 100, 1) if total else 100.0
+
+
+def _collect_dataset_file_structure(dataset_dir):
+    img_dir = dataset_dir / 'img'
+    if not img_dir.exists():
+        raise FileNotFoundError('Image directory not found')
+
+    folders_to_process = list(DATASET_IMAGE_FOLDERS)
+    primary_basenames = set()
+    for file in img_dir.iterdir():
+        if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS:
+            primary_basenames.add(file.stem)
+
+    file_structure = {}
+    for basename in primary_basenames:
+        file_structure[basename] = {}
+        for folder_name in folders_to_process:
+            folder = dataset_dir / folder_name
+            if not folder.exists():
+                continue
+
+            extensions = []
+            for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt']:
+                file_path = folder / f"{basename}{ext}"
+                if file_path.exists():
+                    extensions.append(ext)
+
+            if extensions:
+                file_structure[basename][folder_name] = extensions
+
+    return file_structure
+
+
+def process_reshuffle_job(job_id, folder_path):
+    dataset_dir = DATASETS_DIR / folder_path
+    if not dataset_dir.exists():
+        raise FileNotFoundError('Dataset not found')
+
+    file_structure = _collect_dataset_file_structure(dataset_dir)
+    basenames_list = list(file_structure.keys())
+    if not basenames_list:
+        raise FileNotFoundError('No images found')
+
+    set_tool_job_total(job_id, len(basenames_list))
+    random.shuffle(basenames_list)
+    used_names = set()
+    rename_count = 0
+
+    def generate_unique_name():
+        while True:
+            name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+            if name not in used_names:
+                used_names.add(name)
+                return name
+
+    for basename in basenames_list:
+        new_basename = generate_unique_name()
+        for folder_name, extensions in file_structure[basename].items():
+            folder = dataset_dir / folder_name
+            for ext in extensions:
+                old_path = folder / f"{basename}{ext}"
+                new_path = folder / f"{new_basename}{ext}"
+                if old_path.exists():
+                    old_path.rename(new_path)
+                    rename_count += 1
+
+        increment_tool_job_progress(job_id, current_item=basename, metrics={'filesRenamed': rename_count})
+
+    return {
+        'count': len(basenames_list),
+        'filesRenamed': rename_count,
+        'folder': folder_path
+    }
+
+
+def process_compress_job(job_id, folder_path):
+    from PIL import Image
+
+    dataset_dir = DATASETS_DIR / folder_path
+    folders_to_process = list(DATASET_IMAGE_FOLDERS)
+    files_to_compress = []
+    for folder_name in folders_to_process:
+        folder = dataset_dir / folder_name
+        if not folder.exists():
+            continue
+        for file_path in folder.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() == '.png':
+                files_to_compress.append(file_path)
+
+    set_tool_job_total(job_id, len(files_to_compress))
+    if not files_to_compress:
+        return {
+            'compressed': 0,
+            'originalSizeMB': 0,
+            'newSizeMB': 0,
+            'savingsMB': 0,
+            'savingsPercent': 0
+        }
+
+    def compress_single_image(file_path):
+        orig_size = file_path.stat().st_size
+        with Image.open(file_path) as img:
+            img.save(file_path, 'PNG', optimize=True, compress_level=9)
+        new_size = file_path.stat().st_size
+        return file_path.name, orig_size, new_size
+
+    max_workers = min(16, (os.cpu_count() or 4) * 2)
+    compressed_count = 0
+    original_total_size = 0
+    new_total_size = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(compress_single_image, file_path) for file_path in files_to_compress]
+        for future in as_completed(futures):
+            file_name, o_size, n_size = future.result()
+            compressed_count += 1
+            original_total_size += o_size
+            new_total_size += n_size
+            increment_tool_job_progress(job_id, current_item=file_name, metrics={
+                'compressed': compressed_count,
+                'originalTotalSize': original_total_size,
+                'newTotalSize': new_total_size
+            })
+
+    savings_mb = (original_total_size - new_total_size) / (1024 * 1024)
+    savings_percent = ((original_total_size - new_total_size) / original_total_size * 100) if original_total_size > 0 else 0
+    return {
+        'compressed': compressed_count,
+        'originalSizeMB': round(original_total_size / (1024 * 1024), 2),
+        'newSizeMB': round(new_total_size / (1024 * 1024), 2),
+        'savingsMB': round(savings_mb, 2),
+        'savingsPercent': round(savings_percent, 1)
+    }
+
+
+def process_blur_job(job_id, folder_path, strength):
+    from PIL import Image
+
+    source_dir = DATASETS_DIR / folder_path
+    if not source_dir.exists():
+        raise FileNotFoundError('Dataset not found')
+
+    source_images = list(iter_dataset_images(source_dir))
+    if not source_images:
+        raise FileNotFoundError('No images found in dataset')
+
+    target_dir = source_dir.parent / f"{source_dir.name}-blured"
+    if target_dir.exists():
+        raise FileExistsError(f'Dataset "{target_dir.name}" already exists')
+
+    try:
+        shutil.copytree(source_dir, target_dir)
+        target_images = list(iter_dataset_images(target_dir))
+        set_tool_job_total(job_id, len(target_images))
+
+        processed_count = 0
+        for file_path in target_images:
+            with Image.open(file_path) as img:
+                output, image_format = apply_dataset_blur(img, strength, img.format or file_path.suffix.lstrip('.'))
+
+            save_kwargs = {}
+            if image_format == 'PNG':
+                save_kwargs['optimize'] = True
+
+            output.save(file_path, image_format, **save_kwargs)
+            processed_count += 1
+            increment_tool_job_progress(job_id, current_item=file_path.name)
+
+        return {
+            'processed': processed_count,
+            'strength': strength,
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name
+        }
+    except Exception:
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise
+
+
+def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_controls):
+    from PIL import Image
+
+    source_dir = DATASETS_DIR / folder_path
+    if not source_dir.exists():
+        raise FileNotFoundError('Dataset not found')
+
+    source_images = list(iter_dataset_images(source_dir))
+    if not source_images:
+        raise FileNotFoundError('No images found in dataset')
+
+    target_dir = source_dir.parent / f"{source_dir.name}-mirror"
+    if target_dir.exists():
+        raise FileExistsError(f'Dataset "{target_dir.name}" already exists')
+
+    try:
+        shutil.copytree(source_dir, target_dir)
+        target_images = [
+            file_path for file_path in iter_dataset_images(target_dir)
+            if file_path.parent.name not in excluded_controls
+        ]
+        set_tool_job_total(job_id, len(target_images))
+
+        processed_count = 0
+        for file_path in target_images:
+            with Image.open(file_path) as img:
+                output, image_format = apply_dataset_mirror(
+                    img,
+                    horizontal=horizontal,
+                    vertical=vertical,
+                    image_format=img.format or file_path.suffix.lstrip('.')
+                )
+
+            save_kwargs = {}
+            if image_format == 'PNG':
+                save_kwargs['optimize'] = True
+
+            output.save(file_path, image_format, **save_kwargs)
+            processed_count += 1
+            increment_tool_job_progress(job_id, current_item=file_path.name)
+
+        return {
+            'processed': processed_count,
+            'horizontal': horizontal,
+            'vertical': vertical,
+            'excludedControls': sorted(excluded_controls),
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name
+        }
+    except Exception:
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise
+
+
+def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
+    primary_dir = DATASETS_DIR / primary_folder
+    secondary_dir = DATASETS_DIR / secondary_folder
+    target_dir = DATASETS_DIR / target_name
+
+    for source_dir, label in ((primary_dir, 'Primary'), (secondary_dir, 'Secondary')):
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f'{label} dataset not found')
+        if not (source_dir / 'img').exists():
+            raise ValueError(f'{label} dataset is missing its img folder')
+
+    if target_dir.exists():
+        raise FileExistsError(f'Dataset "{target_name}" already exists')
+
+    primary_images = [file_path for file_path in sorted((primary_dir / 'img').iterdir()) if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS]
+    secondary_images = [file_path for file_path in sorted((secondary_dir / 'img').iterdir()) if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS]
+    total_sets = len(primary_images) + len(secondary_images)
+    if total_sets == 0:
+        raise ValueError('No image sets found to merge')
+
+    try:
+        for folder_name in DATASET_IMAGE_FOLDERS:
+            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+
+        set_tool_job_total(job_id, total_sets)
+        counts = {'primary': 0, 'secondary': 0}
+
+        def copy_dataset_sets(source_dir, bucket_name, image_paths):
+            copied_sets = 0
+            for image_path in image_paths:
+                source_basename = image_path.stem
+                target_basename = generate_unique_dataset_basename(target_dir)
+
+                for folder_name in DATASET_IMAGE_FOLDERS:
+                    source_folder = source_dir / folder_name
+                    target_folder = target_dir / folder_name
+
+                    if folder_name == 'img':
+                        for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                            src_file = source_folder / f"{source_basename}{ext}"
+                            if src_file.exists():
+                                shutil.copy2(src_file, target_folder / f"{target_basename}{src_file.suffix}")
+                                break
+
+                        caption_path = source_folder / f"{source_basename}.txt"
+                        if caption_path.exists():
+                            shutil.copy2(caption_path, target_folder / f"{target_basename}.txt")
+                        continue
+
+                    for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                        src_file = source_folder / f"{source_basename}{ext}"
+                        if src_file.exists():
+                            shutil.copy2(src_file, target_folder / f"{target_basename}{src_file.suffix}")
+                            break
+
+                copied_sets += 1
+                counts[bucket_name] = copied_sets
+                increment_tool_job_progress(job_id, current_item=image_path.name, metrics={
+                    'primaryCount': counts['primary'],
+                    'secondaryCount': counts['secondary']
+                })
+
+            return copied_sets
+
+        primary_count = copy_dataset_sets(primary_dir, 'primary', primary_images)
+        secondary_count = copy_dataset_sets(secondary_dir, 'secondary', secondary_images)
+
+        return {
+            'primaryFolder': primary_folder,
+            'secondaryFolder': secondary_folder,
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name,
+            'primaryCount': primary_count,
+            'secondaryCount': secondary_count,
+            'totalCount': total_sets
+        }
+    except Exception:
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise
+
+
+def process_fit_job(job_id, folder_path):
+    from PIL import Image, ImageOps
+
+    dataset_dir = DATASETS_DIR / folder_path
+    if not dataset_dir.exists():
+        raise FileNotFoundError('Dataset not found')
+
+    img_dir = dataset_dir / 'img'
+    control_folders = ['Control1', 'Control2', 'Control3']
+    if not img_dir.exists():
+        raise FileNotFoundError('Primary image directory (img) not found')
+
+    primary_images = {
+        f.stem: f for f in img_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+    }
+    if not primary_images:
+        raise FileNotFoundError('No primary images found in img folder')
+
+    set_tool_job_total(job_id, len(primary_images))
+    processed_count = 0
+    updated_count = 0
+
+    for basename, primary_path in primary_images.items():
+        processed_count += 1
+        with Image.open(primary_path) as p_img:
+            target_size = p_img.size
+
+        for ctrl_folder in control_folders:
+            ctrl_dir = dataset_dir / ctrl_folder
+            if not ctrl_dir.exists():
+                continue
+
+            ctrl_path = None
+            for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                temp_path = ctrl_dir / f"{basename}{ext}"
+                if temp_path.exists():
+                    ctrl_path = temp_path
+                    break
+
+            if not ctrl_path:
+                continue
+
+            with Image.open(ctrl_path) as c_img:
+                if c_img.size == target_size:
+                    continue
+
+                new_img = ImageOps.pad(c_img, target_size, color=(0, 0, 0), centering=(0.5, 0.5))
+                new_img.save(ctrl_path)
+                updated_count += 1
+
+        increment_tool_job_progress(job_id, current_item=primary_path.name, metrics={'updated': updated_count})
+
+    return {
+        'processed': processed_count,
+        'updated': updated_count
+    }
+
+
+def run_tool_job(job_id, tool_name, payload):
+    try:
+        update_tool_job(job_id, status='running', started=True)
+
+        if tool_name == 'reshuffle':
+            result = process_reshuffle_job(job_id, payload['folderPath'])
+        elif tool_name == 'compress':
+            result = process_compress_job(job_id, payload['folderPath'])
+        elif tool_name == 'blur':
+            result = process_blur_job(job_id, payload['folderPath'], float(payload['strength']))
+        elif tool_name == 'mirror':
+            result = process_mirror_job(
+                job_id,
+                payload['folderPath'],
+                bool(payload['horizontal']),
+                bool(payload['vertical']),
+                set(payload.get('excludedControls') or [])
+            )
+        elif tool_name == 'merge':
+            result = process_merge_job(job_id, payload['primaryFolder'], payload['secondaryFolder'], payload['targetName'])
+        elif tool_name == 'fit':
+            result = process_fit_job(job_id, payload['folderPath'])
+        else:
+            raise ValueError('Unsupported tool job')
+
+        update_tool_job(
+            job_id,
+            status='completed',
+            currentItem=None,
+            progressPercent=100.0,
+            finished=True,
+            result=result
+        )
+    except Exception as e:
+        update_tool_job(
+            job_id,
+            status='error',
+            currentItem=None,
             error=str(e),
             finished=True
         )
@@ -1054,6 +1525,105 @@ def mirror_dataset():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/dataset/merge', methods=['POST'])
+def merge_datasets():
+    """Merge two datasets into a new third dataset using fresh unique basenames."""
+    data = request.get_json() or {}
+    primary_folder = data.get('primaryFolder', '').strip()
+    secondary_folder = data.get('secondaryFolder', '').strip()
+    target_name = data.get('targetName', '').strip()
+    target_dir = None
+
+    try:
+        if not primary_folder or not secondary_folder:
+            return jsonify({'error': 'Both source datasets are required'}), 400
+
+        if primary_folder == secondary_folder:
+            return jsonify({'error': 'Choose two different datasets to merge'}), 400
+
+        if not target_name:
+            return jsonify({'error': 'Target dataset name is required'}), 400
+
+        if not re.match(r'^[a-zA-Z0-9_-]+$', target_name):
+            return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
+
+        primary_dir = DATASETS_DIR / primary_folder
+        secondary_dir = DATASETS_DIR / secondary_folder
+        target_dir = DATASETS_DIR / target_name
+
+        for source_dir, label in ((primary_dir, 'Primary'), (secondary_dir, 'Secondary')):
+            if not source_dir.exists() or not source_dir.is_dir():
+                return jsonify({'error': f'{label} dataset not found'}), 404
+            if not (source_dir / 'img').exists():
+                return jsonify({'error': f'{label} dataset is missing its img folder'}), 400
+
+        if target_dir.exists():
+            return jsonify({'error': f'Dataset "{target_name}" already exists'}), 400
+
+        for folder_name in DATASET_IMAGE_FOLDERS:
+            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+
+        def copy_dataset_sets(source_dir):
+            copied_sets = 0
+            for image_path in sorted((source_dir / 'img').iterdir()):
+                if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+
+                source_basename = image_path.stem
+                target_basename = generate_unique_dataset_basename(target_dir)
+
+                for folder_name in DATASET_IMAGE_FOLDERS:
+                    source_folder = source_dir / folder_name
+                    target_folder = target_dir / folder_name
+
+                    if folder_name == 'img':
+                        for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                            src_file = source_folder / f"{source_basename}{ext}"
+                            if src_file.exists():
+                                shutil.copy2(src_file, target_folder / f"{target_basename}{src_file.suffix}")
+                                break
+
+                        caption_path = source_folder / f"{source_basename}.txt"
+                        if caption_path.exists():
+                            shutil.copy2(caption_path, target_folder / f"{target_basename}.txt")
+                        continue
+
+                    for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                        src_file = source_folder / f"{source_basename}{ext}"
+                        if src_file.exists():
+                            shutil.copy2(src_file, target_folder / f"{target_basename}{src_file.suffix}")
+                            break
+
+                copied_sets += 1
+
+            return copied_sets
+
+        primary_count = copy_dataset_sets(primary_dir)
+        secondary_count = copy_dataset_sets(secondary_dir)
+        total_sets = primary_count + secondary_count
+
+        if total_sets == 0:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return jsonify({'error': 'No image sets found to merge'}), 400
+
+        return jsonify({
+            'success': True,
+            'primaryFolder': primary_folder,
+            'secondaryFolder': secondary_folder,
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name,
+            'primaryCount': primary_count,
+            'secondaryCount': secondary_count,
+            'totalCount': total_sets
+        })
+    except Exception as e:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/import/scan', methods=['POST'])
 def scan_import_datasets():
     """Scan an external trainer export folder for reverse-exported datasets."""
@@ -1164,6 +1734,96 @@ def import_external_dataset_status(job_id):
         if not job:
             return jsonify({'error': 'Import job not found'}), 404
         return jsonify(job)
+
+
+@app.route('/api/tool-jobs/start', methods=['POST'])
+def start_tool_job():
+    data = request.get_json() or {}
+    tool_name = (data.get('tool') or '').strip()
+    payload = data.get('payload') or {}
+
+    if tool_name not in {'reshuffle', 'compress', 'blur', 'mirror', 'merge', 'fit'}:
+        return jsonify({'error': 'Unsupported tool job'}), 400
+
+    try:
+        if tool_name in {'reshuffle', 'compress', 'blur', 'mirror', 'fit'}:
+            folder_path = (payload.get('folderPath') or '').strip()
+            if not folder_path:
+                return jsonify({'error': 'Dataset folder is required'}), 400
+            if not (DATASETS_DIR / folder_path).exists():
+                return jsonify({'error': 'Dataset not found'}), 404
+
+        if tool_name == 'blur':
+            strength = float(payload.get('strength', 0))
+            if strength < 0:
+                return jsonify({'error': 'Blur strength must be non-negative'}), 400
+            payload['strength'] = strength
+
+        if tool_name == 'mirror':
+            horizontal = bool(payload.get('horizontal'))
+            vertical = bool(payload.get('vertical'))
+            if not horizontal and not vertical:
+                return jsonify({'error': 'Select at least one mirror direction'}), 400
+
+            excluded_controls = set(payload.get('excludedControls') or [])
+            invalid_controls = excluded_controls - {'Control1', 'Control2', 'Control3'}
+            if invalid_controls:
+                return jsonify({'error': 'Invalid excluded controls specified'}), 400
+
+        if tool_name == 'merge':
+            primary_folder = (payload.get('primaryFolder') or '').strip()
+            secondary_folder = (payload.get('secondaryFolder') or '').strip()
+            target_name = (payload.get('targetName') or '').strip()
+
+            if not primary_folder or not secondary_folder:
+                return jsonify({'error': 'Both source datasets are required'}), 400
+            if primary_folder == secondary_folder:
+                return jsonify({'error': 'Choose two different datasets to merge'}), 400
+            if not target_name:
+                return jsonify({'error': 'Target dataset name is required'}), 400
+            if not re.match(r'^[a-zA-Z0-9_-]+$', target_name):
+                return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
+
+        job_id = uuid.uuid4().hex
+        with TOOL_JOBS_LOCK:
+            TOOL_JOBS[job_id] = {
+                'jobId': job_id,
+                'tool': tool_name,
+                'status': 'queued',
+                'processedItems': 0,
+                'totalItems': 0,
+                'progressPercent': 0.0,
+                'currentItem': None,
+                'metrics': {},
+                'result': None,
+                'error': None,
+                'started': False,
+                'finished': False
+            }
+
+        worker = threading.Thread(target=run_tool_job, args=(job_id, tool_name, payload), daemon=True)
+        worker.start()
+
+        return jsonify({
+            'success': True,
+            'jobId': job_id,
+            'tool': tool_name
+        })
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tool-jobs/status/<job_id>')
+def tool_job_status(job_id):
+    with TOOL_JOBS_LOCK:
+        job = TOOL_JOBS.get(job_id)
+
+    if not job:
+        return jsonify({'error': 'Tool job not found'}), 404
+
+    return jsonify(job)
 
 @app.route('/api/export', methods=['POST'])
 def export_dataset():

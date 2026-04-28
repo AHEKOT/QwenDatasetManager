@@ -194,6 +194,10 @@
                             <strong>Mirror</strong>
                             <span>Flip every target and control image horizontally, vertically, or both into a new dataset copy.</span>
                         </button>
+                        <button class="tools-nav-btn" data-tool-view="merge" role="tab" aria-selected="false">
+                            <strong>Merge</strong>
+                            <span>Combine the active dataset with a second dataset and save the result as a new third dataset.</span>
+                        </button>
                         <button class="tools-nav-btn" data-tool-view="import" role="tab" aria-selected="false">
                             <strong>Import</strong>
                             <span>Scan trainer export folders and rebuild grouped datasets inside this manager.</span>
@@ -445,6 +449,61 @@
                                     <div class="tools-task-fill" data-tool-progress-fill></div>
                                 </div>
                                 <p class="tools-task-summary" data-tool-progress-summary>Mirror generation status and output details will be shown here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel hidden" data-tool-panel="merge">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Merge</h3>
+                                    <p>Take the active dataset as the first source, pick a second dataset, and create a new combined dataset with fresh synchronized basenames.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-info-card">
+                                <div class="tools-info-grid">
+                                    <div>
+                                        <span class="tools-info-label">Primary Dataset</span>
+                                        <strong id="merge-primary-name">No dataset selected</strong>
+                                        <p>The currently active dataset is always used as the first merge source.</p>
+                                    </div>
+                                    <div>
+                                        <span class="tools-info-label">Output</span>
+                                        <strong>New third dataset</strong>
+                                        <p>The merge leaves both source datasets unchanged and writes the result into a new dataset folder.</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="tools-setting-stack">
+                                <label for="merge-secondary-select">Second Dataset</label>
+                                <select id="merge-secondary-select" class="tools-text-input">
+                                    <option value="">-- Select second dataset --</option>
+                                </select>
+                            </div>
+
+                            <div class="tools-setting-stack">
+                                <label for="merge-target-name">New Dataset Name</label>
+                                <input id="merge-target-name" class="tools-text-input" type="text" placeholder="merged_dataset_name" autocomplete="off" spellcheck="false">
+                                <p class="tools-inline-hint">Use letters, numbers, underscores, and hyphens only.</p>
+                            </div>
+
+                            <div class="tools-action-footer">
+                                <button id="merge-apply-btn" class="action-btn export-btn" data-default-label="Create Merged Dataset">
+                                    <span data-button-label>Create Merged Dataset</span>
+                                </button>
+                            </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="merge">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Merge progress and the created dataset summary will be shown here.</p>
                                 <div class="tools-task-details" data-tool-progress-details></div>
                             </div>
                         </section>
