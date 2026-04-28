@@ -15,9 +15,101 @@ CORS(app)
 # Base directory for datasets
 BASE_DIR = Path(__file__).parent
 DATASETS_DIR = BASE_DIR / 'Datasets'
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
+DATASET_IMAGE_FOLDERS = ('img', 'Control1', 'Control2', 'Control3')
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
+
+
+def iter_dataset_images(dataset_dir, folders=DATASET_IMAGE_FOLDERS):
+    for folder_name in folders:
+        folder = dataset_dir / folder_name
+        if not folder.exists():
+            continue
+        for file_path in folder.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
+                yield file_path
+
+
+def apply_dataset_blur(image, strength, image_format=None):
+    from PIL import ImageFilter
+
+    output = image.copy()
+    if strength > 0:
+        output = output.filter(ImageFilter.GaussianBlur(radius=strength))
+
+    normalized_format = (image_format or '').upper()
+    if normalized_format == 'JPG':
+        normalized_format = 'JPEG'
+
+    if normalized_format == 'JPEG' and output.mode in ('RGBA', 'LA'):
+        output = output.convert('RGB')
+
+    return output, normalized_format
+
+
+def scan_exported_dataset_groups(scan_dir):
+    suffix_map = {
+        '_img': 'img',
+        '_ctr1': 'Control1',
+        '_ctr2': 'Control2',
+        '_ctr3': 'Control3'
+    }
+    groups = {}
+
+    for item in scan_dir.iterdir():
+        if not item.is_dir() or item.name.startswith('.'):
+            continue
+
+        matched_suffix = None
+        dataset_key = None
+        dataset_folder = None
+        for suffix, folder_name in suffix_map.items():
+            if item.name.lower().endswith(suffix):
+                matched_suffix = suffix
+                dataset_key = item.name[:-len(suffix)]
+                dataset_folder = folder_name
+                break
+
+        if not matched_suffix or not dataset_key:
+            continue
+
+        group = groups.setdefault(dataset_key, {
+            'sourceName': dataset_key,
+            'folders': {},
+            'imageCount': 0,
+            'controlCount': 0,
+            'pairStyle': 'pair'
+        })
+
+        image_count = 0
+        for file_path in item.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
+                image_count += 1
+
+        group['folders'][dataset_folder] = {
+            'path': str(item),
+            'name': item.name,
+            'imageCount': image_count
+        }
+
+    results = []
+    for group in groups.values():
+        if 'img' not in group['folders']:
+            continue
+
+        control_count = sum(1 for name in ('Control1', 'Control2', 'Control3') if name in group['folders'])
+        if control_count < 2:
+            continue
+
+        group['controlCount'] = control_count
+        group['imageCount'] = group['folders']['img']['imageCount']
+        group['pairStyle'] = 'triplet' if control_count >= 3 else 'pair'
+        results.append(group)
+
+    results.sort(key=lambda item: item['sourceName'].lower())
+    return results
 
 @app.route('/')
 def index():
@@ -586,6 +678,213 @@ def compress_dataset():
     except Exception as e:
         import traceback
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/dataset/blur-preview/<filename>')
+def blur_dataset_preview(filename):
+    """Render a blurred preview for a target image without saving it"""
+    folder_path = request.args.get('folder', '')
+
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        strength = float(request.args.get('strength', 0))
+        strength = max(0.0, min(strength, 50.0))
+
+        if not folder_path:
+            return jsonify({'error': 'Dataset folder is required'}), 400
+
+        image_path = DATASETS_DIR / folder_path / 'img' / filename
+        if not image_path.exists() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return jsonify({'error': 'Preview image not found'}), 404
+
+        with Image.open(image_path) as img:
+            preview, _ = apply_dataset_blur(img, strength, img.format or image_path.suffix.lstrip('.'))
+
+        if preview.mode not in ('RGB', 'RGBA'):
+            preview = preview.convert('RGBA' if 'A' in preview.getbands() else 'RGB')
+
+        buffer = BytesIO()
+        preview.save(buffer, 'PNG')
+        buffer.seek(0)
+        return send_file(buffer, mimetype='image/png', download_name='blur-preview.png')
+
+    except ValueError:
+        return jsonify({'error': 'Blur strength must be a number'}), 400
+    except ImportError:
+        return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/dataset/blur', methods=['POST'])
+def blur_dataset():
+    """Create a blurred copy of a dataset with a -blured suffix"""
+    folder_path = request.args.get('folder', '')
+    data = request.get_json() or {}
+    target_dir = None
+
+    try:
+        from PIL import Image
+
+        if not folder_path:
+            return jsonify({'error': 'Dataset folder is required'}), 400
+
+        strength = float(data.get('strength', 0))
+        if strength < 0:
+            return jsonify({'error': 'Blur strength must be non-negative'}), 400
+
+        source_dir = DATASETS_DIR / folder_path
+        if not source_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        source_images = list(iter_dataset_images(source_dir))
+        if not source_images:
+            return jsonify({'error': 'No images found in dataset'}), 404
+
+        target_dir = source_dir.parent / f"{source_dir.name}-blured"
+        if target_dir.exists():
+            return jsonify({'error': f'Dataset "{target_dir.name}" already exists'}), 400
+
+        shutil.copytree(source_dir, target_dir)
+
+        processed_count = 0
+        for file_path in iter_dataset_images(target_dir):
+            with Image.open(file_path) as img:
+                output, image_format = apply_dataset_blur(img, strength, img.format or file_path.suffix.lstrip('.'))
+
+            save_kwargs = {}
+            if image_format == 'PNG':
+                save_kwargs['optimize'] = True
+
+            output.save(file_path, image_format, **save_kwargs)
+            processed_count += 1
+
+        return jsonify({
+            'success': True,
+            'processed': processed_count,
+            'strength': strength,
+            'targetFolder': str(target_dir.relative_to(DATASETS_DIR)),
+            'targetName': target_dir.name
+        })
+
+    except ValueError:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return jsonify({'error': 'Blur strength must be a number'}), 400
+    except ImportError:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
+    except Exception as e:
+        if target_dir and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/import/scan', methods=['POST'])
+def scan_import_datasets():
+    """Scan an external trainer export folder for reverse-exported datasets."""
+    data = request.get_json() or {}
+    scan_path = (data.get('path') or '').strip()
+
+    if not scan_path:
+        return jsonify({'error': 'Import path is required'}), 400
+
+    try:
+        scan_dir = Path(scan_path).expanduser().resolve()
+        if not scan_dir.exists() or not scan_dir.is_dir():
+            return jsonify({'error': 'Import path does not exist or is not a folder'}), 404
+
+        datasets = scan_exported_dataset_groups(scan_dir)
+
+        return jsonify({
+            'success': True,
+            'path': str(scan_dir),
+            'datasets': datasets
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/import/dataset', methods=['POST'])
+def import_external_dataset():
+    """Import one reverse-exported dataset group into the local Datasets folder."""
+    data = request.get_json() or {}
+    base_path = (data.get('basePath') or '').strip()
+    source_name = (data.get('sourceName') or '').strip()
+    target_name = (data.get('targetName') or source_name).strip()
+
+    if not base_path or not source_name:
+        return jsonify({'error': 'Import path and source dataset are required'}), 400
+
+    if not target_name:
+        return jsonify({'error': 'Target dataset name is required'}), 400
+
+    if not re.match(r'^[a-zA-Z0-9_-]+$', target_name):
+        return jsonify({'error': 'Target name can only contain letters, numbers, underscores and hyphens'}), 400
+
+    try:
+        scan_dir = Path(base_path).expanduser().resolve()
+        if not scan_dir.exists() or not scan_dir.is_dir():
+            return jsonify({'error': 'Import path does not exist or is not a folder'}), 404
+
+        datasets = scan_exported_dataset_groups(scan_dir)
+        dataset = next((item for item in datasets if item['sourceName'] == source_name), None)
+        if not dataset:
+            return jsonify({'error': 'Dataset group not found in import path'}), 404
+
+        target_dir = DATASETS_DIR / target_name
+        if target_dir.exists():
+            return jsonify({'error': f'Dataset "{target_name}" already exists'}), 400
+
+        for folder_name in DATASET_IMAGE_FOLDERS:
+            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+
+        imported_files = 0
+        source_folder_map = dataset['folders']
+        for source_folder_name, target_folder_name in {
+            'img': 'img',
+            'Control1': 'Control1',
+            'Control2': 'Control2',
+            'Control3': 'Control3'
+        }.items():
+            source_info = source_folder_map.get(source_folder_name)
+            if not source_info:
+                continue
+
+            source_dir = Path(source_info['path'])
+            destination_dir = target_dir / target_folder_name
+            for path in source_dir.rglob('*'):
+                relative_path = path.relative_to(source_dir)
+                destination_path = destination_dir / relative_path
+
+                if path.is_dir():
+                    destination_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(path, destination_path)
+                except OSError:
+                    shutil.copy(path, destination_path)
+                imported_files += 1
+
+        return jsonify({
+            'success': True,
+            'sourceName': source_name,
+            'targetName': target_name,
+            'importedFiles': imported_files
+        })
+    except Exception as e:
+        if 'target_dir' in locals() and target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export', methods=['POST'])

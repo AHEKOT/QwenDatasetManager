@@ -2,6 +2,8 @@
 let currentFolder = '';
 let targetFolder = ''; // For transfer functionality
 let images = [];
+let blurPreviewFilename = '';
+let importScanResults = [];
 
 // Stitch mode state
 let stitchMode = false;
@@ -41,6 +43,9 @@ let comparisonEditor = null; // Comparison editor instance
 const folderSelect = document.getElementById('folder-select');
 const imageGrid = document.getElementById('image-grid');
 const imageCount = document.getElementById('image-count');
+const toolsBtn = document.getElementById('tools-btn');
+const toolsModal = document.getElementById('tools-modal');
+const toolsCloseBtn = document.getElementById('tools-close-btn');
 const modal = document.getElementById('preview-modal');
 const previewImg = document.getElementById('preview-img');
 const previewControl = document.getElementById('preview-control');
@@ -57,6 +62,17 @@ const deleteBtn = document.getElementById('delete-btn');
 const reshuffleBtn = document.getElementById('reshuffle-btn');
 const compressBtn = document.getElementById('compress-btn');
 const fitBtn = document.getElementById('fit-btn');
+const blurStrengthInput = document.getElementById('blur-strength');
+const blurStrengthValue = document.getElementById('blur-strength-value');
+const blurPreviewImage = document.getElementById('blur-preview-image');
+const blurPreviewEmpty = document.getElementById('blur-preview-empty');
+const blurPreviewName = document.getElementById('blur-preview-name');
+const blurRerollBtn = document.getElementById('blur-reroll-btn');
+const blurApplyBtn = document.getElementById('blur-apply-btn');
+const importPathInput = document.getElementById('import-path-input');
+const importScanBtn = document.getElementById('import-scan-btn');
+const importStatus = document.getElementById('import-status');
+const importResults = document.getElementById('import-results');
 const exportBtn = document.getElementById('export-btn');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
@@ -439,6 +455,219 @@ function renderImageGrid() {
 // Update image count display
 function updateImageCount() {
     imageCount.textContent = `${images.length} image${images.length !== 1 ? 's' : ''}`;
+}
+
+function setActionButtonLabel(button, label) {
+    const labelEl = button?.querySelector('[data-button-label]');
+    if (labelEl) {
+        labelEl.textContent = label;
+    } else if (button) {
+        button.textContent = label;
+    }
+}
+
+function setActionButtonBusy(button, busyLabel, isBusy) {
+    if (!button) return;
+    button.disabled = isBusy;
+    setActionButtonLabel(button, isBusy ? busyLabel : button.dataset.defaultLabel || 'Action');
+}
+
+function pickBlurPreviewFilename(forceNew = false) {
+    if (!images.length) {
+        blurPreviewFilename = '';
+        return '';
+    }
+
+    if (!blurPreviewFilename || forceNew || !images.includes(blurPreviewFilename)) {
+        blurPreviewFilename = images[Math.floor(Math.random() * images.length)];
+    }
+
+    return blurPreviewFilename;
+}
+
+function updateBlurPreview(forceNew = false) {
+    const strength = Number(blurStrengthInput.value || 0);
+    blurStrengthValue.textContent = `${strength.toFixed(1)} px`;
+
+    const filename = pickBlurPreviewFilename(forceNew);
+    if (!filename || !currentFolder) {
+        blurPreviewName.textContent = 'No image selected';
+        blurPreviewImage.classList.add('hidden');
+        blurPreviewImage.removeAttribute('src');
+        blurPreviewEmpty.classList.remove('hidden');
+        blurApplyBtn.disabled = true;
+        return;
+    }
+
+    blurPreviewName.textContent = filename;
+    blurPreviewImage.src = `/api/dataset/blur-preview/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}&strength=${encodeURIComponent(strength)}&t=${Date.now()}`;
+    blurPreviewImage.classList.remove('hidden');
+    blurPreviewEmpty.classList.add('hidden');
+    blurApplyBtn.disabled = false;
+}
+
+function openToolsModal() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    updateBlurPreview(true);
+    toolsModal.classList.add('active');
+    document.body.style.overflow = 'hidden';
+}
+
+function closeToolsModal() {
+    toolsModal.classList.remove('active');
+    document.body.style.overflow = '';
+}
+
+function setImportStatus(message, type = 'info') {
+    importStatus.textContent = message;
+    importStatus.dataset.type = type;
+}
+
+function renderImportResults() {
+    if (!importScanResults.length) {
+        importResults.classList.add('empty');
+        importResults.innerHTML = '<div class="import-results-empty">No importable trainer datasets found at this path.</div>';
+        return;
+    }
+
+    importResults.classList.remove('empty');
+    importResults.innerHTML = '';
+
+    importScanResults.forEach((dataset) => {
+        const card = document.createElement('div');
+        card.className = 'import-dataset-card';
+
+        const folderRows = ['img', 'Control1', 'Control2', 'Control3']
+            .filter((folderName) => dataset.folders[folderName])
+            .map((folderName) => {
+                const folder = dataset.folders[folderName];
+                return `
+                    <div class="import-folder-row">
+                        <strong>${folderName}</strong>
+                        <span>${folder.imageCount} images</span>
+                        <code>${folder.name}</code>
+                    </div>
+                `;
+            })
+            .join('');
+
+        card.innerHTML = `
+            <div class="import-dataset-head">
+                <div class="import-dataset-title">
+                    <strong>${dataset.sourceName}</strong>
+                    <div class="import-dataset-meta">Grouped as one ${dataset.pairStyle} dataset from trainer export folders</div>
+                </div>
+                <div class="import-dataset-badges">
+                    <span class="import-dataset-badge">${dataset.imageCount} targets</span>
+                    <span class="import-dataset-badge">${dataset.controlCount} controls</span>
+                </div>
+            </div>
+            <div class="import-folder-list">${folderRows}</div>
+            <div class="import-target-row">
+                <input class="tools-text-input import-target-input" type="text" value="${dataset.sourceName}" aria-label="Target dataset name">
+                <button class="action-btn export-btn import-dataset-btn">Import Dataset</button>
+            </div>
+        `;
+
+        const targetInput = card.querySelector('.import-target-input');
+        const importBtn = card.querySelector('.import-dataset-btn');
+        importBtn.addEventListener('click', () => importTrainerDataset(dataset.sourceName, targetInput.value.trim(), importBtn));
+        importResults.appendChild(card);
+    });
+}
+
+async function scanImportDatasets() {
+    const path = importPathInput.value.trim();
+    if (!path) {
+        setImportStatus('Enter a trainer export path first.', 'error');
+        importPathInput.focus();
+        return;
+    }
+
+    try {
+        importScanBtn.disabled = true;
+        importScanBtn.textContent = 'Scanning...';
+        setImportStatus('Scanning trainer export folders...', 'info');
+
+        const response = await fetch('/api/import/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            importScanResults = data.datasets || [];
+            renderImportResults();
+            setImportStatus(
+                importScanResults.length
+                    ? `Found ${importScanResults.length} grouped trainer dataset${importScanResults.length !== 1 ? 's' : ''}.`
+                    : 'Scan completed, but no grouped trainer datasets were found.',
+                importScanResults.length ? 'success' : 'warning'
+            );
+        } else {
+            importScanResults = [];
+            renderImportResults();
+            setImportStatus(data.error || 'Failed to scan trainer folder.', 'error');
+        }
+    } catch (error) {
+        console.error('Import scan failed:', error);
+        importScanResults = [];
+        renderImportResults();
+        setImportStatus('Failed to scan trainer folder. Check console for details.', 'error');
+    } finally {
+        importScanBtn.disabled = false;
+        importScanBtn.textContent = importScanBtn.dataset.defaultLabel || 'Scan';
+    }
+}
+
+async function importTrainerDataset(sourceName, targetName, button) {
+    const basePath = importPathInput.value.trim();
+    if (!basePath) {
+        setImportStatus('Trainer export path is empty.', 'error');
+        return;
+    }
+
+    if (!targetName) {
+        setImportStatus('Target dataset name is required.', 'error');
+        return;
+    }
+
+    try {
+        button.disabled = true;
+        button.textContent = 'Importing...';
+        setImportStatus(`Importing ${sourceName} as ${targetName}...`, 'info');
+
+        const response = await fetch('/api/import/dataset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                basePath,
+                sourceName,
+                targetName
+            })
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            await loadFolders();
+            setImportStatus(`Imported ${data.sourceName} as ${data.targetName}. Copied ${data.importedFiles} files.`, 'success');
+            alert(`Imported ${data.targetName} successfully.`);
+        } else {
+            setImportStatus(data.error || 'Failed to import dataset.', 'error');
+            alert(`Failed to import dataset: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Import dataset failed:', error);
+        setImportStatus('Failed to import dataset. Check console for details.', 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Import Dataset';
+    }
 }
 
 // Open preview modal
@@ -917,8 +1146,7 @@ async function reshuffleDataset() {
     if (!confirmed) return;
 
     try {
-        reshuffleBtn.disabled = true;
-        reshuffleBtn.textContent = 'Shuffling...';
+        setActionButtonBusy(reshuffleBtn, 'Shuffling...', true);
 
         const response = await fetch(`/api/reshuffle?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST'
@@ -937,13 +1165,7 @@ async function reshuffleDataset() {
         console.error('Reshuffle failed:', error);
         alert('Failed to reshuffle dataset. Check console for details.');
     } finally {
-        reshuffleBtn.disabled = false;
-        reshuffleBtn.innerHTML = `
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"></path>
-            </svg>
-            Reshuffle
-        `;
+        setActionButtonBusy(reshuffleBtn, 'Shuffling...', false);
     }
 }
 
@@ -953,8 +1175,7 @@ async function fitDataset() {
 
     if (!confirm('Resize/Letterbox all control images (Control1-3) to match primary images (img folder)?\nThis will add black bars if aspect ratios differ.')) return;
 
-    fitBtn.disabled = true;
-    fitBtn.textContent = 'Processing...';
+    setActionButtonBusy(fitBtn, 'Processing...', true);
 
     try {
         const response = await fetch(`/api/dataset/fit?folder=${encodeURIComponent(currentFolder)}`, {
@@ -974,8 +1195,7 @@ async function fitDataset() {
         console.error('Fit dataset error:', error);
         alert('Failed to process dataset');
     } finally {
-        fitBtn.disabled = false;
-        fitBtn.textContent = 'Fit';
+        setActionButtonBusy(fitBtn, 'Processing...', false);
     }
 }
 
@@ -994,8 +1214,7 @@ async function compressDataset() {
     if (!confirmed) return;
 
     try {
-        compressBtn.disabled = true;
-        compressBtn.textContent = 'Compressing...';
+        setActionButtonBusy(compressBtn, 'Compressing...', true);
 
         const response = await fetch(`/api/compress?folder=${encodeURIComponent(currentFolder)}`, {
             method: 'POST'
@@ -1019,13 +1238,52 @@ async function compressDataset() {
         console.error('Compress failed:', error);
         alert('Failed to compress dataset. Check console for details.');
     } finally {
-        compressBtn.disabled = false;
-        compressBtn.innerHTML = `
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 14h6v6H4zM14 4h6v6h-6zM4 4h6v6H4zM14 14l6 6M17 14v7h-7"></path>
-            </svg>
-            Compress
-        `;
+        setActionButtonBusy(compressBtn, 'Compressing...', false);
+    }
+}
+
+async function createBlurredDatasetCopy() {
+    if (!currentFolder) {
+        alert('Please select a dataset folder first.');
+        return;
+    }
+
+    if (!images.length) {
+        alert('This dataset has no target images to blur.');
+        return;
+    }
+
+    const strength = Number(blurStrengthInput.value || 0);
+
+    try {
+        blurApplyBtn.disabled = true;
+        blurRerollBtn.disabled = true;
+        blurApplyBtn.textContent = 'Creating...';
+
+        const response = await fetch(`/api/dataset/blur?folder=${encodeURIComponent(currentFolder)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ strength })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            const selectedFolder = currentFolder;
+            await loadFolders();
+            folderSelect.value = selectedFolder;
+            alert(`Created ${data.targetFolder} with blur strength ${data.strength}. Processed ${data.processedImages} images.`);
+            closeToolsModal();
+        } else {
+            alert(`Failed to create blurred dataset: ${data.error}`);
+        }
+    } catch (error) {
+        console.error('Blur dataset failed:', error);
+        alert('Failed to create blurred dataset. Check console for details.');
+    } finally {
+        blurApplyBtn.disabled = false;
+        blurRerollBtn.disabled = false;
+        blurApplyBtn.textContent = blurApplyBtn.dataset.defaultLabel || 'Create Blurred Copy';
     }
 }
 
@@ -1228,9 +1486,21 @@ function setupEventListeners() {
         captionDirty = true;
         autoresizeCaption();
     });
+    toolsBtn.addEventListener('click', openToolsModal);
+    toolsCloseBtn.addEventListener('click', closeToolsModal);
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
     fitBtn.addEventListener('click', fitDataset);
+    blurStrengthInput.addEventListener('input', () => updateBlurPreview(false));
+    blurRerollBtn.addEventListener('click', () => updateBlurPreview(true));
+    blurApplyBtn.addEventListener('click', createBlurredDatasetCopy);
+    importScanBtn.addEventListener('click', scanImportDatasets);
+    importPathInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            scanImportDatasets();
+        }
+    });
     exportBtn.addEventListener('click', exportDataset);
     document.getElementById('process-text-btn').addEventListener('click', openProcessTextModal);
     document.getElementById('stitch-btn').addEventListener('click', () => {
@@ -1326,6 +1596,18 @@ function setupEventListeners() {
             case 'P':
                 openInPixelmator();
                 break;
+        }
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && toolsModal.classList.contains('active')) {
+            closeToolsModal();
+        }
+    });
+
+    toolsModal.addEventListener('click', (e) => {
+        if (e.target === toolsModal) {
+            closeToolsModal();
         }
     });
 

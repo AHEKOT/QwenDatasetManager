@@ -17,24 +17,12 @@
                 <select id="folder-select">
                     <option value="">-- Select a folder --</option>
                 </select>
-                <button id="reshuffle-btn" class="action-btn" title="Randomize filenames">
+                <button id="tools-btn" class="action-btn tools-btn" title="Open dataset tools">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"></path>
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10 3.09V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                     </svg>
-                    Reshuffle
-                </button>
-                <button id="compress-btn" class="action-btn" title="Compress images to 90% quality">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M4 14h6v6H4zM14 4h6v6h-6zM4 4h6v6H4zM14 14l6 6M17 14v7h-7"></path>
-                    </svg>
-                    Compress
-                </button>
-                <button id="fit-btn" class="action-btn" title="Resize/Letterbox controls to match img">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                        <path d="M7 10h10M7 14h10"></path>
-                    </svg>
-                    Fit
+                    Tools
                 </button>
                 <button id="stitch-btn" class="action-btn stitch-btn" title="Stitch multiple images into one">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -147,6 +135,102 @@
             </div>
             <p id="stitch-error-msg"></p>
             <button id="stitch-error-close">OK</button>
+        </div>
+    </div>
+
+    <!-- Dataset Tools Modal -->
+    <div id="tools-modal" class="tools-modal">
+        <div class="tools-modal-content">
+            <div class="tools-modal-header">
+                <div>
+                    <h2>Dataset Tools</h2>
+                    <p>Bulk actions for the selected dataset and a blur-copy workflow with live preview.</p>
+                </div>
+                <button id="tools-close-btn" class="tools-close-btn" title="Close tools">✕</button>
+            </div>
+
+            <div class="tools-modal-body">
+                <section class="tools-panel">
+                    <h3>Utilities</h3>
+                    <div class="tools-action-grid">
+                        <button id="reshuffle-btn" class="tools-action-btn" title="Randomize filenames" data-default-label="Reshuffle">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"></path>
+                            </svg>
+                            <span data-button-label>Reshuffle</span>
+                        </button>
+                        <button id="compress-btn" class="tools-action-btn" title="Compress images to 90% quality" data-default-label="Compress">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M4 14h6v6H4zM14 4h6v6h-6zM4 4h6v6H4zM14 14l6 6M17 14v7h-7"></path>
+                            </svg>
+                            <span data-button-label>Compress</span>
+                        </button>
+                        <button id="fit-btn" class="tools-action-btn" title="Resize/Letterbox controls to match img" data-default-label="Fit">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                <path d="M7 10h10M7 14h10"></path>
+                            </svg>
+                            <span data-button-label>Fit</span>
+                        </button>
+                    </div>
+                </section>
+
+                <section class="tools-panel blur-panel">
+                    <div class="tools-panel-heading">
+                        <div>
+                            <h3>Blur</h3>
+                            <p>Create a blurred dataset copy with the suffix <strong>-blured</strong>.</p>
+                        </div>
+                    </div>
+
+                    <div class="tools-setting-row">
+                        <label for="blur-strength">Strength</label>
+                        <div class="tools-range-wrap">
+                            <input type="range" id="blur-strength" min="0" max="20" step="0.5" value="3">
+                            <span id="blur-strength-value">3.0 px</span>
+                        </div>
+                    </div>
+
+                    <div class="tools-preview-card">
+                        <div class="tools-preview-meta">
+                            <span>Random target preview</span>
+                            <span id="blur-preview-name">No image selected</span>
+                        </div>
+                        <div class="tools-preview-frame">
+                            <div id="blur-preview-empty" class="tools-preview-empty">Select a dataset with target images to preview blur.</div>
+                            <img id="blur-preview-image" class="hidden" src="" alt="Blur preview sample">
+                        </div>
+                        <p class="tools-preview-hint">Preview updates live while you adjust the blur strength. The generated copy applies the same blur to target and control images.</p>
+                    </div>
+
+                    <div class="tools-blur-actions">
+                        <button id="blur-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
+                        <button id="blur-apply-btn" class="action-btn export-btn" data-default-label="Create Blurred Copy">Create Blurred Copy</button>
+                    </div>
+
+                    <div class="tools-import-section">
+                        <div class="tools-panel-heading">
+                            <div>
+                                <h3>Import</h3>
+                                <p>Scan a trainer export folder, group <strong>_img</strong> and <strong>_ctr*</strong> folders into one dataset, then import it back into this manager.</p>
+                            </div>
+                        </div>
+
+                        <div class="tools-setting-stack">
+                            <label for="import-path-input">Trainer Folder Path</label>
+                            <div class="tools-inline-actions">
+                                <input id="import-path-input" class="tools-text-input" type="text" placeholder="/path/to/trainer/export/root">
+                                <button id="import-scan-btn" class="action-btn" data-default-label="Scan">Scan</button>
+                            </div>
+                            <p id="import-status" class="tools-inline-hint">Groups are detected from folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, <strong>dataset_ctr3</strong>.</p>
+                        </div>
+
+                        <div id="import-results" class="import-results empty">
+                            <div class="import-results-empty">No trainer datasets scanned yet.</div>
+                        </div>
+                    </div>
+                </section>
+            </div>
         </div>
     </div>
 
