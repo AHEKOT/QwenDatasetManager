@@ -144,90 +144,192 @@
             <div class="tools-modal-header">
                 <div>
                     <h2>Dataset Tools</h2>
-                    <p>Bulk actions for the selected dataset and a blur-copy workflow with live preview.</p>
+                    <p>Choose a utility on the left. Settings, preview, output, and launch actions stay on the right.</p>
                 </div>
                 <button id="tools-close-btn" class="tools-close-btn" title="Close tools">✕</button>
             </div>
 
             <div class="tools-modal-body">
-                <section class="tools-panel">
-                    <h3>Utilities</h3>
-                    <div class="tools-action-grid">
-                        <button id="reshuffle-btn" class="tools-action-btn" title="Randomize filenames" data-default-label="Reshuffle">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"></path>
-                            </svg>
-                            <span data-button-label>Reshuffle</span>
+                <aside class="tools-sidebar">
+                    <div class="tools-sidebar-header">
+                        <span class="tools-sidebar-label">Utilities</span>
+                        <div class="tools-sidebar-dataset">
+                            <strong id="tools-current-folder">No dataset</strong>
+                            <span id="tools-current-count">0 images</span>
+                        </div>
+                    </div>
+
+                    <div class="tools-nav-list" role="tablist" aria-label="Dataset utilities">
+                        <button class="tools-nav-btn" data-tool-view="reshuffle" role="tab" aria-selected="false">
+                            <strong>Reshuffle</strong>
+                            <span>Rename the whole dataset while preserving matching targets, controls, and captions.</span>
                         </button>
-                        <button id="compress-btn" class="tools-action-btn" title="Compress images to 90% quality" data-default-label="Compress">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M4 14h6v6H4zM14 4h6v6h-6zM4 4h6v6H4zM14 14l6 6M17 14v7h-7"></path>
-                            </svg>
-                            <span data-button-label>Compress</span>
+                        <button class="tools-nav-btn" data-tool-view="compress" role="tab" aria-selected="false">
+                            <strong>Compress</strong>
+                            <span>Optimize PNG files to reduce dataset size without changing the layout.</span>
                         </button>
-                        <button id="fit-btn" class="tools-action-btn" title="Resize/Letterbox controls to match img" data-default-label="Fit">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                                <path d="M7 10h10M7 14h10"></path>
-                            </svg>
-                            <span data-button-label>Fit</span>
+                        <button class="tools-nav-btn" data-tool-view="fit" role="tab" aria-selected="false">
+                            <strong>Fit</strong>
+                            <span>Letterbox controls so every pair or triplet matches the target dimensions.</span>
+                        </button>
+                        <button class="tools-nav-btn active" data-tool-view="blur" role="tab" aria-selected="true">
+                            <strong>Blur</strong>
+                            <span>Create a blurred copy with live preview before generation.</span>
+                        </button>
+                        <button class="tools-nav-btn" data-tool-view="import" role="tab" aria-selected="false">
+                            <strong>Import</strong>
+                            <span>Scan trainer export folders and rebuild grouped datasets inside this manager.</span>
                         </button>
                     </div>
-                </section>
+                </aside>
 
-                <section class="tools-panel blur-panel">
-                    <div class="tools-panel-heading">
-                        <div>
-                            <h3>Blur</h3>
-                            <p>Create a blurred dataset copy with the suffix <strong>-blured</strong>.</p>
-                        </div>
-                    </div>
-
-                    <div class="tools-setting-row">
-                        <label for="blur-strength">Strength</label>
-                        <div class="tools-range-wrap">
-                            <input type="range" id="blur-strength" min="0" max="20" step="0.5" value="3">
-                            <span id="blur-strength-value">3.0 px</span>
-                        </div>
-                    </div>
-
-                    <div class="tools-preview-card">
-                        <div class="tools-preview-meta">
-                            <span>Random target preview</span>
-                            <span id="blur-preview-name">No image selected</span>
-                        </div>
-                        <div class="tools-preview-frame">
-                            <div id="blur-preview-empty" class="tools-preview-empty">Select a dataset with target images to preview blur.</div>
-                            <img id="blur-preview-image" class="hidden" src="" alt="Blur preview sample">
-                        </div>
-                        <p class="tools-preview-hint">Preview updates live while you adjust the blur strength. The generated copy applies the same blur to target and control images.</p>
-                    </div>
-
-                    <div class="tools-blur-actions">
-                        <button id="blur-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
-                        <button id="blur-apply-btn" class="action-btn export-btn" data-default-label="Create Blurred Copy">Create Blurred Copy</button>
-                    </div>
-
-                    <div class="tools-import-section">
-                        <div class="tools-panel-heading">
-                            <div>
-                                <h3>Import</h3>
-                                <p>Scan a trainer export folder, group <strong>_img</strong> and <strong>_ctr*</strong> folders into one dataset, then import it back into this manager.</p>
+                <section class="tools-detail-shell">
+                    <div class="tools-detail-scroll">
+                        <section class="tools-detail-panel" data-tool-panel="reshuffle">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Reshuffle</h3>
+                                    <p>Randomizes basenames across the current dataset while keeping every related image and caption in sync.</p>
+                                </div>
                             </div>
-                        </div>
 
-                        <div class="tools-setting-stack">
-                            <label for="import-path-input">Trainer Folder Path</label>
-                            <div class="tools-inline-actions">
-                                <input id="import-path-input" class="tools-text-input" type="text" placeholder="/path/to/trainer/export/root">
-                                <button id="import-scan-btn" class="action-btn" data-default-label="Scan">Scan</button>
+                            <div class="tools-info-card">
+                                <div class="tools-info-grid">
+                                    <div>
+                                        <span class="tools-info-label">Effect</span>
+                                        <strong>New random names</strong>
+                                        <p>All target, control, and caption files are renamed together.</p>
+                                    </div>
+                                    <div>
+                                        <span class="tools-info-label">Best For</span>
+                                        <strong>Dataset cleanup</strong>
+                                        <p>Useful after merges, exports, or when filenames leak ordering you do not want to keep.</p>
+                                    </div>
+                                </div>
                             </div>
-                            <p id="import-status" class="tools-inline-hint">Groups are detected from folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, <strong>dataset_ctr3</strong>.</p>
-                        </div>
 
-                        <div id="import-results" class="import-results empty">
-                            <div class="import-results-empty">No trainer datasets scanned yet.</div>
-                        </div>
+                            <div class="tools-action-footer">
+                                <button id="reshuffle-btn" class="action-btn export-btn" title="Randomize filenames" data-default-label="Reshuffle">
+                                    <span data-button-label>Reshuffle Dataset</span>
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel hidden" data-tool-panel="compress">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Compress</h3>
+                                    <p>Runs PNG optimization over the dataset and keeps the folder structure unchanged.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-info-card">
+                                <div class="tools-info-grid">
+                                    <div>
+                                        <span class="tools-info-label">Effect</span>
+                                        <strong>Smaller PNG files</strong>
+                                        <p>Compression targets storage size while preserving PNG format.</p>
+                                    </div>
+                                    <div>
+                                        <span class="tools-info-label">Output</span>
+                                        <strong>Storage report</strong>
+                                        <p>Shows original size, new size, and total savings after the run finishes.</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="tools-action-footer">
+                                <button id="compress-btn" class="action-btn export-btn" title="Compress images to 90% quality" data-default-label="Compress">
+                                    <span data-button-label>Compress Dataset</span>
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel hidden" data-tool-panel="fit">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Fit</h3>
+                                    <p>Resizes and letterboxes control images so each target and control set shares the same canvas size.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-info-card">
+                                <div class="tools-info-grid">
+                                    <div>
+                                        <span class="tools-info-label">Effect</span>
+                                        <strong>Matched control canvases</strong>
+                                        <p>Black bars are added where needed when aspect ratios differ.</p>
+                                    </div>
+                                    <div>
+                                        <span class="tools-info-label">Use Case</span>
+                                        <strong>Training consistency</strong>
+                                        <p>Helpful when external pipelines produced controls with inconsistent dimensions.</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="tools-action-footer">
+                                <button id="fit-btn" class="action-btn export-btn" title="Resize/Letterbox controls to match img" data-default-label="Fit">
+                                    <span data-button-label>Fit Controls To Targets</span>
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel" data-tool-panel="blur">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Blur</h3>
+                                    <p>Create a blurred dataset copy with the suffix <strong>-blured</strong>. The preview and final export use the same backend blur pipeline.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-setting-row">
+                                <label for="blur-strength">Strength</label>
+                                <div class="tools-range-wrap">
+                                    <input type="range" id="blur-strength" min="0" max="20" step="0.5" value="3">
+                                    <span id="blur-strength-value">3.0 px</span>
+                                </div>
+                            </div>
+
+                            <div class="tools-preview-card">
+                                <div class="tools-preview-meta">
+                                    <span>Random target preview</span>
+                                    <span id="blur-preview-name">No image selected</span>
+                                </div>
+                                <div class="tools-preview-frame">
+                                    <div id="blur-preview-empty" class="tools-preview-empty">Select a dataset with target images to preview blur.</div>
+                                    <img id="blur-preview-image" class="hidden" src="" alt="Blur preview sample">
+                                </div>
+                                <p class="tools-preview-hint">Preview updates live while you adjust blur strength. The generated copy applies the same blur to targets and control images.</p>
+                            </div>
+
+                            <div class="tools-blur-actions">
+                                <button id="blur-reroll-btn" class="action-btn" title="Choose another random preview">Another Preview</button>
+                                <button id="blur-apply-btn" class="action-btn export-btn" data-default-label="Create Blurred Copy">Create Blurred Copy</button>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel hidden" data-tool-panel="import">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Import</h3>
+                                    <p>Scan a trainer export folder, group <strong>_img</strong> and <strong>_ctr*</strong> folders into one dataset, and import it back into this manager.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-setting-stack">
+                                <label for="import-path-input">Trainer Folder Path</label>
+                                <div class="tools-inline-actions">
+                                    <input id="import-path-input" class="tools-text-input" type="text" placeholder="/path/to/trainer/export/root">
+                                    <button id="import-scan-btn" class="action-btn" data-default-label="Scan">Scan</button>
+                                </div>
+                                <p id="import-status" class="tools-inline-hint">Groups are detected from folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, <strong>dataset_ctr3</strong>.</p>
+                            </div>
+
+                            <div id="import-results" class="import-results empty">
+                                <div class="import-results-empty">No trainer datasets scanned yet.</div>
+                            </div>
+                        </section>
                     </div>
                 </section>
             </div>

@@ -4,6 +4,7 @@ let targetFolder = ''; // For transfer functionality
 let images = [];
 let blurPreviewFilename = '';
 let importScanResults = [];
+let currentToolsView = 'blur';
 
 // Stitch mode state
 let stitchMode = false;
@@ -46,6 +47,10 @@ const imageCount = document.getElementById('image-count');
 const toolsBtn = document.getElementById('tools-btn');
 const toolsModal = document.getElementById('tools-modal');
 const toolsCloseBtn = document.getElementById('tools-close-btn');
+const toolsCurrentFolder = document.getElementById('tools-current-folder');
+const toolsCurrentCount = document.getElementById('tools-current-count');
+const toolsNavButtons = Array.from(document.querySelectorAll('.tools-nav-btn'));
+const toolsDetailPanels = Array.from(document.querySelectorAll('.tools-detail-panel'));
 const modal = document.getElementById('preview-modal');
 const previewImg = document.getElementById('preview-img');
 const previewControl = document.getElementById('preview-control');
@@ -398,6 +403,7 @@ async function loadImages(folder) {
 
         renderImageGrid();
         updateImageCount();
+        updateToolsContext();
         saveAppState();
     } catch (error) {
         console.error('Failed to load images:', error);
@@ -472,6 +478,32 @@ function setActionButtonBusy(button, busyLabel, isBusy) {
     setActionButtonLabel(button, isBusy ? busyLabel : button.dataset.defaultLabel || 'Action');
 }
 
+function updateToolsContext() {
+    if (!toolsCurrentFolder || !toolsCurrentCount) return;
+
+    toolsCurrentFolder.textContent = currentFolder || 'No dataset';
+    toolsCurrentCount.textContent = `${images.length} image${images.length !== 1 ? 's' : ''}`;
+}
+
+function setToolsView(viewName, options = {}) {
+    currentToolsView = viewName;
+
+    toolsNavButtons.forEach((button) => {
+        const isActive = button.dataset.toolView === viewName;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-selected', String(isActive));
+    });
+
+    toolsDetailPanels.forEach((panel) => {
+        const isActive = panel.dataset.toolPanel === viewName;
+        panel.classList.toggle('hidden', !isActive);
+    });
+
+    if (viewName === 'blur') {
+        updateBlurPreview(Boolean(options.forceRefresh));
+    }
+}
+
 function pickBlurPreviewFilename(forceNew = false) {
     if (!images.length) {
         blurPreviewFilename = '';
@@ -512,7 +544,8 @@ function openToolsModal() {
         return;
     }
 
-    updateBlurPreview(true);
+    updateToolsContext();
+    setToolsView(currentToolsView, { forceRefresh: true });
     toolsModal.classList.add('active');
     document.body.style.overflow = 'hidden';
 }
@@ -1488,6 +1521,11 @@ function setupEventListeners() {
     });
     toolsBtn.addEventListener('click', openToolsModal);
     toolsCloseBtn.addEventListener('click', closeToolsModal);
+    toolsNavButtons.forEach((button) => {
+        button.addEventListener('click', () => {
+            setToolsView(button.dataset.toolView, { forceRefresh: button.dataset.toolView === 'blur' });
+        });
+    });
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
     fitBtn.addEventListener('click', fitDataset);
@@ -1610,6 +1648,9 @@ function setupEventListeners() {
             closeToolsModal();
         }
     });
+
+    updateToolsContext();
+    setToolsView(currentToolsView);
 
     // Close modal when clicking outside
     modal.addEventListener('click', (e) => {
