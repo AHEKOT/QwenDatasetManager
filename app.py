@@ -140,7 +140,7 @@ def scan_exported_dataset_groups(scan_dir):
             continue
 
         control_count = sum(1 for name in ('Control1', 'Control2', 'Control3') if name in group['folders'])
-        if control_count < 2:
+        if control_count < 1:
             continue
 
         group['controlCount'] = control_count
