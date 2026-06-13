@@ -73,6 +73,54 @@ def apply_dataset_mirror(image, horizontal=False, vertical=False, image_format=N
     return output, normalized_format
 
 
+def get_dataset_caption(dataset_dir, filename):
+    basename = Path(filename).stem
+    caption_path = dataset_dir / 'img' / f"{basename}.txt"
+    if not caption_path.exists():
+        return ''
+
+    with open(caption_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def build_duplicate_image_fingerprint(image_path, hash_size=8):
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        rgb_sample = image.convert('RGB').resize((16, 16), Image.Resampling.LANCZOS)
+        rgb_pixels = list(rgb_sample.getdata())
+        average_rgb = tuple(
+            sum(pixel[channel] for pixel in rgb_pixels) // len(rgb_pixels)
+            for channel in range(3)
+        )
+
+        grayscale = image.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+        pixels = list(grayscale.getdata())
+
+    bits = []
+    for row in range(hash_size):
+        offset = row * (hash_size + 1)
+        for col in range(hash_size):
+            bits.append(1 if pixels[offset + col] > pixels[offset + col + 1] else 0)
+
+    return {
+        'hash': bits,
+        'averageRgb': average_rgb
+    }
+
+
+def duplicate_image_distance(fingerprint_a, fingerprint_b):
+    hash_distance = sum(
+        1 for left, right in zip(fingerprint_a['hash'], fingerprint_b['hash'])
+        if left != right
+    )
+    color_distance = sum(
+        abs(left - right)
+        for left, right in zip(fingerprint_a['averageRgb'], fingerprint_b['averageRgb'])
+    )
+    return hash_distance + (color_distance // 24)
+
+
 def generate_unique_dataset_basename(target_dataset_dir):
     chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
     target_img_dir = target_dataset_dir / 'img'
@@ -1528,6 +1576,83 @@ def mirror_dataset():
     except Exception as e:
         if target_dir and target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/dataset/duplicates', methods=['POST'])
+def find_duplicate_images():
+    """Find likely duplicate image pairs across the selected dataset."""
+    data = request.get_json() or {}
+    folder_path = (data.get('folder') or '').strip()
+
+    try:
+        if not folder_path:
+            return jsonify({'error': 'Dataset folder is required'}), 400
+
+        threshold = int(data.get('threshold', 8))
+        threshold = max(0, min(threshold, 64))
+
+        dataset_dir = DATASETS_DIR / folder_path
+        img_dir = dataset_dir / 'img'
+        if not dataset_dir.exists() or not img_dir.exists():
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        image_paths = [
+            image_path for image_path in sorted(img_dir.iterdir())
+            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        fingerprints = {}
+        for image_path in image_paths:
+            try:
+                fingerprints[image_path.name] = build_duplicate_image_fingerprint(image_path)
+            except Exception as e:
+                print(f"Failed to hash {image_path}: {e}")
+
+        pairs = []
+        for left_index, left_path in enumerate(image_paths):
+            left_fingerprint = fingerprints.get(left_path.name)
+            if not left_fingerprint:
+                continue
+
+            for right_path in image_paths[left_index + 1:]:
+                right_fingerprint = fingerprints.get(right_path.name)
+                if not right_fingerprint:
+                    continue
+
+                distance = duplicate_image_distance(left_fingerprint, right_fingerprint)
+                if distance <= threshold:
+                    pairs.append({
+                        'left': {
+                            'filename': left_path.name,
+                            'caption': get_dataset_caption(dataset_dir, left_path.name)
+                        },
+                        'right': {
+                            'filename': right_path.name,
+                            'caption': get_dataset_caption(dataset_dir, right_path.name)
+                        },
+                        'distance': distance
+                    })
+
+        pairs.sort(key=lambda item: (
+            item['distance'],
+            item['left']['filename'].lower(),
+            item['right']['filename'].lower()
+        ))
+
+        return jsonify({
+            'success': True,
+            'threshold': threshold,
+            'pairs': pairs,
+            'count': len(pairs),
+            'imageCount': len(image_paths)
+        })
+    except ImportError:
+        return jsonify({'error': 'Pillow library not installed. Run: pip install Pillow'}), 500
+    except ValueError:
+        return jsonify({'error': 'Threshold must be a number'}), 400
+    except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500

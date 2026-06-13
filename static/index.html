@@ -186,6 +186,10 @@
                             <strong>Fit</strong>
                             <span>Letterbox controls so every pair or triplet matches the target dimensions.</span>
                         </button>
+                        <button class="tools-nav-btn" data-tool-view="duplicates" role="tab" aria-selected="false">
+                            <strong>Duplicates</strong>
+                            <span>Find duplicate image pairs, then keep one side and delete the other set.</span>
+                        </button>
                         <button class="tools-nav-btn active" data-tool-view="blur" role="tab" aria-selected="true">
                             <strong>Blur</strong>
                             <span>Create a blurred copy with live preview before generation.</span>
@@ -329,6 +333,73 @@
                                     <div class="tools-task-fill" data-tool-progress-fill></div>
                                 </div>
                                 <p class="tools-task-summary" data-tool-progress-summary>Fit progress and resize summary will appear here.</p>
+                                <div class="tools-task-details" data-tool-progress-details></div>
+                            </div>
+                        </section>
+
+                        <section class="tools-detail-panel hidden" data-tool-panel="duplicates">
+                            <div class="tools-panel-heading">
+                                <div>
+                                    <h3>Duplicates</h3>
+                                    <p>Scan the current dataset for visually similar target-image pairs, then review each pair side by side with captions.</p>
+                                </div>
+                            </div>
+
+                            <div class="tools-setting-stack">
+                                <div class="tools-inline-actions">
+                                    <button id="duplicate-scan-btn" class="action-btn export-btn" data-default-label="Find Duplicates">
+                                        <span data-button-label>Find Duplicates</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="tools-setting-row">
+                                <label for="duplicate-threshold">Similarity Threshold</label>
+                                <div class="tools-range-wrap">
+                                    <input type="range" id="duplicate-threshold" min="0" max="24" step="1" value="8">
+                                    <span id="duplicate-threshold-value">8</span>
+                                </div>
+                            </div>
+
+                            <div id="duplicate-review" class="duplicate-review is-empty">
+                                <div id="duplicate-empty" class="duplicate-empty">Run a scan to review duplicate candidates.</div>
+
+                                <div id="duplicate-stage" class="duplicate-stage hidden">
+                                    <div class="duplicate-review-head">
+                                        <div>
+                                            <strong id="duplicate-progress">0 / 0</strong>
+                                            <span id="duplicate-distance">Distance 0</span>
+                                        </div>
+                                        <button id="duplicate-skip-btn" class="action-btn" title="Skip this pair">Skip Pair</button>
+                                    </div>
+
+                                    <div class="duplicate-pair">
+                                        <button id="duplicate-left-card" class="duplicate-card" type="button" title="Keep this image and delete the other set">
+                                            <span class="duplicate-card-kicker">Image A</span>
+                                            <img id="duplicate-left-img" src="" alt="Duplicate candidate A">
+                                            <strong id="duplicate-left-name">No image</strong>
+                                            <p id="duplicate-left-caption"></p>
+                                        </button>
+
+                                        <button id="duplicate-right-card" class="duplicate-card" type="button" title="Keep this image and delete the other set">
+                                            <span class="duplicate-card-kicker">Image B</span>
+                                            <img id="duplicate-right-img" src="" alt="Duplicate candidate B">
+                                            <strong id="duplicate-right-name">No image</strong>
+                                            <p id="duplicate-right-caption"></p>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="tools-task-card hidden" data-tool-progress="duplicates">
+                                <div class="tools-task-head">
+                                    <strong data-tool-progress-title>Ready</strong>
+                                    <span data-tool-progress-percent>0%</span>
+                                </div>
+                                <div class="tools-task-bar">
+                                    <div class="tools-task-fill" data-tool-progress-fill></div>
+                                </div>
+                                <p class="tools-task-summary" data-tool-progress-summary>Duplicate scan and deletion results will be shown here.</p>
                                 <div class="tools-task-details" data-tool-progress-details></div>
                             </div>
                         </section>

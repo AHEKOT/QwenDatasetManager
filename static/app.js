@@ -4,6 +4,11 @@ let targetFolder = ''; // For transfer functionality
 let images = [];
 let blurPreviewFilename = '';
 let mirrorPreviewFilename = '';
+let duplicateReviewState = {
+    pairs: [],
+    index: 0,
+    threshold: 8
+};
 let importScanResults = [];
 let currentToolsView = 'blur';
 let activeImportJobId = null;
@@ -97,6 +102,23 @@ const deleteBtn = document.getElementById('delete-btn');
 const reshuffleBtn = document.getElementById('reshuffle-btn');
 const compressBtn = document.getElementById('compress-btn');
 const fitBtn = document.getElementById('fit-btn');
+const duplicateThresholdInput = document.getElementById('duplicate-threshold');
+const duplicateThresholdValue = document.getElementById('duplicate-threshold-value');
+const duplicateScanBtn = document.getElementById('duplicate-scan-btn');
+const duplicateReview = document.getElementById('duplicate-review');
+const duplicateEmpty = document.getElementById('duplicate-empty');
+const duplicateStage = document.getElementById('duplicate-stage');
+const duplicateProgress = document.getElementById('duplicate-progress');
+const duplicateDistance = document.getElementById('duplicate-distance');
+const duplicateSkipBtn = document.getElementById('duplicate-skip-btn');
+const duplicateLeftCard = document.getElementById('duplicate-left-card');
+const duplicateRightCard = document.getElementById('duplicate-right-card');
+const duplicateLeftImg = document.getElementById('duplicate-left-img');
+const duplicateRightImg = document.getElementById('duplicate-right-img');
+const duplicateLeftName = document.getElementById('duplicate-left-name');
+const duplicateRightName = document.getElementById('duplicate-right-name');
+const duplicateLeftCaption = document.getElementById('duplicate-left-caption');
+const duplicateRightCaption = document.getElementById('duplicate-right-caption');
 const blurStrengthInput = document.getElementById('blur-strength');
 const blurStrengthValue = document.getElementById('blur-strength-value');
 const blurPreviewImage = document.getElementById('blur-preview-image');
@@ -1194,6 +1216,10 @@ function setToolsView(viewName, options = {}) {
             mergeTargetNameInput.value = `${currentFolder}_merged`;
         }
     }
+
+    if (viewName === 'duplicates') {
+        renderDuplicateReview();
+    }
 }
 
 function pickBlurPreviewFilename(forceNew = false) {
@@ -1275,6 +1301,219 @@ function getMirrorExcludedControls() {
     if (mirrorExcludeControl2Input.checked) excludedControls.push('Control2');
     if (mirrorExcludeControl3Input.checked) excludedControls.push('Control3');
     return excludedControls;
+}
+
+function resetDuplicateReview(message = 'Run a scan to review duplicate candidates.') {
+    duplicateReviewState = {
+        pairs: [],
+        index: 0,
+        threshold: Number(duplicateThresholdInput?.value || 8)
+    };
+    renderDuplicateReview(message);
+}
+
+function renderDuplicateReview(emptyMessage = 'Run a scan to review duplicate candidates.') {
+    if (!duplicateReview || !duplicateEmpty || !duplicateStage) return;
+
+    const { pairs, index } = duplicateReviewState;
+    const currentPair = pairs[index];
+
+    if (!currentPair) {
+        duplicateReview.classList.add('is-empty');
+        duplicateStage.classList.add('hidden');
+        duplicateEmpty.classList.remove('hidden');
+        duplicateEmpty.textContent = emptyMessage;
+        return;
+    }
+
+    duplicateReview.classList.remove('is-empty');
+    duplicateEmpty.classList.add('hidden');
+    duplicateStage.classList.remove('hidden');
+
+    duplicateProgress.textContent = `${index + 1} / ${pairs.length}`;
+    duplicateDistance.textContent = `Distance ${currentPair.distance}`;
+
+    duplicateLeftImg.src = `/api/image/img/${encodeURIComponent(currentPair.left.filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(currentPair.left.filename)}`;
+    duplicateRightImg.src = `/api/image/img/${encodeURIComponent(currentPair.right.filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(currentPair.right.filename)}`;
+    duplicateLeftName.textContent = currentPair.left.filename;
+    duplicateRightName.textContent = currentPair.right.filename;
+    duplicateLeftCaption.textContent = currentPair.left.caption || 'No caption';
+    duplicateRightCaption.textContent = currentPair.right.caption || 'No caption';
+}
+
+async function scanDuplicateImages() {
+    if (!currentFolder) {
+        showToolValidation('duplicates', 'Select a dataset before searching duplicates.');
+        return;
+    }
+
+    if (images.length < 2) {
+        showToolValidation('duplicates', 'This dataset needs at least two images to search duplicates.');
+        return;
+    }
+
+    const threshold = Number(duplicateThresholdInput.value || 8);
+    duplicateThresholdValue.textContent = String(threshold);
+
+    try {
+        setActionButtonBusy(duplicateScanBtn, 'Scanning...', true);
+        renderToolProgress('duplicates', {
+            state: 'running',
+            title: 'Scanning duplicates',
+            summary: `Comparing ${images.length} images against each other.`,
+            percent: 35,
+            details: [
+                { label: 'Images', value: images.length },
+                { label: 'Threshold', value: threshold }
+            ],
+            indeterminate: true
+        });
+
+        const response = await fetch('/api/dataset/duplicates', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                folder: currentFolder,
+                threshold
+            })
+        });
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            throw new Error(data.error || 'Duplicate scan failed.');
+        }
+
+        duplicateReviewState = {
+            pairs: data.pairs || [],
+            index: 0,
+            threshold: data.threshold
+        };
+
+        if (!duplicateReviewState.pairs.length) {
+            renderDuplicateReview('No duplicate pairs found in this dataset.');
+        } else {
+            renderDuplicateReview();
+        }
+
+        renderToolProgress('duplicates', {
+            state: 'success',
+            title: duplicateReviewState.pairs.length ? 'Duplicate pairs found' : 'No duplicates found',
+            summary: duplicateReviewState.pairs.length
+                ? `Found ${duplicateReviewState.pairs.length} duplicate pair${duplicateReviewState.pairs.length !== 1 ? 's' : ''}. Click the image you want to keep.`
+                : `No pairs matched at threshold ${data.threshold}.`,
+            percent: 100,
+            details: [
+                { label: 'Images Scanned', value: data.imageCount },
+                { label: 'Pairs', value: duplicateReviewState.pairs.length },
+                { label: 'Threshold', value: data.threshold }
+            ]
+        });
+    } catch (error) {
+        console.error('Duplicate scan failed:', error);
+        resetDuplicateReview('Duplicate scan failed. Check the status card for details.');
+        renderToolProgress('duplicates', {
+            state: 'error',
+            title: 'Duplicate scan failed',
+            summary: error.message || 'Failed to scan duplicate images.',
+            percent: 100,
+            details: [{ label: 'Dataset', value: currentFolder }]
+        });
+    } finally {
+        setActionButtonBusy(duplicateScanBtn, 'Scanning...', false);
+    }
+}
+
+function advanceDuplicatePair() {
+    if (!duplicateReviewState.pairs.length) {
+        renderDuplicateReview('Duplicate review is complete.');
+        return;
+    }
+
+    duplicateReviewState.index += 1;
+    if (duplicateReviewState.index >= duplicateReviewState.pairs.length) {
+        duplicateReviewState.pairs = [];
+        duplicateReviewState.index = 0;
+        renderDuplicateReview('Duplicate review is complete.');
+        return;
+    }
+
+    renderDuplicateReview();
+}
+
+async function keepDuplicateSide(side) {
+    const { pairs, index } = duplicateReviewState;
+    const currentPair = pairs[index];
+    if (!currentPair) return;
+
+    const keepFilename = side === 'left' ? currentPair.left.filename : currentPair.right.filename;
+    const deleteFilename = side === 'left' ? currentPair.right.filename : currentPair.left.filename;
+
+    duplicateLeftCard.disabled = true;
+    duplicateRightCard.disabled = true;
+    duplicateSkipBtn.disabled = true;
+
+    try {
+        const response = await fetch(
+            `/api/delete/${encodeURIComponent(deleteFilename)}?folder=${encodeURIComponent(currentFolder)}`,
+            { method: 'DELETE' }
+        );
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            throw new Error(data.error || 'Delete failed.');
+        }
+
+        images = images.filter((filename) => filename !== deleteFilename);
+        if (currentIndex >= images.length) {
+            currentIndex = Math.max(0, images.length - 1);
+        }
+        markDirty(keepFilename);
+
+        duplicateReviewState.pairs = duplicateReviewState.pairs
+            .filter((pair, pairIndex) => (
+                pairIndex !== index
+                && pair.left.filename !== deleteFilename
+                && pair.right.filename !== deleteFilename
+            ));
+        duplicateReviewState.index = Math.min(index, Math.max(0, duplicateReviewState.pairs.length - 1));
+
+        renderImageGrid();
+        updateImageCount();
+        updateToolsContext();
+
+        if (!duplicateReviewState.pairs.length) {
+            renderDuplicateReview('Duplicate review is complete.');
+        } else {
+            renderDuplicateReview();
+        }
+
+        renderToolProgress('duplicates', {
+            state: 'success',
+            title: 'Image set deleted',
+            summary: `Kept ${keepFilename} and deleted ${deleteFilename} with its related files.`,
+            percent: 100,
+            details: [
+                { label: 'Kept', value: keepFilename },
+                { label: 'Deleted', value: deleteFilename },
+                { label: 'Remaining Pairs', value: duplicateReviewState.pairs.length }
+            ]
+        });
+    } catch (error) {
+        console.error('Duplicate delete failed:', error);
+        renderToolProgress('duplicates', {
+            state: 'error',
+            title: 'Delete failed',
+            summary: error.message || 'Failed to delete duplicate image set.',
+            percent: 100,
+            details: [
+                { label: 'Keep', value: keepFilename },
+                { label: 'Delete', value: deleteFilename }
+            ]
+        });
+    } finally {
+        duplicateLeftCard.disabled = false;
+        duplicateRightCard.disabled = false;
+        duplicateSkipBtn.disabled = false;
+    }
 }
 
 function openToolsModal() {
@@ -2663,6 +2902,13 @@ function setupEventListeners() {
     reshuffleBtn.addEventListener('click', reshuffleDataset);
     compressBtn.addEventListener('click', compressDataset);
     fitBtn.addEventListener('click', fitDataset);
+    duplicateThresholdInput.addEventListener('input', () => {
+        duplicateThresholdValue.textContent = duplicateThresholdInput.value;
+    });
+    duplicateScanBtn.addEventListener('click', scanDuplicateImages);
+    duplicateSkipBtn.addEventListener('click', advanceDuplicatePair);
+    duplicateLeftCard.addEventListener('click', () => keepDuplicateSide('left'));
+    duplicateRightCard.addEventListener('click', () => keepDuplicateSide('right'));
     blurStrengthInput.addEventListener('input', () => updateBlurPreview(false));
     blurRerollBtn.addEventListener('click', () => updateBlurPreview(true));
     blurApplyBtn.addEventListener('click', createBlurredDatasetCopy);

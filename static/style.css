@@ -801,6 +801,127 @@ select:focus {
   line-height: 1.6;
 }
 
+.duplicate-review {
+  min-height: 420px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.015));
+  padding: 1rem;
+}
+
+.duplicate-review.is-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.duplicate-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.duplicate-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.duplicate-review-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.duplicate-review-head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.duplicate-review-head strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.duplicate-review-head span {
+  color: var(--accent-hover);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.duplicate-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.duplicate-card {
+  display: grid;
+  grid-template-rows: auto minmax(260px, 42vh) auto minmax(84px, 120px);
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 0.85rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-primary);
+  font-family: var(--font);
+  text-align: left;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.duplicate-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(16, 185, 129, 0.34);
+  background: rgba(16, 185, 129, 0.08);
+  box-shadow: 0 16px 36px rgba(16, 185, 129, 0.08);
+}
+
+.duplicate-card:disabled {
+  cursor: wait;
+  opacity: 0.65;
+  transform: none;
+}
+
+.duplicate-card-kicker {
+  color: var(--accent-hover);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.duplicate-card img {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.duplicate-card strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.duplicate-card p {
+  min-height: 0;
+  overflow: auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .tools-blur-actions {
   display: flex;
   align-items: center;
@@ -2585,6 +2706,14 @@ input[type="range"]::-moz-range-thumb {
 
   .tools-toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .duplicate-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .duplicate-card {
+    grid-template-rows: auto minmax(220px, 34vh) auto minmax(72px, 110px);
   }
 
   .tools-mirror-exclusions {
