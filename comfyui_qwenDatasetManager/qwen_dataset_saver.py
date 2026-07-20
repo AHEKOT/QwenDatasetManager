@@ -1,6 +1,8 @@
 import os
 import re
-import torch
+import threading
+import uuid
+from pathlib import Path
 import numpy as np
 from PIL import Image
 import folder_paths
@@ -11,6 +13,7 @@ class QwenDatasetSaver:
     ComfyUI node for saving images in Qwen dataset format.
     Saves target image and optional control images with automatic numbering.
     """
+    _save_lock = threading.Lock()
     
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
@@ -35,14 +38,16 @@ class QwenDatasetSaver:
     OUTPUT_NODE = True
     CATEGORY = "image/io"
     
-    def tensor_to_pil(self, tensor):
+    def tensor_to_pil(self, tensor, batch_index=0):
         """Convert ComfyUI tensor to PIL Image"""
         # ComfyUI images are in format [B, H, W, C] with values 0-1
         if len(tensor.shape) == 4:
-            tensor = tensor[0]  # Take first batch
+            if tensor.shape[0] == 0:
+                raise ValueError("Image batch is empty")
+            tensor = tensor[min(batch_index, tensor.shape[0] - 1)]
         
         # Convert to numpy and scale to 0-255
-        np_image = (tensor.cpu().numpy() * 255).astype(np.uint8)
+        np_image = (tensor.detach().cpu().numpy().clip(0.0, 1.0) * 255).round().astype(np.uint8)
         
         # Convert to PIL
         return Image.fromarray(np_image)
@@ -61,7 +66,7 @@ class QwenDatasetSaver:
         max_num = 0
         
         for filename in os.listdir(directory):
-            match = pattern.match(filename)
+            match = pattern.fullmatch(filename)
             if match:
                 num = int(match.group(1))
                 max_num = max(max_num, num)
@@ -69,75 +74,115 @@ class QwenDatasetSaver:
         # Return next number
         next_num = max_num + 1
         return f"image_{next_num:05d}.png"
+
+    def resolve_dataset_path(self, dataset_name):
+        dataset_name = dataset_name.strip()
+        if (
+            not dataset_name
+            or dataset_name in {'.', '..'}
+            or '/' in dataset_name
+            or '\\' in dataset_name
+            or '\x00' in dataset_name
+        ):
+            raise ValueError("dataset_name must be a single folder name")
+
+        output_root = Path(self.output_dir).resolve()
+        dataset_path = (output_root / dataset_name).resolve(strict=False)
+        if dataset_path.parent != output_root:
+            raise ValueError("Dataset path must stay inside the ComfyUI output directory")
+        return dataset_path
+
+    def save_png_atomic(self, image, destination):
+        temp_path = destination.with_name(f'.{destination.name}.{uuid.uuid4().hex}.tmp.png')
+        try:
+            image.save(temp_path, "PNG", compress_level=0)
+            os.replace(temp_path, destination)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
     
     def save_dataset(self, target, dataset_name, control1=None, control2=None, control3=None, caption=None):
         """Save images in Qwen dataset format"""
         
-        # Create dataset directory structure
-        dataset_path = os.path.join(self.output_dir, dataset_name)
-        img_dir = os.path.join(dataset_path, "img")
-        control1_dir = os.path.join(dataset_path, "Control1")
-        control2_dir = os.path.join(dataset_path, "Control2")
-        control3_dir = os.path.join(dataset_path, "Control3")
-        
-        # Create directories
-        for directory in [img_dir, control1_dir, control2_dir, control3_dir]:
-            os.makedirs(directory, exist_ok=True)
-        
-        # Get next filename
-        filename = self.get_next_filename(img_dir)
-        basename = os.path.splitext(filename)[0]
-        
-        # Convert target to PIL and save
-        target_image = self.tensor_to_pil(target)
-        target_path = os.path.join(img_dir, filename)
-        target_image.save(target_path, "PNG", compress_level=0)
-        
-        # Check if any control images are provided
-        has_control = control1 is not None or control2 is not None or control3 is not None
-        
-        # Save control1 (or black image if no control images provided)
-        if control1 is not None:
-            control1_image = self.tensor_to_pil(control1)
-        elif not has_control:
-            # No control images at all - create black image same size as target
-            control1_image = self.create_black_image(target_image.size)
-        else:
-            control1_image = None
-        
-        if control1_image is not None:
-            control1_path = os.path.join(control1_dir, filename)
-            control1_image.save(control1_path, "PNG", compress_level=0)
-        
-        # Save control2 if provided
-        if control2 is not None:
-            control2_image = self.tensor_to_pil(control2)
-            control2_path = os.path.join(control2_dir, filename)
-            control2_image.save(control2_path, "PNG", compress_level=0)
-        
-        # Save control3 if provided
-        if control3 is not None:
-            control3_image = self.tensor_to_pil(control3)
-            control3_path = os.path.join(control3_dir, filename)
-            control3_image.save(control3_path, "PNG", compress_level=0)
-        
-        # Save caption if provided
-        if caption and caption.strip():
-            caption_path = os.path.join(img_dir, f"{basename}.txt")
-            with open(caption_path, 'w', encoding='utf-8') as f:
-                f.write(caption.strip())
-        
-        print(f"✅ Saved dataset entry: {filename}")
+        dataset_path = self.resolve_dataset_path(dataset_name)
+        directories = {
+            "img": dataset_path / "img",
+            "Control1": dataset_path / "Control1",
+            "Control2": dataset_path / "Control2",
+            "Control3": dataset_path / "Control3",
+        }
+        batch_size = int(target.shape[0]) if len(target.shape) == 4 else 1
+        has_control = any(control is not None for control in (control1, control2, control3))
+        for folder_name, control in (
+            ("Control1", control1), ("Control2", control2), ("Control3", control3)
+        ):
+            if control is None:
+                continue
+            control_batch_size = int(control.shape[0]) if len(control.shape) == 4 else 1
+            if control_batch_size not in {1, batch_size}:
+                raise ValueError(
+                    f"{folder_name} batch must contain either 1 or {batch_size} images"
+                )
+        saved_entries = []
+
+        with self._save_lock:
+            for directory in directories.values():
+                directory.mkdir(parents=True, exist_ok=True)
+
+            for batch_index in range(batch_size):
+                filename = self.get_next_filename(directories["img"])
+                basename = Path(filename).stem
+                written_paths = []
+                try:
+                    target_image = self.tensor_to_pil(target, batch_index)
+                    target_path = directories["img"] / filename
+                    self.save_png_atomic(target_image, target_path)
+                    written_paths.append(target_path)
+
+                    controls = {
+                        "Control1": control1,
+                        "Control2": control2,
+                        "Control3": control3,
+                    }
+                    for folder_name, control in controls.items():
+                        control_image = None
+                        if control is not None:
+                            control_image = self.tensor_to_pil(control, batch_index)
+                        elif folder_name == "Control1" and not has_control:
+                            control_image = self.create_black_image(target_image.size)
+                        if control_image is None:
+                            continue
+                        if control_image.size != target_image.size:
+                            raise ValueError(f"{folder_name} size does not match target size")
+                        control_path = directories[folder_name] / filename
+                        self.save_png_atomic(control_image, control_path)
+                        written_paths.append(control_path)
+
+                    if caption and caption.strip():
+                        caption_path = directories["img"] / f"{basename}.txt"
+                        temp_caption = caption_path.with_name(
+                            f'.{caption_path.name}.{uuid.uuid4().hex}.tmp'
+                        )
+                        try:
+                            temp_caption.write_text(caption.strip(), encoding='utf-8')
+                            os.replace(temp_caption, caption_path)
+                        finally:
+                            if temp_caption.exists():
+                                temp_caption.unlink()
+                        written_paths.append(caption_path)
+
+                    saved_entries.append(filename)
+                except Exception:
+                    for path in written_paths:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    raise
+
+        print(f"✅ Saved {len(saved_entries)} dataset entr{'y' if len(saved_entries) == 1 else 'ies'}")
         print(f"   Dataset: {dataset_name}")
-        print(f"   Target: {target_path}")
-        if control1_image:
-            print(f"   Control1: saved")
-        if control2 is not None:
-            print(f"   Control2: saved")
-        if control3 is not None:
-            print(f"   Control3: saved")
-        if caption and caption.strip():
-            print(f"   Caption: saved")
+        print(f"   Files: {', '.join(saved_entries)}")
         
         return ()
 

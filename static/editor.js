@@ -35,7 +35,7 @@ class ImageEditor {
         this.selectionStart = null;
 
         this.history = [];
-        this.maxHistory = 20; // Reduced from 50 to save memory
+        this.maxHistory = 20;
         this.hasChanges = false;
         this.currentFilename = null;
         this.currentFolder = null;
@@ -117,6 +117,8 @@ class ImageEditor {
         const img = this.targetImageElement;
         this.canvas.width = img.naturalWidth || img.width;
         this.canvas.height = img.naturalHeight || img.height;
+        const bytesPerState = Math.max(1, this.canvas.width * this.canvas.height * 4);
+        this.maxHistory = Math.max(2, Math.min(20, Math.floor((96 * 1024 * 1024) / bytesPerState)));
 
         // Draw initial image
         this.ctx.drawImage(img, 0, 0);
@@ -167,34 +169,60 @@ class ImageEditor {
     }
 
     setupEventListeners() {
-        // Mouse events
-        this.canvas.parentElement.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+        const activate = () => {
+            ImageEditor.activeEditor = this;
+            const sizeSlider = document.getElementById('brush-size');
+            const opacitySlider = document.getElementById('brush-opacity');
+            const colorPicker = document.getElementById('brush-color');
+            if (sizeSlider) sizeSlider.value = this.brushSize;
+            if (opacitySlider) opacitySlider.value = Math.round(this.brushOpacity * 100);
+            if (colorPicker) colorPicker.value = this.brushColor;
+            const sizeValue = document.getElementById('size-value');
+            const opacityValue = document.getElementById('opacity-value-brush');
+            if (sizeValue) sizeValue.textContent = this.brushSize;
+            if (opacityValue) opacityValue.textContent = Math.round(this.brushOpacity * 100);
+            this.onStateChange?.();
+        };
+
+        // Canvas-specific events remain bound to their own editor.
+        this.canvas.parentElement.addEventListener('mousedown', (e) => {
+            activate();
+            this.handleMouseDown(e);
+        });
         window.addEventListener('mousemove', (e) => this.handleMouseMove(e));
         window.addEventListener('mouseup', (e) => this.handleMouseUp(e));
+        this.canvas.parentElement.addEventListener('wheel', (e) => {
+            activate();
+            this.handleWheel(e);
+        }, { passive: false });
 
-        // Wheel zoom
-        this.canvas.parentElement.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
+        if (!ImageEditor.activeEditor) ImageEditor.activeEditor = this;
+        if (ImageEditor.globalControlsBound) return;
+        ImageEditor.globalControlsBound = true;
 
-        // Tools
+        const active = () => ImageEditor.activeEditor;
         const toolButtons = ['brush', 'picker', 'spray', 'blur', 'distort', 'stamp', 'eraser', 'crop'];
         toolButtons.forEach(tool => {
             const btn = document.getElementById(`${tool}-tool`);
-            if (btn) btn.addEventListener('click', () => this.selectTool(tool));
+            if (btn) btn.addEventListener('click', () => active()?.selectTool(tool));
         });
 
-        // Settings
         const sizeSlider = document.getElementById('brush-size');
         if (sizeSlider) {
             sizeSlider.addEventListener('input', (e) => {
-                this.brushSize = parseInt(e.target.value);
-                document.getElementById('size-value').textContent = this.brushSize;
+                const editor = active();
+                if (!editor) return;
+                editor.brushSize = parseInt(e.target.value);
+                document.getElementById('size-value').textContent = editor.brushSize;
             });
         }
 
         const opacitySlider = document.getElementById('brush-opacity');
         if (opacitySlider) {
             opacitySlider.addEventListener('input', (e) => {
-                this.brushOpacity = parseInt(e.target.value) / 100;
+                const editor = active();
+                if (!editor) return;
+                editor.brushOpacity = parseInt(e.target.value) / 100;
                 document.getElementById('opacity-value-brush').textContent = e.target.value;
             });
         }
@@ -202,56 +230,55 @@ class ImageEditor {
         const colorPicker = document.getElementById('brush-color');
         if (colorPicker) {
             colorPicker.addEventListener('change', (e) => {
-                this.brushColor = e.target.value;
+                const editor = active();
+                if (editor) editor.brushColor = e.target.value;
             });
         }
 
-        // Actions
         const undoBtn = document.getElementById('undo-btn');
-        if (undoBtn) undoBtn.addEventListener('click', () => this.undo());
+        if (undoBtn) undoBtn.addEventListener('click', () => active()?.undo());
 
         const resetBtn = document.getElementById('reset-edit-btn');
-        if (resetBtn) resetBtn.addEventListener('click', () => this.reset());
+        if (resetBtn) resetBtn.addEventListener('click', () => active()?.reset());
 
         const saveBtn = document.getElementById('save-edit-btn');
-        if (saveBtn) saveBtn.addEventListener('click', () => this.save());
+        if (saveBtn) saveBtn.addEventListener('click', () => active()?.save());
 
         const applyCropBtn = document.getElementById('apply-crop-btn');
-        if (applyCropBtn) applyCropBtn.addEventListener('click', () => this.applyCrop());
+        if (applyCropBtn) applyCropBtn.addEventListener('click', () => active()?.applyCrop());
 
         document.addEventListener('keydown', (e) => {
-            // Only handle shortcuts if canvas is visible
-            if (this.canvas.offsetParent === null) return;
+            const editor = active();
+            if (!editor || editor.canvas.offsetParent === null) return;
             // Don't steal keys when user is typing in an input or textarea
             if (document.activeElement && (document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'INPUT')) return;
 
-            if (e.ctrlKey && e.key === 'z') {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
                 e.preventDefault();
-                this.undo();
+                editor.undo();
             } else if (e.key === 'Enter') {
-                // Determine context
-                if (this.currentTool === 'crop' && this.selectionRect) {
+                if (editor.currentTool === 'crop' && editor.selectionRect) {
                     e.preventDefault();
-                    this.applyCrop();
+                    editor.applyCrop();
                 } else {
                     const saveBtn = document.getElementById('save-edit-btn');
                     if (saveBtn && !saveBtn.disabled) {
                         e.preventDefault();
-                        this.save();
+                        editor.save();
                     }
                 }
             } else if (e.key === '[' || e.key === ']') {
                 const step = 2;
-                let newSize = this.brushSize;
+                let newSize = editor.brushSize;
 
                 if (e.key === '[') {
-                    newSize = Math.max(1, this.brushSize - step);
+                    newSize = Math.max(1, editor.brushSize - step);
                 } else {
-                    newSize = Math.min(100, this.brushSize + step);
+                    newSize = Math.min(100, editor.brushSize + step);
                 }
 
-                if (newSize !== this.brushSize) {
-                    this.brushSize = newSize;
+                if (newSize !== editor.brushSize) {
+                    editor.brushSize = newSize;
                     const sizeSlider = document.getElementById('brush-size');
                     const sizeValue = document.getElementById('size-value');
 
@@ -259,21 +286,21 @@ class ImageEditor {
                     if (sizeValue) sizeValue.textContent = newSize;
                 }
             } else if (e.key === '1') {
-                this.selectTool('brush');
-            } else if (e.key === '2') {
-                this.selectTool('picker');
-            } else if (e.key === '3') {
-                this.selectTool('stamp');
-            } else if (e.key === '4') {
-                this.selectTool('eraser');
+                editor.selectTool('brush');
+            } else if (e.key === '2' || (!e.shiftKey && e.key.toLowerCase() === 'p')) {
+                editor.selectTool('picker');
+            } else if (e.key === '3' || e.key.toLowerCase() === 's') {
+                editor.selectTool('stamp');
+            } else if (e.key === '4' || e.key.toLowerCase() === 'e') {
+                editor.selectTool('eraser');
             } else if (e.key === '5' || e.key === 'c') {
-                this.selectTool('crop');
+                editor.selectTool('crop');
             } else if (e.key === 'a' || e.key === '6') {
-                this.selectTool('spray');
+                editor.selectTool('spray');
             } else if (e.key === 'b' || e.key === '7') {
-                this.selectTool('blur');
+                editor.selectTool('blur');
             } else if (e.key === 'd' || e.key === '8') {
-                this.selectTool('distort');
+                editor.selectTool('distort');
             }
         });
     }
@@ -320,8 +347,8 @@ class ImageEditor {
     }
 
     handleMouseDown(e) {
-        // Middle mouse or Space+Click for panning
-        if (e.button === 1 || (e.button === 0 && e.code === 'Space')) {
+        // Middle mouse or Alt+Click for panning
+        if (e.button === 1 || (e.button === 0 && e.altKey)) {
             e.preventDefault();
             this.isPanning = true;
             this.lastMouseX = e.clientX;
@@ -896,17 +923,27 @@ class ImageEditor {
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving...';
 
+        let wasSelecting = null;
         try {
             // Before saving, verify we are not in crop mode or clear crop handles?
             // The toBlob uses the context, which might have selection handles drawn if we didn't clear them?
             // redrawCanvas() calls drawSelectionLayer() at the end.
             // We should temporarily clear selection handles for the save.
 
-            const wasSelecting = this.selectionRect;
+            wasSelecting = this.selectionRect;
             this.selectionRect = null;
             this.redrawCanvas();
 
-            const blob = await new Promise(resolve => this.canvas.toBlob(resolve));
+            const extension = this.currentFilename.split('.').pop().toLowerCase();
+            const mimeType = {
+                png: 'image/png',
+                jpg: 'image/jpeg',
+                jpeg: 'image/jpeg',
+                webp: 'image/webp'
+            }[extension];
+            if (!mimeType) throw new Error('Unsupported image extension');
+            const blob = await new Promise(resolve => this.canvas.toBlob(resolve, mimeType, 0.92));
+            if (!blob) throw new Error('Browser failed to encode the edited image');
             const formData = new FormData();
             formData.append('file', blob, this.currentFilename);
 
@@ -917,34 +954,38 @@ class ImageEditor {
 
             if (response.ok) {
                 this.hasChanges = false;
+                this.history = [this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height)];
 
                 // Notify app to update cache and UI
                 if (window.onImageSaved) {
                     window.onImageSaved();
                 }
 
-                alert('Image saved successfully');
+                return true;
             } else {
-                alert('Failed to save image');
-            }
-
-            // Restore selection if needed
-            if (wasSelecting) {
-                this.selectionRect = wasSelecting;
-                this.redrawCanvas();
+                const data = await response.json().catch(() => ({}));
+                alert(`Failed to save image: ${data.error || response.statusText}`);
+                return false;
             }
 
         } catch (e) {
             console.error('Save error:', e);
             alert('Error saving image');
+            return false;
         } finally {
+            if (wasSelecting) {
+                this.selectionRect = wasSelecting;
+                this.redrawCanvas();
+            }
             saveBtn.disabled = this.history.length <= 1;
             saveBtn.innerHTML = originalText;
+            this.onStateChange?.();
         }
     }
 
     async applyCrop() {
         if (!this.selectionRect || !this.currentFolder || !this.currentFilename) return;
+        if (this.hasChanges && !await this.save()) return;
 
         const applyBtn = document.getElementById('apply-crop-btn');
         const sourceExceptionSelect = document.getElementById('crop-source-exception');
@@ -998,3 +1039,6 @@ class ImageEditor {
         }
     }
 }
+
+ImageEditor.activeEditor = null;
+ImageEditor.globalControlsBound = false;

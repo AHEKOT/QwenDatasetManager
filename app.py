@@ -1,6 +1,5 @@
 from flask import Flask, send_from_directory, jsonify, request, send_file
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask_cors import CORS
 import os
 import re
 import json
@@ -8,13 +7,24 @@ import random
 import shutil
 import uuid
 import threading
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+from PIL import Image as PillowImage
 
 app = Flask(__name__, static_folder='static')
-CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('QDM_MAX_UPLOAD_MB', '128')) * 1024 * 1024
+app.config['TRUSTED_HOSTS'] = [
+    host.strip()
+    for host in os.environ.get('QDM_TRUSTED_HOSTS', 'localhost,127.0.0.1,[::1]').split(',')
+    if host.strip()
+]
+PillowImage.MAX_IMAGE_PIXELS = int(os.environ.get('QDM_MAX_IMAGE_PIXELS', '100000000'))
+warnings.filterwarnings('error', category=PillowImage.DecompressionBombWarning)
 
 # Base directory for datasets
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 DATASETS_DIR = BASE_DIR / 'Datasets'
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 DATASET_IMAGE_FOLDERS = ('img', 'Control1', 'Control2', 'Control3')
@@ -22,19 +32,279 @@ IMPORT_JOBS = {}
 IMPORT_JOBS_LOCK = threading.Lock()
 TOOL_JOBS = {}
 TOOL_JOBS_LOCK = threading.Lock()
+ACTIVE_DATASETS = {}
+ACTIVE_DATASETS_LOCK = threading.Lock()
+MAX_RETAINED_JOBS = 200
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
 
 
+class InvalidPathError(ValueError):
+    """Raised when an API path would leave the managed datasets directory."""
+
+
+def _resolved_datasets_root():
+    return DATASETS_DIR.resolve()
+
+
+def _is_within(path, root):
+    return path == root or root in path.parents
+
+
+def validate_dataset_name(name, field_name='Dataset'):
+    if not isinstance(name, str):
+        raise InvalidPathError(f'{field_name} name must be a string')
+
+    name = name.strip()
+    if (
+        not name
+        or name in {'.', '..'}
+        or '/' in name
+        or '\\' in name
+        or '\x00' in name
+        or any(ord(char) < 32 for char in name)
+    ):
+        raise InvalidPathError(f'Invalid {field_name.lower()} name')
+    return name
+
+
+def resolve_dataset_dir(name, *, must_exist=False):
+    name = validate_dataset_name(name)
+    root = _resolved_datasets_root()
+    lexical_candidate = root / name
+    if lexical_candidate.is_symlink():
+        raise InvalidPathError('Dataset symlinks are not allowed')
+    candidate = lexical_candidate.resolve(strict=False)
+    if not _is_within(candidate, root):
+        raise InvalidPathError('Dataset path escapes the datasets directory')
+    if must_exist and not candidate.is_dir():
+        raise FileNotFoundError('Dataset not found')
+    return candidate
+
+
+def validate_subfolder(name):
+    if name not in DATASET_IMAGE_FOLDERS:
+        raise InvalidPathError('Invalid dataset subfolder')
+    return name
+
+
+def validate_image_filename(filename):
+    if not isinstance(filename, str):
+        raise InvalidPathError('Filename must be a string')
+    if (
+        not filename
+        or filename in {'.', '..'}
+        or Path(filename).name != filename
+        or '/' in filename
+        or '\\' in filename
+        or '\x00' in filename
+        or Path(filename).suffix.lower() not in IMAGE_EXTENSIONS
+    ):
+        raise InvalidPathError('Invalid image filename')
+    return filename
+
+
+def resolve_dataset_file(dataset_dir, subfolder, filename):
+    validate_subfolder(subfolder)
+    validate_image_filename(filename)
+    dataset_root = dataset_dir.resolve()
+    candidate = (dataset_root / subfolder / filename).resolve(strict=False)
+    if not _is_within(candidate, dataset_root):
+        raise InvalidPathError('File path escapes the dataset directory')
+    return candidate
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def claim_datasets(names, owner_id):
+    normalized = sorted({validate_dataset_name(name) for name in names if name})
+    with ACTIVE_DATASETS_LOCK:
+        conflicts = [name for name in normalized if name in ACTIVE_DATASETS]
+        if conflicts:
+            return conflicts
+        for name in normalized:
+            ACTIVE_DATASETS[name] = owner_id
+    return []
+
+
+def release_datasets(owner_id):
+    with ACTIVE_DATASETS_LOCK:
+        for name in [name for name, owner in ACTIVE_DATASETS.items() if owner == owner_id]:
+            ACTIVE_DATASETS.pop(name, None)
+
+
+def prune_finished_jobs(jobs):
+    if len(jobs) < MAX_RETAINED_JOBS:
+        return
+    finished = sorted(
+        (job for job in jobs.values() if job.get('finished')),
+        key=lambda job: job.get('finishedAt') or job.get('createdAt') or ''
+    )
+    for job in finished[:max(1, len(jobs) - MAX_RETAINED_JOBS + 1)]:
+        jobs.pop(job['jobId'], None)
+
+
+def atomic_write_text(path, content):
+    temp_path = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def verify_uploaded_image(path, expected_extension):
+    from PIL import Image
+
+    compatible_formats = {
+        '.png': {'PNG'},
+        '.jpg': {'JPEG'},
+        '.jpeg': {'JPEG'},
+        '.webp': {'WEBP'}
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', Image.DecompressionBombWarning)
+        with Image.open(path) as image:
+            image.verify()
+            image_format = (image.format or '').upper()
+    if image_format not in compatible_formats[expected_extension.lower()]:
+        raise ValueError('Uploaded image format does not match the filename extension')
+
+
+def save_pillow_image_atomic(image, destination, image_format=None, **save_kwargs):
+    temp_path = destination.with_name(
+        f'.{destination.stem}.{uuid.uuid4().hex}.tmp{destination.suffix}'
+    )
+    try:
+        image.save(temp_path, image_format, **save_kwargs)
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _validate_request_paths(values):
+    dataset_fields = (
+        'folder', 'folderPath', 'primaryFolder', 'secondaryFolder',
+        'linkedFolder', 'targetFolder', 'oldName'
+    )
+    for field in dataset_fields:
+        value = values.get(field)
+        if value not in (None, ''):
+            validate_dataset_name(value, field)
+
+    if values.get('subfolder') not in (None, ''):
+        validate_subfolder(values['subfolder'])
+
+    filename = values.get('filename')
+    if filename not in (None, ''):
+        validate_image_filename(filename)
+
+    filenames = values.get('filenames')
+    if filenames is not None:
+        if not isinstance(filenames, list) or len(filenames) > 1000:
+            raise InvalidPathError('Invalid filenames list')
+        for item in filenames:
+            validate_image_filename(item)
+
+
+@app.before_request
+def protect_api_requests():
+    if not request.path.startswith('/api/'):
+        return None
+
+    if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+        if request.headers.get('Sec-Fetch-Site') == 'cross-site':
+            return jsonify({'error': 'Cross-site request rejected'}), 403
+        origin = request.headers.get('Origin')
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.scheme not in {'http', 'https'} or parsed.netloc != request.host:
+                return jsonify({'error': 'Cross-origin request rejected'}), 403
+
+    try:
+        _validate_request_paths(request.args)
+        if request.view_args:
+            _validate_request_paths(request.view_args)
+        body = None
+        if request.is_json:
+            body = request.get_json(silent=True)
+            if isinstance(body, dict):
+                _validate_request_paths(body)
+                payload = body.get('payload')
+                if isinstance(payload, dict):
+                    _validate_request_paths(payload)
+
+        if request.method not in {'GET', 'HEAD', 'OPTIONS'} and request.path not in {
+            '/api/tool-jobs/start', '/api/import/dataset/start'
+        }:
+            names = []
+            sources = [request.args]
+            if isinstance(body, dict):
+                sources.append(body)
+                if isinstance(body.get('payload'), dict):
+                    sources.append(body['payload'])
+            for source in sources:
+                for field in (
+                    'folder', 'folderPath', 'primaryFolder', 'secondaryFolder',
+                    'linkedFolder', 'targetFolder', 'oldName', 'newName', 'name', 'targetName'
+                ):
+                    value = source.get(field)
+                    if isinstance(value, str) and value.strip():
+                        names.append(value.strip())
+            owner_id = f'request-{uuid.uuid4().hex}'
+            conflicts = claim_datasets(names, owner_id)
+            if conflicts:
+                return jsonify({
+                    'error': 'Dataset is busy with another operation',
+                    'datasets': conflicts
+                }), 409
+            request.environ['qdm_dataset_claim_owner'] = owner_id
+    except InvalidPathError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return None
+
+
+@app.after_request
+def add_security_headers(response):
+    owner_id = request.environ.get('qdm_dataset_claim_owner')
+    if owner_id:
+        release_datasets(owner_id)
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; img-src 'self' blob: data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    )
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({'error': 'Request exceeds the configured upload limit'}), 413
+
+
 def iter_dataset_images(dataset_dir, folders=DATASET_IMAGE_FOLDERS):
+    dataset_dir = dataset_dir.resolve()
     for folder_name in folders:
         folder = dataset_dir / folder_name
         if not folder.exists():
             continue
         for file_path in folder.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
-                yield file_path
+            if not file_path.is_file() or file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            resolved_path = file_path.resolve()
+            if _is_within(resolved_path, dataset_dir):
+                yield resolved_path
 
 
 def apply_dataset_blur(image, strength, image_format=None):
@@ -88,14 +358,14 @@ def build_duplicate_image_fingerprint(image_path, hash_size=8):
 
     with Image.open(image_path) as image:
         rgb_sample = image.convert('RGB').resize((16, 16), Image.Resampling.LANCZOS)
-        rgb_pixels = list(rgb_sample.getdata())
+        rgb_pixels = list(rgb_sample.get_flattened_data())
         average_rgb = tuple(
             sum(pixel[channel] for pixel in rgb_pixels) // len(rgb_pixels)
             for channel in range(3)
         )
 
         grayscale = image.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
-        pixels = list(grayscale.getdata())
+        pixels = list(grayscale.get_flattened_data())
 
     bits = []
     for row in range(hash_size):
@@ -119,6 +389,79 @@ def duplicate_image_distance(fingerprint_a, fingerprint_b):
         for left, right in zip(fingerprint_a['averageRgb'], fingerprint_b['averageRgb'])
     )
     return hash_distance + (color_distance // 24)
+
+
+def process_duplicate_scan_job(job_id, folder_path, threshold):
+    dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
+    img_dir = dataset_dir / 'img'
+    if not img_dir.is_dir():
+        raise FileNotFoundError('Image directory not found')
+
+    image_paths = [
+        image_path for image_path in sorted(img_dir.iterdir())
+        if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    comparison_count = len(image_paths) * (len(image_paths) - 1) // 2
+    set_tool_job_total(job_id, len(image_paths) + comparison_count)
+    fingerprints = {}
+    captions = {}
+    for image_path in image_paths:
+        try:
+            fingerprints[image_path.name] = build_duplicate_image_fingerprint(image_path)
+            captions[image_path.name] = get_dataset_caption(dataset_dir, image_path.name)
+        except (OSError, ValueError) as exc:
+            print(f'Failed to fingerprint {image_path}: {exc}')
+        finally:
+            increment_tool_job_progress(job_id, current_item=image_path.name)
+
+    pairs = []
+    pending_progress = 0
+    for left_index, left_path in enumerate(image_paths):
+        left_fingerprint = fingerprints.get(left_path.name)
+        for right_path in image_paths[left_index + 1:]:
+            pending_progress += 1
+            right_fingerprint = fingerprints.get(right_path.name)
+            if left_fingerprint and right_fingerprint:
+                distance = duplicate_image_distance(left_fingerprint, right_fingerprint)
+                if distance <= threshold:
+                    pairs.append({
+                        'left': {
+                            'filename': left_path.name,
+                            'caption': captions.get(left_path.name, '')
+                        },
+                        'right': {
+                            'filename': right_path.name,
+                            'caption': captions.get(right_path.name, '')
+                        },
+                        'distance': distance
+                    })
+            if pending_progress >= 250:
+                increment_tool_job_progress(
+                    job_id,
+                    processed_delta=pending_progress,
+                    current_item=left_path.name,
+                    metrics={'pairsFound': len(pairs)}
+                )
+                pending_progress = 0
+
+    if pending_progress:
+        increment_tool_job_progress(
+            job_id,
+            processed_delta=pending_progress,
+            metrics={'pairsFound': len(pairs)}
+        )
+
+    pairs.sort(key=lambda item: (
+        item['distance'],
+        item['left']['filename'].lower(),
+        item['right']['filename'].lower()
+    ))
+    return {
+        'threshold': threshold,
+        'pairs': pairs,
+        'count': len(pairs),
+        'imageCount': len(image_paths)
+    }
 
 
 def generate_unique_dataset_basename(target_dataset_dir):
@@ -172,7 +515,7 @@ def scan_exported_dataset_groups(scan_dir):
         })
 
         image_count = 0
-        for file_path in item.rglob('*'):
+        for file_path in item.iterdir():
             if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
                 image_count += 1
 
@@ -193,7 +536,7 @@ def scan_exported_dataset_groups(scan_dir):
 
         group['controlCount'] = control_count
         group['imageCount'] = group['folders']['img']['imageCount']
-        group['pairStyle'] = 'triplet' if control_count >= 3 else 'pair'
+        group['pairStyle'] = 'triplet' if control_count >= 2 else 'pair'
         results.append(group)
 
     results.sort(key=lambda item: item['sourceName'].lower())
@@ -217,23 +560,22 @@ def build_import_plan(dataset, target_dir):
 
         source_dir = Path(source_info['path'])
         destination_dir = target_dir / target_folder_name
-        directories = []
         files = []
 
-        for path in source_dir.rglob('*'):
-            relative_path = path.relative_to(source_dir)
-            destination_path = destination_dir / relative_path
-            if path.is_dir():
-                directories.append(destination_path)
-            else:
-                files.append((path, destination_path))
+        for path in source_dir.iterdir():
+            if not path.is_file():
+                continue
+            is_caption = source_folder_name == 'img' and path.suffix.lower() == '.txt'
+            if path.suffix.lower() not in IMAGE_EXTENSIONS and not is_caption:
+                continue
+            files.append((path, destination_dir / path.name))
 
         folder_plans.append({
             'sourceFolder': source_folder_name,
             'targetFolder': target_folder_name,
             'sourceDir': source_dir,
             'destinationDir': destination_dir,
-            'directories': directories,
+            'directories': [],
             'files': files
         })
         total_files += len(files)
@@ -265,10 +607,10 @@ def increment_import_job_progress(job_id, folder_name, copied_delta=1):
         job['progressPercent'] = round((job['copiedFiles'] / total) * 100, 1) if total else 100.0
 
 
-def run_import_job(job_id, folder_plans, target_dir):
+def run_import_job(job_id, folder_plans, staging_dir, target_dir):
     try:
         for folder_name in DATASET_IMAGE_FOLDERS:
-            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+            (staging_dir / folder_name).mkdir(parents=True, exist_ok=True)
 
         update_import_job(job_id, status='running', started=True)
 
@@ -305,22 +647,30 @@ def run_import_job(job_id, folder_plans, target_dir):
             for future in futures:
                 future.result()
 
+        if target_dir.exists():
+            raise FileExistsError(f'Dataset "{target_dir.name}" was created while import was running')
+        os.replace(staging_dir, target_dir)
+
         update_import_job(
             job_id,
             status='completed',
             currentFolder=None,
             progressPercent=100.0,
-            finished=True
+            finished=True,
+            finishedAt=utc_now_iso()
         )
     except Exception as e:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
         update_import_job(
             job_id,
             status='error',
             currentFolder=None,
             error=str(e),
-            finished=True
+            finished=True,
+            finishedAt=utc_now_iso()
         )
+    finally:
+        release_datasets(job_id)
 
 
 def update_tool_job(job_id, **changes):
@@ -391,9 +741,7 @@ def _collect_dataset_file_structure(dataset_dir):
 
 
 def process_reshuffle_job(job_id, folder_path):
-    dataset_dir = DATASETS_DIR / folder_path
-    if not dataset_dir.exists():
-        raise FileNotFoundError('Dataset not found')
+    dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
 
     file_structure = _collect_dataset_file_structure(dataset_dir)
     basenames_list = list(file_structure.keys())
@@ -402,8 +750,7 @@ def process_reshuffle_job(job_id, folder_path):
 
     set_tool_job_total(job_id, len(basenames_list))
     random.shuffle(basenames_list)
-    used_names = set()
-    rename_count = 0
+    used_names = set(file_structure)
 
     def generate_unique_name():
         while True:
@@ -412,18 +759,43 @@ def process_reshuffle_job(job_id, folder_path):
                 used_names.add(name)
                 return name
 
-    for basename in basenames_list:
-        new_basename = generate_unique_name()
+    basename_mapping = {basename: generate_unique_name() for basename in basenames_list}
+    operations = []
+    for basename, new_basename in basename_mapping.items():
         for folder_name, extensions in file_structure[basename].items():
             folder = dataset_dir / folder_name
             for ext in extensions:
                 old_path = folder / f"{basename}{ext}"
                 new_path = folder / f"{new_basename}{ext}"
                 if old_path.exists():
-                    old_path.rename(new_path)
-                    rename_count += 1
+                    temp_path = folder / f'.qdm-rename-{uuid.uuid4().hex}{ext}'
+                    operations.append((basename, old_path, temp_path, new_path))
 
-        increment_tool_job_progress(job_id, current_item=basename, metrics={'filesRenamed': rename_count})
+    try:
+        for _, old_path, temp_path, _ in operations:
+            os.replace(old_path, temp_path)
+
+        rename_count = 0
+        for basename in basenames_list:
+            for operation_basename, _, temp_path, new_path in operations:
+                if operation_basename == basename:
+                    os.replace(temp_path, new_path)
+                    rename_count += 1
+            increment_tool_job_progress(
+                job_id,
+                current_item=basename,
+                metrics={'filesRenamed': rename_count}
+            )
+    except Exception:
+        for _, old_path, temp_path, new_path in reversed(operations):
+            try:
+                if new_path.exists():
+                    os.replace(new_path, old_path)
+                elif temp_path.exists():
+                    os.replace(temp_path, old_path)
+            except OSError:
+                pass
+        raise
 
     return {
         'count': len(basenames_list),
@@ -435,7 +807,7 @@ def process_reshuffle_job(job_id, folder_path):
 def process_compress_job(job_id, folder_path):
     from PIL import Image
 
-    dataset_dir = DATASETS_DIR / folder_path
+    dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
     folders_to_process = list(DATASET_IMAGE_FOLDERS)
     files_to_compress = []
     for folder_name in folders_to_process:
@@ -459,7 +831,7 @@ def process_compress_job(job_id, folder_path):
     def compress_single_image(file_path):
         orig_size = file_path.stat().st_size
         with Image.open(file_path) as img:
-            img.save(file_path, 'PNG', optimize=True, compress_level=9)
+            save_pillow_image_atomic(img, file_path, 'PNG', optimize=True, compress_level=9)
         new_size = file_path.stat().st_size
         return file_path.name, orig_size, new_size
 
@@ -495,9 +867,7 @@ def process_compress_job(job_id, folder_path):
 def process_blur_job(job_id, folder_path, strength):
     from PIL import Image
 
-    source_dir = DATASETS_DIR / folder_path
-    if not source_dir.exists():
-        raise FileNotFoundError('Dataset not found')
+    source_dir = resolve_dataset_dir(folder_path, must_exist=True)
 
     source_images = list(iter_dataset_images(source_dir))
     if not source_images:
@@ -506,10 +876,11 @@ def process_blur_job(job_id, folder_path, strength):
     target_dir = source_dir.parent / f"{source_dir.name}-blured"
     if target_dir.exists():
         raise FileExistsError(f'Dataset "{target_dir.name}" already exists')
+    staging_dir = source_dir.parent / f'.qdm-blur-{uuid.uuid4().hex}'
 
     try:
-        shutil.copytree(source_dir, target_dir)
-        target_images = list(iter_dataset_images(target_dir))
+        shutil.copytree(source_dir, staging_dir)
+        target_images = list(iter_dataset_images(staging_dir))
         set_tool_job_total(job_id, len(target_images))
 
         processed_count = 0
@@ -521,9 +892,13 @@ def process_blur_job(job_id, folder_path, strength):
             if image_format == 'PNG':
                 save_kwargs['optimize'] = True
 
-            output.save(file_path, image_format, **save_kwargs)
+            save_pillow_image_atomic(output, file_path, image_format, **save_kwargs)
             processed_count += 1
             increment_tool_job_progress(job_id, current_item=file_path.name)
+
+        if target_dir.exists():
+            raise FileExistsError(f'Dataset "{target_dir.name}" was created while blur was running')
+        os.replace(staging_dir, target_dir)
 
         return {
             'processed': processed_count,
@@ -532,17 +907,15 @@ def process_blur_job(job_id, folder_path, strength):
             'targetName': target_dir.name
         }
     except Exception:
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
 
 def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_controls):
     from PIL import Image
 
-    source_dir = DATASETS_DIR / folder_path
-    if not source_dir.exists():
-        raise FileNotFoundError('Dataset not found')
+    source_dir = resolve_dataset_dir(folder_path, must_exist=True)
 
     source_images = list(iter_dataset_images(source_dir))
     if not source_images:
@@ -551,11 +924,12 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
     target_dir = source_dir.parent / f"{source_dir.name}-mirror"
     if target_dir.exists():
         raise FileExistsError(f'Dataset "{target_dir.name}" already exists')
+    staging_dir = source_dir.parent / f'.qdm-mirror-{uuid.uuid4().hex}'
 
     try:
-        shutil.copytree(source_dir, target_dir)
+        shutil.copytree(source_dir, staging_dir)
         target_images = [
-            file_path for file_path in iter_dataset_images(target_dir)
+            file_path for file_path in iter_dataset_images(staging_dir)
             if file_path.parent.name not in excluded_controls
         ]
         set_tool_job_total(job_id, len(target_images))
@@ -573,7 +947,7 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
             if image_format == 'PNG':
                 save_kwargs['optimize'] = True
 
-            output.save(file_path, image_format, **save_kwargs)
+            save_pillow_image_atomic(output, file_path, image_format, **save_kwargs)
             return file_path.name
 
         processed_count = 0
@@ -586,6 +960,10 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
                     processed_count += 1
                     increment_tool_job_progress(job_id, current_item=file_name)
 
+        if target_dir.exists():
+            raise FileExistsError(f'Dataset "{target_dir.name}" was created while mirror was running')
+        os.replace(staging_dir, target_dir)
+
         return {
             'processed': processed_count,
             'horizontal': horizontal,
@@ -595,15 +973,15 @@ def process_mirror_job(job_id, folder_path, horizontal, vertical, excluded_contr
             'targetName': target_dir.name
         }
     except Exception:
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
 
 def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
-    primary_dir = DATASETS_DIR / primary_folder
-    secondary_dir = DATASETS_DIR / secondary_folder
-    target_dir = DATASETS_DIR / target_name
+    primary_dir = resolve_dataset_dir(primary_folder, must_exist=True)
+    secondary_dir = resolve_dataset_dir(secondary_folder, must_exist=True)
+    target_dir = resolve_dataset_dir(target_name)
 
     for source_dir, label in ((primary_dir, 'Primary'), (secondary_dir, 'Secondary')):
         if not source_dir.exists() or not source_dir.is_dir():
@@ -613,6 +991,7 @@ def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
 
     if target_dir.exists():
         raise FileExistsError(f'Dataset "{target_name}" already exists')
+    staging_dir = _resolved_datasets_root() / f'.qdm-merge-{uuid.uuid4().hex}'
 
     primary_images = [file_path for file_path in sorted((primary_dir / 'img').iterdir()) if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS]
     secondary_images = [file_path for file_path in sorted((secondary_dir / 'img').iterdir()) if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS]
@@ -622,7 +1001,7 @@ def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
 
     try:
         for folder_name in DATASET_IMAGE_FOLDERS:
-            (target_dir / folder_name).mkdir(parents=True, exist_ok=True)
+            (staging_dir / folder_name).mkdir(parents=True, exist_ok=True)
 
         set_tool_job_total(job_id, total_sets)
         counts = {'primary': 0, 'secondary': 0}
@@ -631,11 +1010,11 @@ def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
             copied_sets = 0
             for image_path in image_paths:
                 source_basename = image_path.stem
-                target_basename = generate_unique_dataset_basename(target_dir)
+                target_basename = generate_unique_dataset_basename(staging_dir)
 
                 for folder_name in DATASET_IMAGE_FOLDERS:
                     source_folder = source_dir / folder_name
-                    target_folder = target_dir / folder_name
+                    target_folder = staging_dir / folder_name
 
                     if folder_name == 'img':
                         for ext in ['.png', '.jpg', '.jpeg', '.webp']:
@@ -667,6 +1046,10 @@ def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
         primary_count = copy_dataset_sets(primary_dir, 'primary', primary_images)
         secondary_count = copy_dataset_sets(secondary_dir, 'secondary', secondary_images)
 
+        if target_dir.exists():
+            raise FileExistsError(f'Dataset "{target_name}" was created while merge was running')
+        os.replace(staging_dir, target_dir)
+
         return {
             'primaryFolder': primary_folder,
             'secondaryFolder': secondary_folder,
@@ -677,17 +1060,15 @@ def process_merge_job(job_id, primary_folder, secondary_folder, target_name):
             'totalCount': total_sets
         }
     except Exception:
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
 
 def process_fit_job(job_id, folder_path):
     from PIL import Image, ImageOps
 
-    dataset_dir = DATASETS_DIR / folder_path
-    if not dataset_dir.exists():
-        raise FileNotFoundError('Dataset not found')
+    dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
 
     img_dir = dataset_dir / 'img'
     control_folders = ['Control1', 'Control2', 'Control3']
@@ -730,7 +1111,7 @@ def process_fit_job(job_id, folder_path):
                     continue
 
                 new_img = ImageOps.pad(c_img, target_size, color=(0, 0, 0), centering=(0.5, 0.5))
-                new_img.save(ctrl_path)
+                save_pillow_image_atomic(new_img, ctrl_path, c_img.format or ctrl_path.suffix.lstrip('.'))
                 updated_count += 1
 
         increment_tool_job_progress(job_id, current_item=primary_path.name, metrics={'updated': updated_count})
@@ -763,6 +1144,12 @@ def run_tool_job(job_id, tool_name, payload):
             result = process_merge_job(job_id, payload['primaryFolder'], payload['secondaryFolder'], payload['targetName'])
         elif tool_name == 'fit':
             result = process_fit_job(job_id, payload['folderPath'])
+        elif tool_name == 'duplicates':
+            result = process_duplicate_scan_job(
+                job_id,
+                payload['folderPath'],
+                int(payload['threshold'])
+            )
         else:
             raise ValueError('Unsupported tool job')
 
@@ -772,6 +1159,7 @@ def run_tool_job(job_id, tool_name, payload):
             currentItem=None,
             progressPercent=100.0,
             finished=True,
+            finishedAt=utc_now_iso(),
             result=result
         )
     except Exception as e:
@@ -780,8 +1168,11 @@ def run_tool_job(job_id, tool_name, payload):
             status='error',
             currentItem=None,
             error=str(e),
-            finished=True
+            finished=True,
+            finishedAt=utc_now_iso()
         )
+    finally:
+        release_datasets(job_id)
 
 @app.route('/')
 def index():
@@ -804,17 +1195,26 @@ def save_image(filename):
         if file.filename == '':
             return jsonify({'error': 'No selected file'}), 400
             
-        # Construct path
-        # We save to the specified subfolder (default 'img')
-        save_path = DATASETS_DIR / folder / subfolder / filename
-        
-        if not save_path.parent.exists():
+        dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+        save_path = resolve_dataset_file(dataset_dir, subfolder, filename)
+
+        if not save_path.parent.is_dir():
             return jsonify({'error': 'Dataset folder not found'}), 404
-            
-        file.save(save_path)
-        
+
+        temp_path = save_path.with_name(f'.{save_path.name}.{uuid.uuid4().hex}.upload')
+        try:
+            file.save(temp_path)
+            verify_uploaded_image(temp_path, save_path.suffix)
+            os.replace(temp_path, save_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
         return jsonify({'success': True})
-        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
+    except (InvalidPathError, ValueError) as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -824,7 +1224,7 @@ def get_folders():
     try:
         folders = []
         for item in DATASETS_DIR.iterdir():
-            if item.is_dir() and not item.name.startswith('.'):
+            if item.is_dir() and not item.is_symlink() and not item.name.startswith('.'):
                 # Check if it has img, Control1, Control2 subdirectories
                 img_dir = item / 'img'
                 control1_dir = item / 'Control1'
@@ -858,16 +1258,21 @@ def create_dataset():
         if not re.match(r'^[a-zA-Z0-9_-]+$', name):
             return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
         
-        dataset_dir = DATASETS_DIR / name
+        dataset_dir = resolve_dataset_dir(name)
         
         if dataset_dir.exists():
             return jsonify({'error': f'Dataset "{name}" already exists'}), 400
         
-        # Create dataset folder and subfolders
-        (dataset_dir / 'img').mkdir(parents=True, exist_ok=True)
-        (dataset_dir / 'Control1').mkdir(parents=True, exist_ok=True)
-        (dataset_dir / 'Control2').mkdir(parents=True, exist_ok=True)
-        (dataset_dir / 'Control3').mkdir(parents=True, exist_ok=True)
+        staging_dir = _resolved_datasets_root() / f'.qdm-create-{uuid.uuid4().hex}'
+        try:
+            for folder_name in DATASET_IMAGE_FOLDERS:
+                (staging_dir / folder_name).mkdir(parents=True, exist_ok=True)
+            if dataset_dir.exists():
+                return jsonify({'error': f'Dataset "{name}" already exists'}), 409
+            os.replace(staging_dir, dataset_dir)
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
         
         return jsonify({
             'success': True,
@@ -896,8 +1301,8 @@ def rename_dataset():
         if not re.match(r'^[a-zA-Z0-9_-]+$', new_name):
             return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
 
-        source_dir = DATASETS_DIR / old_name
-        target_dir = DATASETS_DIR / new_name
+        source_dir = resolve_dataset_dir(old_name, must_exist=True)
+        target_dir = resolve_dataset_dir(new_name)
 
         if not source_dir.exists() or not source_dir.is_dir():
             return jsonify({'error': 'Dataset not found'}), 404
@@ -930,8 +1335,8 @@ def compare_datasets():
         if not primary_folder or not linked_folder:
             return jsonify({'error': 'Primary and linked folders are required'}), 400
         
-        primary_dir = DATASETS_DIR / primary_folder / 'img'
-        linked_dir = DATASETS_DIR / linked_folder / 'img'
+        primary_dir = resolve_dataset_dir(primary_folder, must_exist=True) / 'img'
+        linked_dir = resolve_dataset_dir(linked_folder, must_exist=True) / 'img'
         
         if not primary_dir.exists():
             return jsonify({'error': 'Primary dataset not found'}), 404
@@ -976,7 +1381,9 @@ def get_images():
     folder_path = request.args.get('folder', '')
     
     try:
-        dataset_dir = DATASETS_DIR / folder_path
+        return jsonify({'success': True, **process_reshuffle_job(None, folder_path)})
+
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         img_dir = dataset_dir / 'img'
         
         if not img_dir.exists():
@@ -997,19 +1404,18 @@ def get_image(image_type, filename):
     folder_path = request.args.get('folder', '')
     
     try:
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         
         # Validate image_type
         if image_type not in ['img', 'Control1', 'Control2', 'Control3']:
             return jsonify({'error': 'Invalid image type'}), 400
         
-        image_dir = dataset_dir / image_type
-        image_path = image_dir / filename
+        image_path = resolve_dataset_file(dataset_dir, image_type, filename)
         
         if not image_path.exists():
             return jsonify({'error': 'Image not found'}), 404
         
-        return send_file(image_path)
+        return send_file(image_path, conditional=True)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1018,8 +1424,8 @@ def get_caption(filename):
     """Get caption text for an image"""
     folder_path = request.args.get('folder', '')
     try:
-        dataset_dir = DATASETS_DIR / folder_path
-        basename = os.path.splitext(filename)[0]
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
+        basename = Path(validate_image_filename(filename)).stem
         txt_path = dataset_dir / 'img' / f"{basename}.txt"
         
         if not txt_path.exists():
@@ -1039,16 +1445,16 @@ def save_caption(filename):
     try:
         data = request.get_json() or {}
         caption = data.get('caption', '')
+        if not isinstance(caption, str) or len(caption.encode('utf-8')) > 1024 * 1024:
+            return jsonify({'error': 'Caption must be text no larger than 1 MB'}), 400
         
-        dataset_dir = DATASETS_DIR / folder_path
-        basename = os.path.splitext(filename)[0]
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
+        basename = Path(validate_image_filename(filename)).stem
         txt_path = dataset_dir / 'img' / f"{basename}.txt"
-        
-        # Ensure img directory exists
-        (dataset_dir / 'img').mkdir(parents=True, exist_ok=True)
-        
-        with open(txt_path, 'w', encoding='utf-8') as f:
-            f.write(caption)
+
+        if not (dataset_dir / 'img').is_dir():
+            return jsonify({'error': 'Image directory not found'}), 404
+        atomic_write_text(txt_path, caption)
             
         return jsonify({'success': True})
     except Exception as e:
@@ -1061,14 +1467,70 @@ def delete_image(filename):
     linked_folder = request.args.get('linkedFolder', '')
     
     try:
+        basename = Path(validate_image_filename(filename)).stem
+        batch_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+        dataset_specs = [(folder_path, '')]
+        if linked_folder:
+            dataset_specs.append((linked_folder, f"[linked:{linked_folder}] "))
+
+        move_plan = []
+        for dataset_name, prefix in dataset_specs:
+            dataset_dir = resolve_dataset_dir(dataset_name, must_exist=True)
+            trash_root = dataset_dir / '.trash' / batch_id
+            for folder_name in DATASET_IMAGE_FOLDERS:
+                folder = dataset_dir / folder_name
+                if not folder.is_dir():
+                    continue
+                for extension in ('.png', '.jpg', '.jpeg', '.webp'):
+                    source_path = folder / f'{basename}{extension}'
+                    if source_path.is_file():
+                        move_plan.append((
+                            source_path,
+                            trash_root / folder_name / source_path.name,
+                            f'{prefix}{folder_name}/{source_path.name}'
+                        ))
+                if folder_name == 'img':
+                    caption_path = folder / f'{basename}.txt'
+                    if caption_path.is_file():
+                        move_plan.append((
+                            caption_path,
+                            trash_root / folder_name / caption_path.name,
+                            f'{prefix}{folder_name}/{caption_path.name}'
+                        ))
+
+        if not move_plan:
+            return jsonify({'success': False, 'error': 'No files found to delete'}), 404
+
+        completed = []
+        try:
+            for source_path, trash_path, display_path in move_plan:
+                trash_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source_path, trash_path)
+                completed.append((source_path, trash_path, display_path))
+        except Exception:
+            for source_path, trash_path, _ in reversed(completed):
+                try:
+                    os.replace(trash_path, source_path)
+                except OSError:
+                    pass
+            raise
+
+        return jsonify({
+            'success': True,
+            'deleted': [display_path for _, _, display_path in completed],
+            'errors': None,
+            'recoverable': True,
+            'trashBatch': batch_id
+        })
+
         deleted_files = []
         errors = []
         
         # Helper function to delete from a single dataset
         def delete_from_dataset(dataset_path, prefix=''):
-            dataset_dir = DATASETS_DIR / dataset_path
+            dataset_dir = resolve_dataset_dir(dataset_path, must_exist=True)
             folders_to_check = ['img', 'Control1', 'Control2', 'Control3']
-            basename = os.path.splitext(filename)[0]
+            basename = Path(validate_image_filename(filename)).stem
             txt_filename = f"{basename}.txt"
             
             # Delete txt file from img folder
@@ -1083,7 +1545,7 @@ def delete_image(filename):
             # Delete image files
             for folder_name in folders_to_check:
                 folder = dataset_dir / folder_name
-                file_path = folder / filename
+                file_path = resolve_dataset_file(dataset_dir, folder_name, filename)
                 
                 if file_path.exists():
                     try:
@@ -1130,7 +1592,7 @@ def transfer_image(filename):
         return jsonify({'error': 'Source and target folders must be different'}), 400
     
     try:
-        target_dir = DATASETS_DIR / target_folder
+        target_dir = resolve_dataset_dir(target_folder, must_exist=True)
         
         # Verify target exists
         if not target_dir.exists():
@@ -1139,8 +1601,79 @@ def transfer_image(filename):
             return jsonify({'error': 'Target is not a valid dataset (no img folder)'}), 400
         
         # Get basename without extension
-        basename = os.path.splitext(filename)[0]
-        original_ext = os.path.splitext(filename)[1]
+        basename = Path(validate_image_filename(filename)).stem
+        original_ext = Path(filename).suffix
+
+        source_specs = [(source_folder, 'primary')]
+        if linked_folder:
+            source_specs.append((linked_folder, 'linked'))
+
+        reserved_names = set()
+        plans = []
+        result_names = {}
+        for source_name, label in source_specs:
+            source_dir = resolve_dataset_dir(source_name, must_exist=True)
+            while True:
+                new_basename = generate_unique_dataset_basename(target_dir)
+                if new_basename not in reserved_names:
+                    reserved_names.add(new_basename)
+                    break
+            result_names[label] = new_basename
+
+            source_moves = []
+            for folder_name in DATASET_IMAGE_FOLDERS:
+                source_subfolder = source_dir / folder_name
+                target_subfolder = target_dir / folder_name
+                if not source_subfolder.is_dir():
+                    continue
+                for extension in ('.png', '.jpg', '.jpeg', '.webp'):
+                    source_file = source_subfolder / f'{basename}{extension}'
+                    if source_file.is_file():
+                        source_moves.append((source_file, target_subfolder / f'{new_basename}{extension}'))
+                if folder_name == 'img':
+                    caption_source = source_subfolder / f'{basename}.txt'
+                    if caption_source.is_file():
+                        source_moves.append((caption_source, target_subfolder / f'{new_basename}.txt'))
+            plans.append((label, source_moves))
+
+        if not plans[0][1]:
+            return jsonify({'error': 'No files found to transfer'}), 404
+        if any(destination.exists() for _, moves in plans for _, destination in moves):
+            return jsonify({'error': 'A generated target filename already exists; retry the transfer'}), 409
+
+        completed_moves = []
+        try:
+            for _, moves in plans:
+                for source_file, target_file in moves:
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source_file, target_file)
+                    completed_moves.append((source_file, target_file))
+        except Exception:
+            for source_file, target_file in reversed(completed_moves):
+                try:
+                    os.replace(target_file, source_file)
+                except OSError:
+                    pass
+            raise
+
+        def serialize_moves(moves):
+            return [
+                {
+                    'from': str(source.relative_to(BASE_DIR)),
+                    'to': str(destination.relative_to(BASE_DIR))
+                }
+                for source, destination in moves
+            ]
+
+        response_data = {
+            'success': True,
+            'newFilename': f"{result_names['primary']}{original_ext}",
+            'transferred': serialize_moves(plans[0][1])
+        }
+        if linked_folder:
+            response_data['linkedTransferred'] = serialize_moves(plans[1][1])
+            response_data['linkedNewFilename'] = f"{result_names['linked']}{original_ext}"
+        return jsonify(response_data)
         
         # Generate unique 8-character name for target
         import string
@@ -1166,7 +1699,7 @@ def transfer_image(filename):
         
         def transfer_from_dataset(src_folder, target_dataset_dir, src_basename):
             """Transfer files from source to target with new unique name"""
-            source_dir = DATASETS_DIR / src_folder
+            source_dir = resolve_dataset_dir(src_folder, must_exist=True)
             
             if not source_dir.exists():
                 return [], f"Source directory {src_folder} not found"
@@ -1237,7 +1770,7 @@ def reshuffle_dataset():
     folder_path = request.args.get('folder', '')
     
     try:
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         img_dir = dataset_dir / 'img'
         
         if not img_dir.exists():
@@ -1319,8 +1852,10 @@ def compress_dataset():
     folder_path = request.args.get('folder', '')
     
     try:
+        return jsonify({'success': True, **process_compress_job(None, folder_path)})
+
         from PIL import Image
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
         
         # Collect all files to process
@@ -1409,7 +1944,8 @@ def blur_dataset_preview(filename):
         if not folder_path:
             return jsonify({'error': 'Dataset folder is required'}), 400
 
-        image_path = DATASETS_DIR / folder_path / 'img' / filename
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
+        image_path = resolve_dataset_file(dataset_dir, 'img', filename)
         if not image_path.exists() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
             return jsonify({'error': 'Preview image not found'}), 404
 
@@ -1451,7 +1987,9 @@ def blur_dataset():
         if strength < 0:
             return jsonify({'error': 'Blur strength must be non-negative'}), 400
 
-        source_dir = DATASETS_DIR / folder_path
+        return jsonify({'success': True, **process_blur_job(None, folder_path, strength)})
+
+        source_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not source_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
 
@@ -1524,7 +2062,12 @@ def mirror_dataset():
         if invalid_controls:
             return jsonify({'error': 'Invalid excluded controls specified'}), 400
 
-        source_dir = DATASETS_DIR / folder_path
+        return jsonify({
+            'success': True,
+            **process_mirror_job(None, folder_path, horizontal, vertical, excluded_controls)
+        })
+
+        source_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not source_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
 
@@ -1594,7 +2137,12 @@ def find_duplicate_images():
         threshold = int(data.get('threshold', 8))
         threshold = max(0, min(threshold, 64))
 
-        dataset_dir = DATASETS_DIR / folder_path
+        return jsonify({
+            'success': True,
+            **process_duplicate_scan_job(None, folder_path, threshold)
+        })
+
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         img_dir = dataset_dir / 'img'
         if not dataset_dir.exists() or not img_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
@@ -1680,9 +2228,14 @@ def merge_datasets():
         if not re.match(r'^[a-zA-Z0-9_-]+$', target_name):
             return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
 
-        primary_dir = DATASETS_DIR / primary_folder
-        secondary_dir = DATASETS_DIR / secondary_folder
-        target_dir = DATASETS_DIR / target_name
+        return jsonify({
+            'success': True,
+            **process_merge_job(None, primary_folder, secondary_folder, target_name)
+        })
+
+        primary_dir = resolve_dataset_dir(primary_folder, must_exist=True)
+        secondary_dir = resolve_dataset_dir(secondary_folder, must_exist=True)
+        target_dir = resolve_dataset_dir(target_name)
 
         for source_dir, label in ((primary_dir, 'Primary'), (secondary_dir, 'Secondary')):
             if not source_dir.exists() or not source_dir.is_dir():
@@ -1809,15 +2362,23 @@ def import_external_dataset_start():
         if not dataset:
             return jsonify({'error': 'Dataset group not found in import path'}), 404
 
-        target_dir = DATASETS_DIR / target_name
+        target_dir = resolve_dataset_dir(target_name)
         if target_dir.exists():
             return jsonify({'error': f'Dataset "{target_name}" already exists'}), 400
 
-        folder_plans, total_files = build_import_plan(dataset, target_dir)
+        job_id = uuid.uuid4().hex
+        staging_dir = _resolved_datasets_root() / f'.qdm-import-{job_id}'
+        folder_plans, total_files = build_import_plan(dataset, staging_dir)
         if total_files == 0:
             return jsonify({'error': 'No files found to import'}), 404
 
-        job_id = uuid.uuid4().hex
+        conflicts = claim_datasets([target_name], job_id)
+        if conflicts:
+            return jsonify({
+                'error': 'Target dataset is busy with another operation',
+                'datasets': conflicts
+            }), 409
+
         folder_progress = {
             folder_plan['targetFolder']: {
                 'total': len(folder_plan['files']),
@@ -1827,6 +2388,7 @@ def import_external_dataset_start():
         }
 
         with IMPORT_JOBS_LOCK:
+            prune_finished_jobs(IMPORT_JOBS)
             IMPORT_JOBS[job_id] = {
                 'jobId': job_id,
                 'status': 'queued',
@@ -1839,10 +2401,15 @@ def import_external_dataset_start():
                 'folderProgress': folder_progress,
                 'error': None,
                 'started': False,
-                'finished': False
+                'finished': False,
+                'createdAt': utc_now_iso(),
+                'finishedAt': None
             }
 
-        worker = threading.Thread(target=run_import_job, args=(job_id, folder_plans, target_dir), daemon=True)
+        worker = threading.Thread(
+            target=run_import_job,
+            args=(job_id, folder_plans, staging_dir, target_dir)
+        )
         worker.start()
 
         return jsonify({
@@ -1854,8 +2421,10 @@ def import_external_dataset_start():
             'folderProgress': folder_progress
         })
     except Exception as e:
-        if 'target_dir' in locals() and target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+        if 'job_id' in locals():
+            release_datasets(job_id)
+        if 'staging_dir' in locals() and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -1875,15 +2444,15 @@ def start_tool_job():
     tool_name = (data.get('tool') or '').strip()
     payload = data.get('payload') or {}
 
-    if tool_name not in {'reshuffle', 'compress', 'blur', 'mirror', 'merge', 'fit'}:
+    if tool_name not in {'reshuffle', 'compress', 'blur', 'mirror', 'merge', 'fit', 'duplicates'}:
         return jsonify({'error': 'Unsupported tool job'}), 400
 
     try:
-        if tool_name in {'reshuffle', 'compress', 'blur', 'mirror', 'fit'}:
+        if tool_name in {'reshuffle', 'compress', 'blur', 'mirror', 'fit', 'duplicates'}:
             folder_path = (payload.get('folderPath') or '').strip()
             if not folder_path:
                 return jsonify({'error': 'Dataset folder is required'}), 400
-            if not (DATASETS_DIR / folder_path).exists():
+            if not resolve_dataset_dir(folder_path).is_dir():
                 return jsonify({'error': 'Dataset not found'}), 404
 
         if tool_name == 'blur':
@@ -1903,6 +2472,12 @@ def start_tool_job():
             if invalid_controls:
                 return jsonify({'error': 'Invalid excluded controls specified'}), 400
 
+        if tool_name == 'duplicates':
+            threshold = int(payload.get('threshold', 8))
+            if threshold < 0 or threshold > 64:
+                return jsonify({'error': 'Duplicate threshold must be between 0 and 64'}), 400
+            payload['threshold'] = threshold
+
         if tool_name == 'merge':
             primary_folder = (payload.get('primaryFolder') or '').strip()
             secondary_folder = (payload.get('secondaryFolder') or '').strip()
@@ -1917,8 +2492,25 @@ def start_tool_job():
             if not re.match(r'^[a-zA-Z0-9_-]+$', target_name):
                 return jsonify({'error': 'Name can only contain letters, numbers, underscores and hyphens'}), 400
 
+        if tool_name == 'merge':
+            reservation_names = [primary_folder, secondary_folder, target_name]
+        else:
+            reservation_names = [folder_path]
+            if tool_name == 'blur':
+                reservation_names.append(f'{folder_path}-blured')
+            elif tool_name == 'mirror':
+                reservation_names.append(f'{folder_path}-mirror')
+
         job_id = uuid.uuid4().hex
+        conflicts = claim_datasets(reservation_names, job_id)
+        if conflicts:
+            return jsonify({
+                'error': 'Dataset is busy with another operation',
+                'datasets': conflicts
+            }), 409
+
         with TOOL_JOBS_LOCK:
+            prune_finished_jobs(TOOL_JOBS)
             TOOL_JOBS[job_id] = {
                 'jobId': job_id,
                 'tool': tool_name,
@@ -1931,10 +2523,12 @@ def start_tool_job():
                 'result': None,
                 'error': None,
                 'started': False,
-                'finished': False
+                'finished': False,
+                'createdAt': utc_now_iso(),
+                'finishedAt': None
             }
 
-        worker = threading.Thread(target=run_tool_job, args=(job_id, tool_name, payload), daemon=True)
+        worker = threading.Thread(target=run_tool_job, args=(job_id, tool_name, payload))
         worker.start()
 
         return jsonify({
@@ -1943,8 +2537,12 @@ def start_tool_job():
             'tool': tool_name
         })
     except ValueError as e:
+        if 'job_id' in locals():
+            release_datasets(job_id)
         return jsonify({'error': str(e)}), 400
     except Exception as e:
+        if 'job_id' in locals():
+            release_datasets(job_id)
         return jsonify({'error': str(e)}), 500
 
 
@@ -1971,9 +2569,9 @@ def export_dataset():
         return jsonify({'error': 'Export path is required'}), 400
     
     try:
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         dataset_name = folder_path.replace('/', '_')
-        export_base = Path(export_path)
+        export_base = Path(export_path).expanduser().resolve()
         
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
@@ -1989,40 +2587,66 @@ def export_dataset():
             'Control3': '_ctr3'
         }
         
-        exported = {}
+        export_specs = []
         for src_folder, suffix in folder_mapping.items():
             src_dir = dataset_dir / src_folder
-            
-            if not src_dir.exists():
+            if not src_dir.is_dir():
                 continue
-            
-            # Check if folder has any files
-            files = [f for f in src_dir.iterdir() if f.is_file()]
-            if not files:
-                continue
-            
-            # Create export folder
-            export_folder = export_base / f"{dataset_name}{suffix}"
-            export_folder.mkdir(parents=True, exist_ok=True)
-            
-            # Copy all files
-            copied_count = 0
-            for file_path in files:
-                dest_path = export_folder / file_path.name
-                try:
-                    shutil.copy2(str(file_path), str(dest_path))
-                except OSError:
-                     # Fallback if metadata copy fails (e.g. invalid argument on exFAT)
-                    shutil.copy(str(file_path), str(dest_path))
-                copied_count += 1
-            
-            exported[src_folder] = {
-                'folder': str(export_folder),
-                'files': copied_count
-            }
-        
-        if not exported:
+            files = [
+                file_path for file_path in src_dir.iterdir()
+                if file_path.is_file() and (
+                    file_path.suffix.lower() in IMAGE_EXTENSIONS
+                    or (src_folder == 'img' and file_path.suffix.lower() == '.txt')
+                )
+            ]
+            if files:
+                export_specs.append((src_folder, suffix, files))
+
+        if not export_specs:
             return jsonify({'error': 'No files to export'}), 404
+
+        existing_folders = [
+            str(export_base / f'{dataset_name}{suffix}')
+            for _, suffix, _ in export_specs
+            if (export_base / f'{dataset_name}{suffix}').exists()
+        ]
+        if existing_folders:
+            return jsonify({
+                'error': 'Export destination already contains dataset folders',
+                'folders': existing_folders
+            }), 409
+
+        staging_dir = export_base / f'.qdm-export-{uuid.uuid4().hex}'
+        staging_dir.mkdir()
+        exported = {}
+        completed_folders = []
+        try:
+            for src_folder, suffix, files in export_specs:
+                folder_name = f'{dataset_name}{suffix}'
+                staged_folder = staging_dir / folder_name
+                staged_folder.mkdir()
+                for file_path in files:
+                    try:
+                        shutil.copy2(file_path, staged_folder / file_path.name)
+                    except OSError:
+                        shutil.copy(file_path, staged_folder / file_path.name)
+                export_folder = export_base / folder_name
+                os.replace(staged_folder, export_folder)
+                completed_folders.append(export_folder)
+                exported[src_folder] = {
+                    'folder': str(export_folder),
+                    'files': len(files)
+                }
+        except Exception:
+            for export_folder in reversed(completed_folders):
+                try:
+                    os.replace(export_folder, staging_dir / export_folder.name)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
         
         return jsonify({
             'success': True,
@@ -2049,7 +2673,7 @@ def augment_crop():
         if not crop_data or 'x' not in crop_data or 'w' not in crop_data:
             return jsonify({'error': 'Invalid crop data'}), 400
             
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
             
@@ -2063,6 +2687,10 @@ def augment_crop():
             return jsonify({'error': 'Invalid crop dimensions'}), 400
             
         crop_mode = data.get('mode', 'keep')
+        if crop_mode not in {'keep', '1:1'}:
+            return jsonify({'error': 'Invalid crop mode'}), 400
+        if source_exception not in {'', 'Control1', 'Control2', 'Control3'}:
+            return jsonify({'error': 'Invalid source exception'}), 400
         
         # Generate new unique basename
         import string
@@ -2081,14 +2709,15 @@ def augment_crop():
                     return name
                     
         new_basename = generate_unique_name()
-        
+
         # Process each folder
         from PIL import Image
         
         folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
         processed_files = []
+        created_paths = []
         
-        basename = os.path.splitext(filename)[0]
+        basename = Path(validate_image_filename(filename)).stem
         original_ext = os.path.splitext(filename)[1]
         
         # We need the reference size from 'img' to know how to scale x, y, w, h
@@ -2100,12 +2729,13 @@ def augment_crop():
                 ref_img_path = temp_path
                 break
                 
-        if ref_img_path:
-            try:
-                with Image.open(ref_img_path) as ref_img:
-                    ref_w, ref_h = ref_img.size
-            except Exception:
-                pass
+        if not ref_img_path:
+            return jsonify({'error': 'Primary image not found'}), 404
+        try:
+            with Image.open(ref_img_path) as ref_img:
+                ref_w, ref_h = ref_img.size
+        except (OSError, ValueError) as exc:
+            return jsonify({'error': f'Primary image cannot be read: {exc}'}), 400
         
         for folder_name in folders_to_process:
             src_folder = dataset_dir / folder_name
@@ -2129,9 +2759,9 @@ def augment_crop():
             else:
                 # Normal case: Crop and Resize
                 try:
-                    img = Image.open(src_file)
-                    original_size = img.size # (width, height)
-                    cw, ch = original_size
+                    with Image.open(src_file) as img:
+                        original_size = img.size # (width, height)
+                        cw, ch = original_size
                     
                     # Scale coordinates if this image has a different resolution from ref_img
                     scale_x = cw / ref_w if ref_w > 0 else 1.0
@@ -2153,22 +2783,28 @@ def augment_crop():
                          shutil.copy2(src_file, dest_file)
                     else:
                         # Crop
-                        cropped_img = img.crop((cx, cy, cx + cw_crop, cy + ch_crop))
-                        
-                        if crop_mode == '1:1':
-                            target_dim = max(cw_crop, ch_crop)
-                            final_img = cropped_img.resize((target_dim, target_dim), Image.Resampling.LANCZOS)
-                        else:
-                            # Keep Proportion mode: resize back to original_size (which perfectly preserves aspect ratio)
-                            final_img = cropped_img.resize(original_size, Image.Resampling.LANCZOS)
-                        
-                        final_img.save(dest_file)
+                        with Image.open(src_file) as img:
+                            cropped_img = img.crop((cx, cy, cx + cw_crop, cy + ch_crop))
+
+                            if crop_mode == '1:1':
+                                target_dim = max(cw_crop, ch_crop)
+                                final_img = cropped_img.resize((target_dim, target_dim), Image.Resampling.LANCZOS)
+                            else:
+                                # Keep Proportion mode: resize back to original_size
+                                final_img = cropped_img.resize(original_size, Image.Resampling.LANCZOS)
+
+                            save_pillow_image_atomic(
+                                final_img,
+                                dest_file,
+                                img.format or dest_file.suffix.lstrip('.')
+                            )
                 except Exception as e:
                     print(f"Error processing {src_file}: {e}")
                     # Fallback copy on error?
                     shutil.copy2(src_file, dest_file)
             
             processed_files.append(str(dest_file.relative_to(BASE_DIR)))
+            created_paths.append(dest_file)
             
             # Handle Caption (only for img folder)
             if folder_name == 'img':
@@ -2176,6 +2812,7 @@ def augment_crop():
                 if txt_src.exists():
                     txt_dest = src_folder / f"{new_basename}.txt"
                     shutil.copy2(txt_src, txt_dest)
+                    created_paths.append(txt_dest)
 
         return jsonify({
             'success': True,
@@ -2184,6 +2821,11 @@ def augment_crop():
         })
 
     except Exception as e:
+        for path in locals().get('created_paths', []):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -2199,7 +2841,7 @@ def augment_duplicate():
         if not folder_path or not filename:
              return jsonify({'error': 'Folder and filename are required'}), 400
              
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
             
@@ -2220,6 +2862,59 @@ def augment_duplicate():
                     return name
                     
         new_basename = generate_unique_name()
+
+        basename = Path(validate_image_filename(filename)).stem
+        original_ext = Path(filename).suffix
+        copy_plan = []
+        for folder_name in DATASET_IMAGE_FOLDERS:
+            source_folder = dataset_dir / folder_name
+            for extension in ('.png', '.jpg', '.jpeg', '.webp'):
+                source_path = source_folder / f'{basename}{extension}'
+                if source_path.is_file():
+                    copy_plan.append((source_path, source_folder / f'{new_basename}{extension}'))
+                    break
+            if folder_name == 'img':
+                caption_source = source_folder / f'{basename}.txt'
+                if caption_source.is_file():
+                    copy_plan.append((caption_source, source_folder / f'{new_basename}.txt'))
+
+        if not any(
+            source.parent.name == 'img' and source.suffix.lower() in IMAGE_EXTENSIONS
+            for source, _ in copy_plan
+        ):
+            return jsonify({'error': 'Primary image not found'}), 404
+
+        staged = []
+        completed = []
+        try:
+            for source_path, destination_path in copy_plan:
+                temp_path = destination_path.with_name(
+                    f'.{destination_path.name}.{uuid.uuid4().hex}.copy'
+                )
+                shutil.copy2(source_path, temp_path)
+                staged.append((temp_path, destination_path))
+            for temp_path, destination_path in staged:
+                os.replace(temp_path, destination_path)
+                completed.append(destination_path)
+        except Exception:
+            for temp_path, _ in staged:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+            for destination_path in completed:
+                try:
+                    destination_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+        return jsonify({
+            'success': True,
+            'newBasename': new_basename,
+            'newFilename': f'{new_basename}{original_ext}',
+            'processed': [str(path.relative_to(BASE_DIR)) for path in completed]
+        })
         
         # Process each folder
         folders_to_process = ['img', 'Control1', 'Control2', 'Control3']
@@ -2271,9 +2966,11 @@ def fit_dataset():
     folder_path = request.args.get('folder', '')
     
     try:
+        return jsonify({'success': True, **process_fit_job(None, folder_path)})
+
         from PIL import Image, ImageOps
         
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
             
@@ -2359,7 +3056,7 @@ def open_in_pixelmator():
         if not folder_path or not filename:
              return jsonify({'error': 'Folder and filename are required'}), 400
              
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
             
@@ -2385,15 +3082,13 @@ def open_in_pixelmator():
         # We want 'img' to be the first one to open (sets canvas size)
         # But we also want 'img' to be on top at the end.
         
-        paths_string = '", "'.join(image_paths)
-        
         # AppleScript to open images as layers
         # 1. Open first image (img) to create document and set canvas size
         # 2. Add remaining images as image layers (scale Control1 if needed)
         # 3. Move 'img' to front and 'Control1' to second position
-        applescript = f'''
-        set imgPaths to {{"{paths_string}"}}
-        set imgAliases to {{}}
+        applescript = '''
+        on run imgPaths
+        set imgAliases to {}
         repeat with p in imgPaths
             set end of imgAliases to (POSIX file p) as alias
         end repeat
@@ -2408,12 +3103,12 @@ def open_in_pixelmator():
             repeat with i from 2 to (count of imgAliases)
                 set nextAlias to item i of imgAliases
                 tell doc
-                    set newLayer to make new image layer with properties {{file:nextAlias}}
+                    set newLayer to make new image layer with properties {file:nextAlias}
                     -- If this is Control1 (index 2 in imgPaths), scale it to doc size
                     if i is 2 then
                         set width of newLayer to docWidth
                         set height of newLayer to docHeight
-                        set position of newLayer to {{0, 0}}
+                        set position of newLayer to {0, 0}
                     end if
                 end tell
             end repeat
@@ -2428,17 +3123,20 @@ def open_in_pixelmator():
                 end if
             end tell
         end tell
+        end run
         '''
         
         import subprocess
-        process = subprocess.Popen(['osascript', '-e', applescript], 
-                                   stdout=subprocess.PIPE, 
-                                   stderr=subprocess.PIPE, 
-                                   text=True)
-        stdout, stderr = process.communicate()
+        process = subprocess.run(
+            ['osascript', '-e', applescript, *image_paths],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False
+        )
         
         if process.returncode != 0:
-            return jsonify({'error': f'AppleScript failed: {stderr}'}), 500
+            return jsonify({'error': f'AppleScript failed: {process.stderr.strip()}'}), 500
             
         return jsonify({'success': True})
         
@@ -2636,21 +3334,71 @@ DEFAULT_PROCESS_CONFIG = {
 }
 
 
+def validate_process_config(config):
+    if not isinstance(config, dict):
+        raise ValueError('Process config must be an object')
+
+    drops = config.get('drops', [])
+    slots = config.get('slots', [])
+    template = config.get('template', '{remainder}')
+    if not isinstance(drops, list) or len(drops) > 100:
+        raise ValueError('drops must be a list with at most 100 patterns')
+    if not isinstance(slots, list) or len(slots) > 50:
+        raise ValueError('slots must be a list with at most 50 entries')
+    if not isinstance(template, str) or len(template) > 10000:
+        raise ValueError('template must be a string of at most 10000 characters')
+
+    def validate_pattern(pattern):
+        if not isinstance(pattern, str) or len(pattern) > 512:
+            raise ValueError('Regex patterns must be strings of at most 512 characters')
+        if re.search(r'\([^)]*[+*][^)]*\)\s*(?:[+*]|\{\d)', pattern):
+            raise ValueError('Nested regex quantifiers are not allowed')
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f'Invalid regex pattern: {exc}') from exc
+        return pattern
+
+    normalized_drops = [validate_pattern(pattern) for pattern in drops]
+    normalized_slots = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            raise ValueError('Each slot must be an object')
+        name = slot.get('name', '').strip() if isinstance(slot.get('name', ''), str) else ''
+        pattern = slot.get('pattern', '')
+        transform = slot.get('transform', '')
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', name):
+            raise ValueError('Slot names must be identifiers up to 64 characters')
+        if not isinstance(transform, str) or len(transform) > 512:
+            raise ValueError('Slot transforms must be strings of at most 512 characters')
+        normalized_slots.append({
+            'name': name,
+            'pattern': validate_pattern(pattern),
+            'transform': transform
+        })
+
+    return {'drops': normalized_drops, 'slots': normalized_slots, 'template': template}
+
+
 @app.route('/api/process-text/config', methods=['GET', 'POST'])
 def process_text_config():
     folder = request.args.get('folder', '')
     if not folder:
         return jsonify({'error': 'folder required'}), 400
 
-    config_path = DATASETS_DIR / folder / '.process_config.json'
+    dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+    config_path = dataset_dir / '.process_config.json'
 
     if request.method == 'GET':
         if config_path.exists():
             return jsonify(json.loads(config_path.read_text(encoding='utf-8')))
         return jsonify(DEFAULT_PROCESS_CONFIG)
 
-    data = request.get_json() or {}
-    config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    try:
+        data = validate_process_config(request.get_json() or {})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    atomic_write_text(config_path, json.dumps(data, ensure_ascii=False, indent=2))
     return jsonify({'success': True})
 
 
@@ -2659,12 +3407,16 @@ def process_text_preview():
     data = request.get_json() or {}
     folder = data.get('folder', '')
     config = data.get('config', {})
-    count = int(data.get('count', 5))
+    try:
+        count = max(1, min(50, int(data.get('count', 5))))
+        config = validate_process_config(config)
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
 
     if not folder:
         return jsonify({'error': 'folder required'}), 400
 
-    img_dir = DATASETS_DIR / folder / 'img'
+    img_dir = resolve_dataset_dir(folder, must_exist=True) / 'img'
     if not img_dir.exists():
         return jsonify({'error': 'Dataset not found'}), 404
 
@@ -2691,24 +3443,41 @@ def process_text_apply():
     if not folder:
         return jsonify({'error': 'folder required'}), 400
 
-    img_dir = DATASETS_DIR / folder / 'img'
+    try:
+        config = validate_process_config(config)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+    img_dir = dataset_dir / 'img'
     if not img_dir.exists():
         return jsonify({'error': 'Dataset not found'}), 404
 
     txt_files = [f for f in img_dir.iterdir() if f.suffix == '.txt']
     processed_count = 0
     errors = []
+    backup_dir = dataset_dir / '.process-backup' / (
+        datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + f'-{uuid.uuid4().hex[:8]}'
+    )
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    for caption_path in txt_files:
+        shutil.copy2(caption_path, backup_dir / caption_path.name)
 
     for f in txt_files:
         try:
             original = f.read_text(encoding='utf-8').strip()
             result = _apply_process_config(original, config)
-            f.write_text(result, encoding='utf-8')
+            atomic_write_text(f, result)
             processed_count += 1
         except Exception as e:
             errors.append({'file': f.name, 'error': str(e)})
 
-    return jsonify({'success': True, 'processed': processed_count, 'errors': errors})
+    return jsonify({
+        'success': not errors,
+        'processed': processed_count,
+        'errors': errors,
+        'backup': str(backup_dir.relative_to(dataset_dir))
+    })
 
 
 @app.route('/api/stitch', methods=['POST'])
@@ -2724,8 +3493,12 @@ def stitch_images():
 
         if not folder_path or len(filenames) < 2:
             return jsonify({'error': 'Folder and at least 2 filenames are required'}), 400
+        if direction not in {'horizontal', 'vertical', 'grid2x2'}:
+            return jsonify({'error': 'Invalid stitch direction'}), 400
+        if as_is_control not in {'', 'Control1', 'Control2', 'Control3'}:
+            return jsonify({'error': 'Invalid as-is control folder'}), 400
 
-        dataset_dir = DATASETS_DIR / folder_path
+        dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         if not dataset_dir.exists():
             return jsonify({'error': 'Dataset not found'}), 404
 
@@ -2744,75 +3517,105 @@ def stitch_images():
         new_basename = generate_unique_name()
         subfolders = ['img', 'Control1', 'Control2', 'Control3']
         processed = []
+        written_paths = []
 
-        for subfolder in subfolders:
-            folder_dir = dataset_dir / subfolder
-            if not folder_dir.exists():
-                continue
+        try:
+            for subfolder in subfolders:
+                folder_dir = dataset_dir / subfolder
+                if not folder_dir.exists():
+                    continue
 
-            # Collect existing source files in order
-            sources = [folder_dir / fn for fn in filenames if (folder_dir / fn).exists()]
-            if not sources:
-                continue
+                # Match synchronized files by stem even when extensions differ.
+                sources = []
+                for source_filename in filenames:
+                    source_stem = Path(source_filename).stem
+                    source_path = next(
+                        (
+                            folder_dir / f'{source_stem}{extension}'
+                            for extension in ('.png', '.jpg', '.jpeg', '.webp')
+                            if (folder_dir / f'{source_stem}{extension}').is_file()
+                        ),
+                        None
+                    )
+                    if source_path:
+                        sources.append(source_path)
+                if not sources:
+                    continue
 
-            new_path = folder_dir / f"{new_basename}.png"
+                new_path = folder_dir / f"{new_basename}.png"
+                temp_path = folder_dir / f'.{new_basename}.{uuid.uuid4().hex}.tmp.png'
 
-            if subfolder == as_is_control:
-                # Keep first image as-is (no stitching); use copy (not copy2) to get fresh timestamps
-                shutil.copy(str(sources[0]), str(new_path))
-            else:
-                # Open all images for this subfolder
-                imgs = [Image.open(src).copy() for src in sources]
+                if subfolder == as_is_control:
+                    with Image.open(sources[0]) as source_image:
+                        source_image.save(temp_path, 'PNG')
+                    os.replace(temp_path, new_path)
+                else:
+                    imgs = []
+                    for source in sources:
+                        with Image.open(source) as source_image:
+                            imgs.append(source_image.copy())
 
-                # Normalise to RGB (or RGBA if any source has alpha)
-                has_alpha = any(img.mode in ('RGBA', 'LA', 'PA') for img in imgs)
-                mode = 'RGBA' if has_alpha else 'RGB'
-                bg = (0, 0, 0, 255) if has_alpha else (0, 0, 0)
-                imgs = [img.convert(mode) for img in imgs]
+                    # Normalise to RGB (or RGBA if any source has alpha)
+                    has_alpha = any(img.mode in ('RGBA', 'LA', 'PA') for img in imgs)
+                    mode = 'RGBA' if has_alpha else 'RGB'
+                    bg = (0, 0, 0, 255) if has_alpha else (0, 0, 0)
+                    imgs = [img.convert(mode) for img in imgs]
 
-                if direction == 'grid2x2':
-                    # Arrange 4 images in a 2×2 grid: [0][1] / [2][3]
-                    if len(imgs) < 4:
-                        imgs += [Image.new(mode, imgs[0].size, bg)] * (4 - len(imgs))
-                    row_w = imgs[0].width + imgs[1].width
-                    row_h = max(imgs[0].height, imgs[1].height)
-                    bot_w = imgs[2].width + imgs[3].width
-                    bot_h = max(imgs[2].height, imgs[3].height)
-                    total_w = max(row_w, bot_w)
-                    total_h = row_h + bot_h
-                    canvas = Image.new(mode, (total_w, total_h), bg)
-                    canvas.paste(imgs[0], (0, 0))
-                    canvas.paste(imgs[1], (imgs[0].width, 0))
-                    canvas.paste(imgs[2], (0, row_h))
-                    canvas.paste(imgs[3], (imgs[2].width, row_h))
-                elif direction == 'horizontal':
-                    total_w = sum(img.width for img in imgs)
-                    max_h = max(img.height for img in imgs)
-                    canvas = Image.new(mode, (total_w, max_h), bg)
-                    x = 0
+                    if direction == 'grid2x2':
+                        # Arrange 4 images in a 2×2 grid: [0][1] / [2][3]
+                        if len(imgs) < 4:
+                            imgs += [Image.new(mode, imgs[0].size, bg)] * (4 - len(imgs))
+                        row_w = imgs[0].width + imgs[1].width
+                        row_h = max(imgs[0].height, imgs[1].height)
+                        bot_w = imgs[2].width + imgs[3].width
+                        bot_h = max(imgs[2].height, imgs[3].height)
+                        total_w = max(row_w, bot_w)
+                        total_h = row_h + bot_h
+                        canvas = Image.new(mode, (total_w, total_h), bg)
+                        canvas.paste(imgs[0], (0, 0))
+                        canvas.paste(imgs[1], (imgs[0].width, 0))
+                        canvas.paste(imgs[2], (0, row_h))
+                        canvas.paste(imgs[3], (imgs[2].width, row_h))
+                    elif direction == 'horizontal':
+                        total_w = sum(img.width for img in imgs)
+                        max_h = max(img.height for img in imgs)
+                        canvas = Image.new(mode, (total_w, max_h), bg)
+                        x = 0
+                        for img in imgs:
+                            canvas.paste(img, (x, 0))
+                            x += img.width
+                    else:  # vertical
+                        max_w = max(img.width for img in imgs)
+                        total_h = sum(img.height for img in imgs)
+                        canvas = Image.new(mode, (max_w, total_h), bg)
+                        y = 0
+                        for img in imgs:
+                            canvas.paste(img, (0, y))
+                            y += img.height
+
+                    canvas.save(temp_path, 'PNG')
+                    os.replace(temp_path, new_path)
+                    canvas.close()
                     for img in imgs:
-                        canvas.paste(img, (x, 0))
-                        x += img.width
-                else:  # vertical
-                    max_w = max(img.width for img in imgs)
-                    total_h = sum(img.height for img in imgs)
-                    canvas = Image.new(mode, (max_w, total_h), bg)
-                    y = 0
-                    for img in imgs:
-                        canvas.paste(img, (0, y))
-                        y += img.height
+                        img.close()
 
-                canvas.save(str(new_path), 'PNG')
-                for img in imgs:
-                    img.close()
+                written_paths.append(new_path)
+                processed.append(f"{subfolder}/{new_basename}.png")
 
-            processed.append(f"{subfolder}/{new_basename}.png")
-
-        # Copy caption from first filename
-        first_stem = os.path.splitext(filenames[0])[0]
-        txt_src = dataset_dir / 'img' / f"{first_stem}.txt"
-        if txt_src.exists():
-            shutil.copy(str(txt_src), str(dataset_dir / 'img' / f"{new_basename}.txt"))
+            # Copy caption from first filename
+            first_stem = Path(filenames[0]).stem
+            txt_src = dataset_dir / 'img' / f"{first_stem}.txt"
+            if txt_src.exists():
+                caption_path = dataset_dir / 'img' / f"{new_basename}.txt"
+                shutil.copy2(txt_src, caption_path)
+                written_paths.append(caption_path)
+        except Exception:
+            for path in written_paths:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
 
         return jsonify({'success': True, 'newFilename': f"{new_basename}.png", 'processed': processed})
 
@@ -2825,7 +3628,10 @@ def stitch_images():
 
 
 if __name__ == '__main__':
+    host = os.environ.get('QDM_HOST', '127.0.0.1')
+    port = int(os.environ.get('QDM_PORT', '5001'))
+    debug = os.environ.get('QDM_DEBUG', '').lower() in {'1', 'true', 'yes'}
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")
-    print(f"Open http://localhost:5001 in your browser")
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    print(f"Open http://{host}:{port} in your browser")
+    app.run(debug=debug, host=host, port=port)

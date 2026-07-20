@@ -1,4 +1,6 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 echo 🚀 Starting Qwen Dataset Manager...
 
 REM Activate virtual environment

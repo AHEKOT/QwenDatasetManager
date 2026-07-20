@@ -1,4 +1,6 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 echo 🚀 Installing Qwen Dataset Manager...
 
 REM Create virtual environment
@@ -12,7 +14,7 @@ call .venv\Scripts\activate.bat
 REM Install dependencies
 echo 📥 Installing dependencies...
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 echo.
 echo ✅ Installation complete!

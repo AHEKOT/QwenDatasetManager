@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import numpy as np
 from PIL import Image, ImageOps
@@ -93,9 +94,7 @@ class QwenDatasetLoader:
                      print(f"Available files: {all_files[:5]}...") # Debug info
                      raise ValueError(f"Filename '{manual_filename}' not found in dataset. Ensure exact match.")
         elif mode == "Random":
-            import random
-            random.seed(seed)
-            files_to_process = [random.choice(all_files)]
+            files_to_process = [random.Random(seed).choice(all_files)]
         else: # List mode
             files_to_process = all_files
             
@@ -111,12 +110,13 @@ class QwenDatasetLoader:
             # Load Target Image
             img_path = os.path.join(img_dir, filename)
             try:
-                pil_img = Image.open(img_path)
-                # Ensure RGB
-                pil_img = ImageOps.exif_transpose(pil_img)
-                if pil_img.mode != 'RGB':
-                    pil_img = pil_img.convert('RGB')
-                
+                with Image.open(img_path) as source_image:
+                    pil_img = ImageOps.exif_transpose(source_image)
+                    if pil_img.mode != 'RGB':
+                        pil_img = pil_img.convert('RGB')
+                    else:
+                        pil_img = pil_img.copy()
+
                 target_tensor = self.pil_to_tensor(pil_img)
                 target_size = pil_img.size # (W, H)
                 
@@ -134,22 +134,37 @@ class QwenDatasetLoader:
                 try:
                     with open(caption_path, 'r', encoding='utf-8') as f:
                         caption_text = f.read().strip()
-                except:
-                    pass
+                except (OSError, UnicodeError) as exc:
+                    print(f"Error loading caption {caption_path}: {exc}")
             captions_list.append(caption_text)
             
             # Helper to load control or black
             def load_control(ctrl_dir):
-                c_path = os.path.join(ctrl_dir, filename)
-                if os.path.exists(c_path):
+                c_path = None
+                for extension in ('.png', '.jpg', '.jpeg', '.webp'):
+                    candidate = os.path.join(ctrl_dir, f"{basename}{extension}")
+                    if os.path.isfile(candidate):
+                        c_path = candidate
+                        break
+                if c_path:
                     try:
-                        c_img = Image.open(c_path)
-                        c_img = ImageOps.exif_transpose(c_img)
-                        if c_img.mode != 'RGB':
-                            c_img = c_img.convert('RGB')
+                        with Image.open(c_path) as source_control:
+                            c_img = ImageOps.exif_transpose(source_control)
+                            if c_img.mode != 'RGB':
+                                c_img = c_img.convert('RGB')
+                            else:
+                                c_img = c_img.copy()
+                        if c_img.size != target_size:
+                            c_img = ImageOps.pad(
+                                c_img,
+                                target_size,
+                                color=(0, 0, 0),
+                                centering=(0.5, 0.5)
+                            )
                         return self.pil_to_tensor(c_img)
-                    except:
-                         return self.create_black_image(target_size)
+                    except (OSError, ValueError) as exc:
+                        print(f"Error loading control {c_path}: {exc}")
+                        return self.create_black_image(target_size)
                 else:
                     return self.create_black_image(target_size)
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two related tools for managing Qwen training datasets:
 
-1. **Web GUI** (`app.py` + `static/`) — A Flask web app for reviewing, editing, and managing datasets stored locally in `Datasets/`. Serves on `http://localhost:5000`.
+1. **Web GUI** (`app.py` + `static/`) — A Flask web app for reviewing, editing, and managing datasets stored locally in `Datasets/`. Serves on `http://127.0.0.1:5001` by default.
 
 2. **ComfyUI Node** (`comfyui_qwenDatasetManager/`) — A custom ComfyUI node package with two nodes: `QwenDatasetSaver` (saves generated images into dataset format) and `QwenDatasetLoader` (loads dataset images back into ComfyUI workflows).
 
@@ -37,11 +37,11 @@ source .venv/bin/activate
 python app.py
 ```
 
-Dependencies: Flask 3.0, Flask-CORS, Pillow. No build step needed.
+Dependencies: Flask 3.1, Werkzeug, and Pillow. No build step is needed and cross-origin access is intentionally disabled.
 
 ## ComfyUI Node Installation
 
-Copy `comfyui_qwenDatasetManager/` into `ComfyUI/custom_nodes/` and restart ComfyUI. The package auto-registers both nodes via `__init__.py`.
+Copy `comfyui_qwenDatasetManager/` into `ComfyUI/custom_nodes/` and restart ComfyUI. The package registers saver, loader, LoRA merge, and LoRA save nodes via `__init__.py`.
 
 ## Architecture
 

@@ -1,5 +1,7 @@
 import os
 import re
+import hashlib
+import uuid
 from pathlib import Path
 
 import folder_paths
@@ -54,19 +56,34 @@ def _resolve_lora_path(name):
     if not name or name == LORA_NONE:
         return None
 
-    candidate = Path(name).expanduser()
-    if candidate.is_file():
+    allowed_roots = [Path(__file__).resolve().parent.parent]
+    try:
+        allowed_roots.extend(Path(path).resolve() for path in folder_paths.get_folder_paths("loras"))
+    except Exception:
+        pass
+
+    candidate = Path(name).expanduser().resolve(strict=False)
+    if candidate.is_file() and any(candidate == root or root in candidate.parents for root in allowed_roots):
         return str(candidate)
 
     try:
         full_path = folder_paths.get_full_path("loras", name)
-        if full_path and os.path.isfile(full_path):
-            return full_path
+        resolved_full_path = Path(full_path).resolve() if full_path else None
+        if (
+            resolved_full_path
+            and resolved_full_path.is_file()
+            and any(
+                resolved_full_path == root or root in resolved_full_path.parents
+                for root in allowed_roots
+            )
+        ):
+            return str(resolved_full_path)
     except Exception:
         pass
 
-    repo_path = Path(__file__).resolve().parent.parent / name
-    if repo_path.is_file():
+    repo_root = Path(__file__).resolve().parent.parent
+    repo_path = (repo_root / name).resolve(strict=False)
+    if repo_path.is_file() and (repo_path == repo_root or repo_root in repo_path.parents):
         return str(repo_path)
 
     raise FileNotFoundError(f"LoRA file not found: {name}")
@@ -81,10 +98,16 @@ def _resolve_output_dir(save_to, subfolder):
     else:
         base_dir = folder_paths.get_output_directory()
 
-    subfolder = subfolder.strip().strip("/\\")
-    if subfolder:
-        return os.path.join(base_dir, subfolder)
-    return base_dir
+    base_path = Path(base_dir).resolve()
+    subfolder = subfolder.strip()
+    if not subfolder:
+        return str(base_path)
+    if Path(subfolder).is_absolute() or '\x00' in subfolder:
+        raise ValueError("LoRA subfolder must be relative")
+    output_path = (base_path / subfolder).resolve(strict=False)
+    if output_path != base_path and base_path not in output_path.parents:
+        raise ValueError("LoRA output path must stay inside the selected ComfyUI directory")
+    return str(output_path)
 
 
 def _is_lora_a_key(key):
@@ -159,37 +182,75 @@ def _merge_regular_key(torch, key, states, strengths, merge_type, density, seed)
         return None
 
     if len(tensors) == 1:
-        return tensors[0].clone()
+        tensor = tensors[0].clone()
+        if tensor.is_floating_point():
+            tensor = tensor * float(active_strengths[0])
+        return tensor
 
     if not _same_shape(tensors):
-        return tensors[0].clone()
+        shapes = ', '.join(str(tuple(tensor.shape)) for tensor in tensors)
+        raise ValueError(f"Cannot merge '{key}': incompatible tensor shapes ({shapes})")
 
     merged = _weighted_tensor_merge(torch, tensors, active_strengths, merge_type, density, seed)
     return merged.to(dtype=dtypes[0])
 
 
-def _merge_concat_pair(torch, a_key, states, strengths):
+def _pair_alpha_key(a_key):
+    return a_key[:-len(".lora_A.weight")] + ".alpha"
+
+
+def _pair_source_scale(state, a_key, rank):
+    alpha = state.get(_pair_alpha_key(a_key))
+    if alpha is None:
+        return 1.0
+    try:
+        return float(alpha.item()) / float(rank)
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+
+
+def _normalized_strengths(strengths, merge_type):
+    values = [float(strength) for strength in strengths]
+    if merge_type != "weighted_average":
+        return values
+    denominator = sum(values)
+    if abs(denominator) < 1e-12:
+        denominator = sum(abs(value) for value in values) or 1.0
+    return [value / denominator for value in values]
+
+
+def _merge_concat_pair(torch, a_key, states, strengths, merge_type="weighted_sum"):
     b_key = _lora_b_key(a_key)
     a_tensors = []
     b_tensors = []
     first_dtype = None
 
-    for state, strength in zip(states, strengths):
-        if a_key not in state or b_key not in state:
-            continue
+    active = [
+        (state, strength)
+        for state, strength in zip(states, strengths)
+        if a_key in state and b_key in state
+    ]
+    effective_strengths = _normalized_strengths(
+        [strength for _, strength in active],
+        merge_type
+    )
 
+    for (state, _), strength in zip(active, effective_strengths):
         a_tensor = state[a_key]
         b_tensor = state[b_key]
-        if a_tensor.ndim < 2 or b_tensor.ndim < 2:
-            continue
+        if a_tensor.ndim != 2 or b_tensor.ndim != 2 or b_tensor.shape[1] != a_tensor.shape[0]:
+            raise ValueError(f"Invalid LoRA A/B shapes for '{a_key}'")
         if a_tensors and a_tensor.shape[1:] != a_tensors[0].shape[1:]:
-            continue
+            raise ValueError(f"Incompatible LoRA input dimensions for '{a_key}'")
         if b_tensors and b_tensor.shape[:1] + b_tensor.shape[2:] != b_tensors[0].shape[:1] + b_tensors[0].shape[2:]:
-            continue
+            raise ValueError(f"Incompatible LoRA output dimensions for '{a_key}'")
 
         first_dtype = first_dtype or a_tensor.dtype
         a_tensors.append(a_tensor)
-        b_tensors.append(b_tensor.float().mul(float(strength)).to(dtype=b_tensor.dtype))
+        source_scale = _pair_source_scale(state, a_key, a_tensor.shape[0])
+        b_tensors.append(
+            b_tensor.float().mul(float(strength) * source_scale).to(dtype=b_tensor.dtype)
+        )
 
     if not a_tensors:
         return None, None
@@ -198,6 +259,56 @@ def _merge_concat_pair(torch, a_key, states, strengths):
         torch.cat(a_tensors, dim=0).to(dtype=first_dtype),
         torch.cat(b_tensors, dim=1).to(dtype=b_tensors[0].dtype),
     )
+
+
+def _stable_key_seed(seed, key):
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return (int(seed) + int.from_bytes(digest[:8], "big")) % (2 ** 63 - 1)
+
+
+def _merge_delta_pair(torch, a_key, states, strengths, merge_type, density, seed):
+    b_key = _lora_b_key(a_key)
+    deltas = []
+    active_strengths = []
+    ranks = []
+    output_dtype = None
+
+    for state, strength in zip(states, strengths):
+        if a_key not in state or b_key not in state:
+            continue
+        a_tensor = state[a_key]
+        b_tensor = state[b_key]
+        if a_tensor.ndim != 2 or b_tensor.ndim != 2 or b_tensor.shape[1] != a_tensor.shape[0]:
+            raise ValueError(f"Invalid LoRA A/B shapes for '{a_key}'")
+        delta = b_tensor.float() @ a_tensor.float()
+        if deltas and delta.shape != deltas[0].shape:
+            raise ValueError(f"Incompatible LoRA delta shapes for '{a_key}'")
+        deltas.append(delta)
+        active_strengths.append(float(strength) * _pair_source_scale(state, a_key, a_tensor.shape[0]))
+        ranks.append(a_tensor.shape[0])
+        output_dtype = output_dtype or a_tensor.dtype
+
+    if not deltas:
+        return None, None
+
+    merged_delta = _weighted_tensor_merge(
+        torch,
+        deltas,
+        active_strengths,
+        merge_type,
+        density,
+        _stable_key_seed(seed, a_key)
+    )
+    max_rank = min(sum(ranks), min(merged_delta.shape))
+    u_matrix, singular_values, vh_matrix = torch.linalg.svd(
+        merged_delta,
+        full_matrices=False
+    )
+    singular_values = singular_values[:max_rank].clamp_min(0)
+    sqrt_values = singular_values.sqrt()
+    merged_a = sqrt_values[:, None] * vh_matrix[:max_rank, :]
+    merged_b = u_matrix[:, :max_rank] * sqrt_values[None, :]
+    return merged_a.to(dtype=output_dtype), merged_b.to(dtype=output_dtype)
 
 
 def _build_metadata(source_names, source_metadata, merge_type, strengths, density):
@@ -295,17 +406,27 @@ class QwenLoraMerge:
         merged = {}
         consumed = set()
 
-        if merge_type == "concat":
-            for a_key in [key for key in all_keys if _is_lora_a_key(key)]:
-                b_key = _lora_b_key(a_key)
-                if b_key not in all_keys:
-                    continue
-                merged_a, merged_b = _merge_concat_pair(torch, a_key, states, strengths)
-                if merged_a is not None:
-                    merged[a_key] = merged_a
-                    merged[b_key] = merged_b
-                    consumed.add(a_key)
-                    consumed.add(b_key)
+        for a_key in [key for key in all_keys if _is_lora_a_key(key)]:
+            b_key = _lora_b_key(a_key)
+            if b_key not in all_keys:
+                continue
+            if merge_type in {"ties", "dare_linear"}:
+                merged_a, merged_b = _merge_delta_pair(
+                    torch, a_key, states, strengths, merge_type, density, seed
+                )
+            else:
+                merged_a, merged_b = _merge_concat_pair(
+                    torch, a_key, states, strengths, merge_type
+                )
+            if merged_a is not None:
+                merged[a_key] = merged_a
+                merged[b_key] = merged_b
+                alpha_key = _pair_alpha_key(a_key)
+                merged[alpha_key] = torch.tensor(
+                    float(merged_a.shape[0]),
+                    dtype=torch.float32
+                )
+                consumed.update({a_key, b_key, alpha_key})
 
         for key in all_keys:
             if key in consumed:
@@ -356,11 +477,17 @@ class QwenLoraSave:
         os.makedirs(output_dir, exist_ok=True)
 
         path = os.path.join(output_dir, _safe_filename(filename))
-        save_file(
-            merged_lora["state_dict"],
-            path,
-            metadata=_metadata_to_strings(merged_lora.get("metadata", {})),
-        )
+        temp_path = os.path.join(output_dir, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
+        try:
+            save_file(
+                merged_lora["state_dict"],
+                temp_path,
+                metadata=_metadata_to_strings(merged_lora.get("metadata", {})),
+            )
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         message = (
             f"Saved merged Qwen LoRA: {path} "

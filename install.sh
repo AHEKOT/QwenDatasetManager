@@ -1,4 +1,8 @@
 #!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 echo "🚀 Installing Qwen Dataset Manager..."
 
@@ -12,8 +16,8 @@ source .venv/bin/activate
 
 # Install dependencies
 echo "📥 Installing dependencies..."
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
 echo ""
 echo "✅ Installation complete!"

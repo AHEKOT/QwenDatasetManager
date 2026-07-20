@@ -1,6 +1,6 @@
 # Qwen Dataset Manager
 
-A web-based tool for managing and reviewing Qwen training datasets with image comparison features.
+A local web application for managing, reviewing, editing, and transforming Qwen training datasets.
 
 ## Features
 
@@ -9,7 +9,9 @@ A web-based tool for managing and reviewing Qwen training datasets with image co
 - 🔍 **Fullscreen Preview** - Click any image to view in fullscreen
 - 🎨 **Overlay Comparison** - Toggle between normal view and semi-transparent overlay to compare with Control1 images
 - ⌨️ **Keyboard Navigation** - Navigate with arrow keys, toggle with space, delete with backspace
-- 🗑️ **Batch Deletion** - Delete all related images (img, Control1, Control2) at once
+- 🧰 **Dataset Tools** - Reshuffle, compress, fit, blur, mirror, merge, import, export, and duplicate review
+- ✏️ **Editing** - Paint/crop images and edit captions with synchronized controls
+- 🗑️ **Recoverable Deletion** - Move complete image/control/caption sets into a hidden `.trash` folder
 
 ## Dataset Structure
 
@@ -18,8 +20,9 @@ Your dataset folder should have this structure:
 ```
 DatasetFolder/
 ├── img/          # Source images
-├── Control1/     # First control images  
-└── Control2/     # Second control images
+├── Control1/     # First control images
+├── Control2/     # Second control images
+└── Control3/     # Optional third control images
 ```
 
 All three folders must contain images with matching filenames (e.g., `image_00003_.png`).
@@ -37,7 +40,9 @@ All three folders must contain images with matching filenames (e.g., `image_0000
    ```
 
 3. **Open your browser**:
-   Navigate to `http://localhost:5000`
+   Navigate to `http://127.0.0.1:5001`
+
+The server binds to localhost by default. To deliberately expose it on another interface, set `QDM_HOST` and list accepted hostnames in `QDM_TRUSTED_HOSTS`; use a trusted network and a reverse proxy with authentication. `QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are also configurable environment variables.
 
 ## Usage
 
@@ -54,7 +59,8 @@ All three folders must contain images with matching filenames (e.g., `image_0000
 |-----|--------|
 | `←` / `→` | Navigate between images |
 | `Space` | Toggle overlay |
-| `Backspace` / `Delete` | Delete current image set (all 3 files) |
+| `Backspace` / `Delete` | Confirm and move the current synchronized set to `.trash` |
+| `Shift+P` | Open the current set in Pixelmator Pro (macOS) |
 | `Esc` | Close preview |
 
 ## Technical Stack
@@ -63,6 +69,8 @@ All three folders must contain images with matching filenames (e.g., `image_0000
 - **Frontend**: Vanilla JavaScript, HTML5, CSS3
 - **Design**: Modern dark theme with glassmorphism and smooth animations
 
-## License
+## Tests
 
-MIT
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```

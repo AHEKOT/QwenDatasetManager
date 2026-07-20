@@ -138,7 +138,7 @@
     </div>
 
     <!-- Stitch validation error modal -->
-    <div id="stitch-error-modal" class="stitch-error-modal hidden">
+    <div id="stitch-error-modal" class="stitch-error-modal hidden" role="alertdialog" aria-modal="true" aria-describedby="stitch-error-msg">
         <div class="stitch-error-content">
             <div class="stitch-error-icon">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -153,14 +153,14 @@
     </div>
 
     <!-- Dataset Tools Modal -->
-    <div id="tools-modal" class="tools-modal">
+    <div id="tools-modal" class="tools-modal" role="dialog" aria-modal="true" aria-labelledby="tools-modal-title">
         <div class="tools-modal-content">
             <div class="tools-modal-header">
                 <div>
-                    <h2>Dataset Tools</h2>
+                    <h2 id="tools-modal-title">Dataset Tools</h2>
                     <p>Choose a utility on the left. Settings, preview, output, and launch actions stay on the right.</p>
                 </div>
-                <button id="tools-close-btn" class="tools-close-btn" title="Close tools">✕</button>
+                <button id="tools-close-btn" class="tools-close-btn" title="Close tools" aria-label="Close dataset tools">✕</button>
             </div>
 
             <div class="tools-modal-body">
@@ -621,15 +621,15 @@
     </div>
 
     <!-- Export Modal -->
-    <div id="export-modal" class="dataset-name-modal hidden">
+    <div id="export-modal" class="dataset-name-modal hidden" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
         <div class="dataset-name-modal-content export-modal-content">
             <div class="dataset-name-modal-header">
                 <div>
                     <span class="dataset-name-modal-kicker">Export</span>
-                    <h2>Export Dataset</h2>
+                    <h2 id="export-modal-title">Export Dataset</h2>
                     <p>Choose the root export path. The app will create trainer-style folders like <strong>dataset_img</strong>, <strong>dataset_ctr1</strong>, <strong>dataset_ctr2</strong>, and <strong>dataset_ctr3</strong>. Empty folders are skipped.</p>
                 </div>
-                <button id="export-close-btn" class="dataset-name-close-btn" title="Close">✕</button>
+                <button id="export-close-btn" class="dataset-name-close-btn" title="Close" aria-label="Close export dialog">✕</button>
             </div>
 
             <div class="dataset-name-modal-body export-modal-body">
@@ -658,7 +658,7 @@
     </div>
 
     <!-- Dataset Name Modal -->
-    <div id="dataset-name-modal" class="dataset-name-modal hidden">
+    <div id="dataset-name-modal" class="dataset-name-modal hidden" role="dialog" aria-modal="true" aria-labelledby="dataset-name-modal-title">
         <div class="dataset-name-modal-content">
             <div class="dataset-name-modal-header">
                 <div>
@@ -666,7 +666,7 @@
                     <h2 id="dataset-name-modal-title">Rename Dataset</h2>
                     <p id="dataset-name-modal-description">Enter a dataset name using letters, numbers, underscores, and hyphens only.</p>
                 </div>
-                <button id="dataset-name-close-btn" class="dataset-name-close-btn" title="Close">✕</button>
+                <button id="dataset-name-close-btn" class="dataset-name-close-btn" title="Close" aria-label="Close dataset dialog">✕</button>
             </div>
 
             <div class="dataset-name-modal-body">
@@ -683,7 +683,7 @@
     </div>
 
     <!-- Fullscreen Preview Modal -->
-    <div id="preview-modal" class="modal">
+    <div id="preview-modal" class="modal" role="dialog" aria-modal="true" aria-label="Image preview and editor">
         <div class="modal-content">
             <div class="transfer-header">
                 <div class="panel-section">
@@ -856,7 +856,7 @@
                 </div>
 
                 <div class="control-sidebar" id="control-sidebar">
-                    <button id="close-modal" class="close-btn" title="Close (Esc)">✕</button>
+                    <button id="close-modal" class="close-btn" title="Close (Esc)" aria-label="Close image preview">✕</button>
                     <div class="control-thumb" id="control1-thumb" data-control="Control1"
                         title="Control 1 (click to view)">
                         <img src="" alt="Control 1">
@@ -921,7 +921,7 @@
                         Duplicate
                     </button>
 
-                    <button id="pixelmator-btn" class="action-btn" title="Open in Pixelmator Pro (P)">
+                    <button id="pixelmator-btn" class="action-btn" title="Open in Pixelmator Pro (Shift+P)">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2">
                             <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
@@ -952,11 +952,11 @@
     </div>
 
     <!-- Process Text Modal -->
-    <div id="process-text-modal" class="pt-modal">
+    <div id="process-text-modal" class="pt-modal" role="dialog" aria-modal="true" aria-labelledby="process-text-modal-title">
         <div class="pt-modal-content">
 
             <div class="pt-header">
-                <div class="pt-header-title">
+                <div id="process-text-modal-title" class="pt-header-title">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M4 6h16M4 12h10M4 18h14"></path>
                         <circle cx="20" cy="18" r="2"></circle>
@@ -964,7 +964,7 @@
                     </svg>
                     Process Text
                 </div>
-                <button id="pt-close-btn" class="pt-close-btn">✕</button>
+                <button id="pt-close-btn" class="pt-close-btn" aria-label="Close process text dialog">✕</button>
             </div>
 
             <div class="pt-body">

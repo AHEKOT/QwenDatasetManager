@@ -50,6 +50,9 @@ let comparisonControlView = null; // Which control is shown in comparison view (
 let linkedDataset = null; // Linked dataset for synchronized operations
 let mainEditor = null; // Main editor instance
 let comparisonEditor = null; // Comparison editor instance
+let captionRequestController = null;
+let captionLoadToken = 0;
+let captionLoadedKey = '';
 
 // DOM elements
 const folderSelect = document.getElementById('folder-select');
@@ -337,12 +340,14 @@ function syncEditorButtons() {
     const resetBtn = document.getElementById('reset-edit-btn');
     const saveBtn  = document.getElementById('save-edit-btn');
 
-    const hasChanges = (mainEditor && mainEditor.history.length > 1) ||
-        (comparisonEditor && comparisonEditor.history.length > 1);
+    const activeEditor = ImageEditor.activeEditor || mainEditor;
+    const hasChanges = Boolean(activeEditor && activeEditor.history.length > 1);
 
     [undoBtn, resetBtn, saveBtn].forEach(btn => {
         if (btn) btn.classList.toggle('hidden', !hasChanges);
     });
+    if (undoBtn) undoBtn.disabled = !hasChanges;
+    if (saveBtn) saveBtn.disabled = !hasChanges;
 }
 
 // Global callback for editor to notify when image is saved
@@ -479,8 +484,8 @@ function renderExportProgress({
         .filter((item) => item && item.label && item.value !== undefined && item.value !== null && item.value !== '')
         .map((item) => `
             <div class="tools-task-detail">
-                <span>${item.label}</span>
-                <strong>${item.value}</strong>
+                <span>${escHtml(item.label)}</span>
+                <strong>${escHtml(item.value)}</strong>
             </div>
         `)
         .join('');
@@ -753,7 +758,7 @@ async function loadImages(folder) {
 
         if (data.error) {
             console.error('Error loading images:', data.error);
-            imageGrid.innerHTML = `<div class="empty-state"><p>❌ Error: ${data.error}</p></div>`;
+            imageGrid.innerHTML = `<div class="empty-state"><p>❌ Error: ${escHtml(data.error)}</p></div>`;
             return;
         }
 
@@ -796,6 +801,9 @@ function renderImageGrid() {
         const item = document.createElement('div');
         item.className = 'image-item';
         item.dataset.index = index;
+        item.tabIndex = 0;
+        item.setAttribute('role', 'button');
+        item.setAttribute('aria-label', `Open ${filename}`);
 
         const img = document.createElement('img');
         img.src = `/api/image/img/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
@@ -887,8 +895,8 @@ function renderToolProgress(toolName, {
         .filter((item) => item && item.label && item.value !== undefined && item.value !== null && item.value !== '')
         .map((item) => `
             <div class="tools-task-detail">
-                <span>${item.label}</span>
-                <strong>${item.value}</strong>
+                <span>${escHtml(item.label)}</span>
+                <strong>${escHtml(item.value)}</strong>
             </div>
         `)
         .join('');
@@ -933,6 +941,7 @@ function renderToolJobState(toolName, job) {
             reshuffle: [{ label: 'Dataset', value: context.folderPath }],
             compress: [{ label: 'Dataset', value: context.folderPath }],
             fit: [{ label: 'Dataset', value: context.folderPath }],
+            duplicates: [{ label: 'Dataset', value: context.folderPath }],
             blur: [{ label: 'Source Dataset', value: context.folderPath }],
             mirror: [{ label: 'Source Dataset', value: context.folderPath }],
             merge: [
@@ -979,6 +988,17 @@ function renderToolJobState(toolName, job) {
                 details: [
                     { label: 'Processed Sets', value: result.processed },
                     { label: 'Updated Controls', value: result.updated }
+                ]
+            },
+            duplicates: {
+                title: result.count ? 'Duplicate pairs found' : 'No duplicates found',
+                summary: result.count
+                    ? `Found ${result.count} duplicate pair${result.count !== 1 ? 's' : ''}.`
+                    : `No pairs matched at threshold ${result.threshold}.`,
+                details: [
+                    { label: 'Images Scanned', value: result.imageCount },
+                    { label: 'Pairs', value: result.count },
+                    { label: 'Threshold', value: result.threshold }
                 ]
             },
             blur: {
@@ -1049,6 +1069,18 @@ function renderToolJobState(toolName, job) {
                 { label: 'Dataset', value: context.folderPath },
                 { label: 'Progress', value: total ? `${processed}/${total} sets` : 'Preparing' },
                 { label: 'Updated Controls', value: job.metrics?.updated ?? 0 }
+            ]
+        },
+        duplicates: {
+            title: 'Scanning duplicates',
+            summary: total
+                ? `Processed ${processed}/${total} fingerprint and comparison steps.`
+                : 'Preparing image fingerprints...',
+            details: [
+                { label: 'Dataset', value: context.folderPath },
+                { label: 'Progress', value: total ? `${processed}/${total}` : 'Preparing' },
+                { label: 'Pairs Found', value: job.metrics?.pairsFound ?? 0 },
+                { label: 'Threshold', value: context.threshold }
             ]
         },
         blur: {
@@ -1125,7 +1157,11 @@ async function pollToolJob(toolName, jobId, { onComplete, onFinally } = {}) {
         }
 
         clearToolPolling(toolName);
-        toolPollTimers.set(toolName, setTimeout(() => pollToolJob(toolName, jobId, { onComplete, onFinally }), 200));
+        await new Promise((resolve) => {
+            toolPollTimers.set(toolName, setTimeout(resolve, 200));
+        });
+        toolPollTimers.delete(toolName);
+        return await pollToolJob(toolName, jobId, { onComplete, onFinally });
     } catch (error) {
         console.error(`${toolName} progress polling failed:`, error);
         renderToolProgress(toolName, {
@@ -1369,19 +1405,14 @@ async function scanDuplicateImages() {
             indeterminate: true
         });
 
-        const response = await fetch('/api/dataset/duplicates', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                folder: currentFolder,
-                threshold
-            })
+        toolJobContexts.set('duplicates', { folderPath: currentFolder, threshold });
+        let data = null;
+        await startToolJob('duplicates', { folderPath: currentFolder, threshold }, {
+            onComplete: async (job) => {
+                data = job.result;
+            }
         });
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-            throw new Error(data.error || 'Duplicate scan failed.');
-        }
+        if (!data) throw new Error('Duplicate scan did not return a result.');
 
         duplicateReviewState = {
             pairs: data.pairs || [],
@@ -1516,16 +1547,18 @@ async function keepDuplicateSide(side) {
     }
 }
 
-function openToolsModal() {
+async function openToolsModal() {
     if (!currentFolder) {
         alert('Please select a dataset folder first.');
         return;
     }
+    if (modal.classList.contains('active') && !await checkUnsavedWork()) return;
 
     updateToolsContext();
     setToolsView(currentToolsView, { forceRefresh: true });
     toolsModal.classList.add('active');
     document.body.style.overflow = 'hidden';
+    toolsCloseBtn.focus();
 }
 
 function closeToolsModal() {
@@ -1581,13 +1614,13 @@ function renderActiveImportCardProgress(job) {
 
     progressBlock.innerHTML = `
         <div class="import-card-progress-head">
-            <strong>${job.targetName}</strong>
+            <strong>${escHtml(job.targetName)}</strong>
             <span>${percent.toFixed(1)}%</span>
         </div>
         <div class="import-card-progress-bar">
             <div class="import-card-progress-fill" style="width: ${Math.max(0, Math.min(100, percent))}%"></div>
         </div>
-        <p class="import-card-progress-text">${summary}</p>
+        <p class="import-card-progress-text">${escHtml(summary)}</p>
     `;
 }
 
@@ -1617,12 +1650,12 @@ function renderImportProgress(job) {
     const folderProgress = job.folderProgress || {};
     importProgressFolders.innerHTML = Object.entries(folderProgress)
         .map(([folderName, folderJob]) => {
-            const total = folderJob.total || 0;
-            const copied = folderJob.copied || 0;
+            const total = Number(folderJob.total) || 0;
+            const copied = Number(folderJob.copied) || 0;
             const width = total ? Math.min(100, (copied / total) * 100) : 100;
             return `
                 <div class="import-progress-folder">
-                    <strong>${folderName}</strong>
+                    <strong>${escHtml(folderName)}</strong>
                     <div class="import-progress-folder-bar">
                         <div class="import-progress-folder-fill" style="width: ${width}%"></div>
                     </div>
@@ -1699,9 +1732,9 @@ function renderImportResults() {
                 const folder = dataset.folders[folderName];
                 return `
                     <div class="import-folder-row">
-                        <strong>${folderName}</strong>
-                        <span>${folder.imageCount} images</span>
-                        <code>${folder.name}</code>
+                        <strong>${escHtml(folderName)}</strong>
+                        <span>${escHtml(folder.imageCount)} images</span>
+                        <code>${escHtml(folder.name)}</code>
                     </div>
                 `;
             })
@@ -1710,17 +1743,17 @@ function renderImportResults() {
         card.innerHTML = `
             <div class="import-dataset-head">
                 <div class="import-dataset-title">
-                    <strong>${dataset.sourceName}</strong>
-                    <div class="import-dataset-meta">Grouped as one ${dataset.pairStyle} dataset from trainer export folders</div>
+                    <strong>${escHtml(dataset.sourceName)}</strong>
+                    <div class="import-dataset-meta">Grouped as one ${escHtml(dataset.pairStyle)} dataset from trainer export folders</div>
                 </div>
                 <div class="import-dataset-badges">
-                    <span class="import-dataset-badge">${dataset.imageCount} targets</span>
-                    <span class="import-dataset-badge">${dataset.controlCount} controls</span>
+                    <span class="import-dataset-badge">${escHtml(dataset.imageCount)} targets</span>
+                    <span class="import-dataset-badge">${escHtml(dataset.controlCount)} controls</span>
                 </div>
             </div>
             <div class="import-folder-list">${folderRows}</div>
             <div class="import-target-row">
-                <input class="tools-text-input import-target-input" type="text" value="${dataset.sourceName}" aria-label="Target dataset name">
+                <input class="tools-text-input import-target-input" type="text" value="${escHtml(dataset.sourceName)}" aria-label="Target dataset name">
                 <button class="action-btn export-btn import-dataset-btn">Import Dataset</button>
             </div>
         `;
@@ -1920,6 +1953,7 @@ function openPreview(index) {
     updatePreview();
     modal.classList.add('active');
     document.body.style.overflow = 'hidden';
+    closeBtn.focus();
     saveAppState();
 }
 
@@ -1945,7 +1979,9 @@ function onTargetDatasetChange(value) {
 }
 
 // Close preview modal
-function closePreview() {
+async function closePreview() {
+    if (modal.classList.contains('active') && !await checkUnsavedWork()) return false;
+    captionRequestController?.abort();
     modal.classList.remove('active');
     document.body.style.overflow = '';
     overlayActive = false;
@@ -1953,6 +1989,7 @@ function closePreview() {
     previewControl.classList.remove('active');
     toggleBtn.classList.remove('active');
     saveAppState();
+    return true;
 }
 
 // Update preview with current image
@@ -2029,9 +2066,9 @@ function updatePreview() {
                 mainEditor.overlayElement = previewControl;
                 mainEditor.subfolder = subfolder;
                 mainEditor.onStateChange = syncEditorButtons;
-                mainEditor.setupCanvas();
                 mainEditor.history = [];
-                mainEditor.saveState();
+                mainEditor.hasChanges = false;
+                mainEditor.setupCanvas();
             }
             mainEditor.currentFilename = filename;
             mainEditor.currentFolder = currentFolder;
@@ -2055,9 +2092,9 @@ function updatePreview() {
                 comparisonEditor.controlImageElement = comparisonImg;
                 comparisonEditor.subfolder = comparisonControlView;
                 comparisonEditor.onStateChange = syncEditorButtons;
-                comparisonEditor.setupCanvas();
                 comparisonEditor.history = [];
-                comparisonEditor.saveState();
+                comparisonEditor.hasChanges = false;
+                comparisonEditor.setupCanvas();
             }
             comparisonEditor.currentFilename = filename;
             comparisonEditor.currentFolder = currentFolder;
@@ -2068,6 +2105,7 @@ function updatePreview() {
         if (comparisonEditor) {
             comparisonEditor.reset(); // Or hide?
         }
+        if (mainEditor) ImageEditor.activeEditor = mainEditor;
     }
 
     // Load control thumbnails
@@ -2126,7 +2164,8 @@ function loadControlThumbnails(filename) {
 }
 
 // Show control image in full preview or side-by-side comparison
-function showControlFullPreview(controlName) {
+async function showControlFullPreview(controlName) {
+    if (!await checkUnsavedEditors()) return;
     if (comparisonControlView === controlName) {
         // Toggle off - hide comparison
         comparisonControlView = null;
@@ -2140,7 +2179,7 @@ function showControlFullPreview(controlName) {
 // Navigate to previous image
 async function showPrevious() {
     if (currentIndex > 0) {
-        if (!await checkUnsavedCaption()) return;
+        if (!await checkUnsavedWork()) return;
         currentIndex--;
         updatePreview();
         saveAppState();
@@ -2150,7 +2189,7 @@ async function showPrevious() {
 // Navigate to next image
 async function showNext() {
     if (currentIndex < images.length - 1) {
-        if (!await checkUnsavedCaption()) return;
+        if (!await checkUnsavedWork()) return;
         currentIndex++;
         updatePreview();
         saveAppState();
@@ -2189,6 +2228,7 @@ function updateOpacity(value) {
 // Transfer current image to target dataset
 async function transferCurrentImage() {
     if (images.length === 0 || !targetFolder) return;
+    if (!await checkUnsavedWork()) return;
 
     const filename = images[currentIndex];
 
@@ -2260,6 +2300,7 @@ async function transferCurrentImage() {
 // Duplicate current image set
 async function duplicateCurrentImage() {
     if (images.length === 0) return;
+    if (!await checkUnsavedWork()) return;
 
     const filename = images[currentIndex];
 
@@ -2329,6 +2370,12 @@ async function deleteCurrentImage() {
         const data = await response.json();
 
         if (data.success) {
+            captionDirty = false;
+            [mainEditor, comparisonEditor].forEach((editor) => {
+                if (!editor) return;
+                editor.hasChanges = false;
+                if (editor.history.length) editor.history = [editor.history[editor.history.length - 1]];
+            });
             // Remove from images array
             images.splice(currentIndex, 1);
 
@@ -2740,21 +2787,49 @@ function autoresizeCaption() {
     captionText.style.height = captionText.scrollHeight + 'px';
 }
 
-// Returns false if navigation should be cancelled (user chose not to discard)
+// Save pending work without interrupting navigation with modal prompts.
 async function checkUnsavedCaption() {
     if (!captionDirty) return true;
-    const choice = confirm('Caption has unsaved changes.\n\nSave before continuing?');
-    if (choice) await saveCurrentCaption();
-    return true; // proceed either way after user acknowledged
+    return await saveCurrentCaption();
+}
+
+async function checkUnsavedEditors(editors = [mainEditor, comparisonEditor]) {
+    const dirtyEditors = editors.filter((editor) => editor?.hasChanges);
+    if (!dirtyEditors.length) return true;
+    for (const editor of dirtyEditors) {
+        if (!await editor.save()) return false;
+    }
+    return true;
+}
+
+async function checkUnsavedWork() {
+    if (!await checkUnsavedCaption()) return false;
+    return await checkUnsavedEditors();
 }
 
 async function loadCaption(filename) {
+    const requestedFolder = currentFolder;
+    const requestedKey = `${requestedFolder}\u0000${filename}`;
+    if (captionDirty && captionLoadedKey === requestedKey) return;
+    captionRequestController?.abort();
+    const controller = new AbortController();
+    captionRequestController = controller;
+    const token = ++captionLoadToken;
     try {
         captionText.value = 'Loading...';
         captionDirty = false;
         autoresizeCaption();
-        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`);
+        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(requestedFolder)}`, {
+            signal: controller.signal
+        });
         const data = await response.json();
+
+        if (
+            token !== captionLoadToken ||
+            requestedFolder !== currentFolder ||
+            images[currentIndex] !== filename ||
+            captionDirty
+        ) return;
 
         if (data.error) {
             console.error('Error loading caption:', data.error);
@@ -2762,25 +2837,30 @@ async function loadCaption(filename) {
         } else {
             captionText.value = data.caption || '';
         }
+        captionLoadedKey = requestedKey;
         captionDirty = false;
         autoresizeCaption();
     } catch (error) {
+        if (error.name === 'AbortError') return;
         console.error('Failed to load caption:', error);
-        captionText.value = '';
-        captionDirty = false;
+        if (token === captionLoadToken && requestedFolder === currentFolder && images[currentIndex] === filename) {
+            captionText.value = '';
+            captionDirty = false;
+        }
     }
 }
 
 // Save current caption
 async function saveCurrentCaption() {
-    if (images.length === 0) return;
+    if (images.length === 0) return false;
 
     const filename = images[currentIndex];
+    const folder = currentFolder;
     const caption = captionText.value;
 
     try {
         saveCaptionBtn.disabled = true;
-        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(currentFolder)}`, {
+        const response = await fetch(`/api/caption/${encodeURIComponent(filename)}?folder=${encodeURIComponent(folder)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ caption })
@@ -2789,16 +2869,27 @@ async function saveCurrentCaption() {
         const data = await response.json();
 
         if (data.success) {
-            captionDirty = false;
+            const savedCurrentCaption = (
+                images[currentIndex] === filename &&
+                currentFolder === folder &&
+                captionText.value === caption
+            );
+            if (savedCurrentCaption) {
+                captionDirty = false;
+                captionLoadedKey = `${folder}\u0000${filename}`;
+            }
             const originalBackground = saveCaptionBtn.style.background;
             saveCaptionBtn.style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
             setTimeout(() => { saveCaptionBtn.style.background = originalBackground; }, 1000);
+            return savedCurrentCaption;
         } else {
             alert(`Failed to save caption: ${data.error}`);
+            return false;
         }
     } catch (error) {
         console.error('Failed to save caption:', error);
         alert('Failed to save caption. Check console for details.');
+        return false;
     } finally {
         saveCaptionBtn.disabled = false;
     }
@@ -2842,7 +2933,11 @@ async function openInPixelmator() {
 // Event listeners
 function setupEventListeners() {
     // Folder selection
-    folderSelect.addEventListener('change', (e) => {
+    folderSelect.addEventListener('change', async (e) => {
+        if (modal.classList.contains('active') && !await checkUnsavedWork()) {
+            folderSelect.value = currentFolder;
+            return;
+        }
         if (e.target.value === '__create_new__') {
             createNewDataset();
         } else {
@@ -2860,6 +2955,15 @@ function setupEventListeners() {
         } else {
             openPreview(idx);
         }
+    });
+    imageGrid.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const item = e.target.closest('.image-item');
+        if (!item || item.dataset.index === undefined) return;
+        e.preventDefault();
+        const idx = parseInt(item.dataset.index);
+        if (stitchMode) toggleStitchSelection(idx);
+        else openPreview(idx);
     });
 
     // Modal controls
@@ -3055,11 +3159,8 @@ function setupEventListeners() {
                     transferCurrentImage();
                 }
                 break;
-            case 'p':
-            case 'P':
-                openInPixelmator();
-                break;
         }
+        if (e.shiftKey && e.key.toLowerCase() === 'p') openInPixelmator();
     });
 
     document.addEventListener('keydown', (e) => {
@@ -3142,6 +3243,7 @@ async function openProcessTextModal() {
     }
     ptModal.classList.add('active');
     await ptLoadConfig();
+    ptCloseBtn.focus();
 }
 
 function closeProcessTextModal() {
@@ -3215,7 +3317,7 @@ function ptAddSlotRow(slot = {}) {
 }
 
 function escHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 ptAddSlotBtn.addEventListener('click', () => ptAddSlotRow());
@@ -3311,7 +3413,7 @@ ptTemplateEl.addEventListener('input', ptSchedulePreview);
 ptApplyBtn.addEventListener('click', async () => {
     if (!currentFolder) return;
     const ok = confirm(
-        `Apply processing to ALL captions in "${currentFolder}"?\n\nThis will overwrite every .txt file. The operation cannot be undone.`
+        `Apply processing to ALL captions in "${currentFolder}"?\n\nA backup will be created inside the dataset before any file is changed.`
     );
     if (!ok) return;
 
@@ -3330,7 +3432,8 @@ ptApplyBtn.addEventListener('click', async () => {
         const errMsg = data.errors?.length
             ? `\n${data.errors.length} error(s): ${data.errors.map(e => e.file).join(', ')}`
             : '';
-        ptShowStatus(`Done — ${data.processed} captions updated.${errMsg}`, data.errors?.length ? 'warning' : 'success');
+        const backupMsg = data.backup ? ` Backup: ${data.backup}.` : '';
+        ptShowStatus(`Done — ${data.processed} captions updated.${backupMsg}${errMsg}`, data.errors?.length ? 'warning' : 'success');
         ptRunPreview();
     } catch (e) {
         ptShowStatus('Apply failed: ' + e.message, 'error');

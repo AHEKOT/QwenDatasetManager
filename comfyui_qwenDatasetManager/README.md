@@ -1,6 +1,6 @@
 # Qwen Dataset Manager - ComfyUI Node
 
-ComfyUI custom node for saving images in Qwen training dataset format.
+ComfyUI custom nodes for saving/loading Qwen datasets and merging Qwen LoRAs.
 
 ## Installation
 
@@ -46,6 +46,10 @@ ComfyUI custom node for saving images in Qwen training dataset format.
 
 5. **Format**: All images saved as PNG without compression
 
+6. **Batch handling**: Every target in the input batch is saved. Control batches must contain either one reusable image or the same number of images as the target batch.
+
+Dataset names are single folder names and cannot escape ComfyUI's output directory.
+
 ### Example Usage
 
 Connect your workflow outputs to the node:
@@ -59,6 +63,14 @@ The node will automatically:
 - Find the next available number
 - Save all files with matching names
 - Print confirmation to console
+
+## Node: Qwen Dataset Loader
+
+Loads a dataset in Manual, List, or deterministic Random mode. Controls are matched by basename even when their extensions differ from the target. Missing controls become black images; controls with different dimensions are padded to the target size.
+
+## Nodes: Qwen LoRA Merge / Save
+
+Merge up to four `.safetensors` LoRAs using concat, weighted sum, weighted average, TIES, or DARE Linear. Weighted operations are performed on LoRA deltas; TIES/DARE results are factorized back to LoRA A/B tensors. Inputs are limited to configured ComfyUI LoRA directories or the repository directory, and outputs cannot escape the selected ComfyUI directory.
 
 ## Dataset Compatibility
 
