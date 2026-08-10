@@ -2603,22 +2603,14 @@ def export_dataset():
         if not export_specs:
             return jsonify({'error': 'No files to export'}), 404
 
-        existing_folders = [
-            str(export_base / f'{dataset_name}{suffix}')
-            for _, suffix, _ in export_specs
-            if (export_base / f'{dataset_name}{suffix}').exists()
-        ]
-        if existing_folders:
-            return jsonify({
-                'error': 'Export destination already contains dataset folders',
-                'folders': existing_folders
-            }), 409
-
         staging_dir = export_base / f'.qdm-export-{uuid.uuid4().hex}'
         staging_dir.mkdir()
         exported = {}
-        completed_folders = []
+        created_files = []
+        replaced_files = []
+        created_folders = []
         try:
+            # Prepare every source file before touching an existing export.
             for src_folder, suffix, files in export_specs:
                 folder_name = f'{dataset_name}{suffix}'
                 staged_folder = staging_dir / folder_name
@@ -2628,17 +2620,60 @@ def export_dataset():
                         shutil.copy2(file_path, staged_folder / file_path.name)
                     except OSError:
                         shutil.copy(file_path, staged_folder / file_path.name)
+
+            # Merge the prepared files into existing trainer folders. Matching
+            # files are replaced, while unrelated files are intentionally kept.
+            backup_root = staging_dir / '.backups'
+            for src_folder, suffix, files in export_specs:
+                folder_name = f'{dataset_name}{suffix}'
+                staged_folder = staging_dir / folder_name
                 export_folder = export_base / folder_name
-                os.replace(staged_folder, export_folder)
-                completed_folders.append(export_folder)
+                if not export_folder.exists():
+                    export_folder.mkdir()
+                    created_folders.append(export_folder)
+                elif not export_folder.is_dir():
+                    raise FileExistsError(f'Export destination is not a folder: {export_folder}')
+
+                overwritten = 0
+                for file_path in files:
+                    staged_file = staged_folder / file_path.name
+                    destination = export_folder / file_path.name
+                    if destination.exists():
+                        backup = backup_root / folder_name / file_path.name
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(destination, backup)
+                        try:
+                            os.replace(staged_file, destination)
+                        except Exception:
+                            os.replace(backup, destination)
+                            raise
+                        replaced_files.append((destination, backup))
+                        overwritten += 1
+                    else:
+                        os.replace(staged_file, destination)
+                        created_files.append(destination)
+
                 exported[src_folder] = {
                     'folder': str(export_folder),
-                    'files': len(files)
+                    'files': len(files),
+                    'overwritten': overwritten
                 }
         except Exception:
-            for export_folder in reversed(completed_folders):
+            for destination in reversed(created_files):
                 try:
-                    os.replace(export_folder, staging_dir / export_folder.name)
+                    destination.unlink()
+                except OSError:
+                    pass
+            for destination, backup in reversed(replaced_files):
+                try:
+                    if destination.exists():
+                        destination.unlink()
+                    os.replace(backup, destination)
+                except OSError:
+                    pass
+            for export_folder in reversed(created_folders):
+                try:
+                    export_folder.rmdir()
                 except OSError:
                     pass
             raise

@@ -251,7 +251,7 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertEqual(body['result']['count'], 1)
         self.assertNotIn('demo', manager.ACTIVE_DATASETS)
 
-    def test_export_refuses_to_overwrite_existing_folder(self):
+    def test_export_updates_existing_folder_without_removing_unrelated_files(self):
         dataset = self.root / 'demo'
         self.save_image(dataset / 'img' / 'one.png')
         export_root = Path(self.tempdir.name) / 'exports'
@@ -263,14 +263,18 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         exported_file = export_root / 'demo_img' / 'one.png'
         original = exported_file.read_bytes()
+        unrelated_file = export_root / 'demo_img' / 'keep.png'
+        self.save_image(unrelated_file, color=(1, 2, 3))
 
         self.save_image(dataset / 'img' / 'one.png', color=(200, 10, 20))
         second = self.client.post(
             '/api/export?folder=demo',
             json={'exportPath': str(export_root)}
         )
-        self.assertEqual(second.status_code, 409)
-        self.assertEqual(exported_file.read_bytes(), original)
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(exported_file.read_bytes(), original)
+        self.assertTrue(unrelated_file.is_file())
+        self.assertEqual(second.get_json()['exported']['img']['overwritten'], 1)
 
 
 if __name__ == '__main__':
