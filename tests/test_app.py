@@ -57,6 +57,20 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse((outside / 'img' / 'secret.txt').exists())
 
+    def test_images_endpoint_lists_files_without_renaming_them(self):
+        dataset = self.root / 'demo'
+        self.save_image(dataset / 'img' / 'second.jpg', 'JPEG')
+        self.save_image(dataset / 'img' / 'first.png')
+        (dataset / 'img' / 'first.txt').write_text('caption', encoding='utf-8')
+
+        response = self.client.get('/api/images?folder=demo')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {'images': ['first.png', 'second.jpg']})
+        self.assertTrue((dataset / 'img' / 'first.png').is_file())
+        self.assertTrue((dataset / 'img' / 'second.jpg').is_file())
+        self.assertTrue((dataset / 'img' / 'first.txt').is_file())
+
     def test_cross_origin_mutation_is_rejected_and_cors_is_absent(self):
         rejected = self.client.post(
             '/api/create-dataset',

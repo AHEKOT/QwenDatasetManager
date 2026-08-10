@@ -1381,8 +1381,6 @@ def get_images():
     folder_path = request.args.get('folder', '')
     
     try:
-        return jsonify({'success': True, **process_reshuffle_job(None, folder_path)})
-
         dataset_dir = resolve_dataset_dir(folder_path, must_exist=True)
         img_dir = dataset_dir / 'img'
         
