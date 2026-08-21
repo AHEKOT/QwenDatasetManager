@@ -1577,17 +1577,21 @@ def delete_image(filename):
 
 @app.route('/api/transfer/<filename>', methods=['POST'])
 def transfer_image(filename):
-    """Transfer all related files (img, Control1-3, .txt) to another dataset folder, optionally from linked dataset too"""
+    """Transfer or copy related files to another dataset, optionally including a linked dataset."""
     source_folder = request.args.get('folder', '')
     data = request.get_json() or {}
     target_folder = data.get('targetFolder', '')
     linked_folder = data.get('linkedFolder', '')
+    operation = data.get('operation', 'transfer')
     
     if not source_folder or not target_folder:
         return jsonify({'error': 'Source and target folders are required'}), 400
     
     if source_folder == target_folder:
         return jsonify({'error': 'Source and target folders must be different'}), 400
+
+    if operation not in {'transfer', 'copy'}:
+        return jsonify({'error': 'Operation must be transfer or copy'}), 400
     
     try:
         target_dir = resolve_dataset_dir(target_folder, must_exist=True)
@@ -1618,7 +1622,7 @@ def transfer_image(filename):
                     break
             result_names[label] = new_basename
 
-            source_moves = []
+            source_files = []
             for folder_name in DATASET_IMAGE_FOLDERS:
                 source_subfolder = source_dir / folder_name
                 target_subfolder = target_dir / folder_name
@@ -1627,49 +1631,58 @@ def transfer_image(filename):
                 for extension in ('.png', '.jpg', '.jpeg', '.webp'):
                     source_file = source_subfolder / f'{basename}{extension}'
                     if source_file.is_file():
-                        source_moves.append((source_file, target_subfolder / f'{new_basename}{extension}'))
+                        source_files.append((source_file, target_subfolder / f'{new_basename}{extension}'))
                 if folder_name == 'img':
                     caption_source = source_subfolder / f'{basename}.txt'
                     if caption_source.is_file():
-                        source_moves.append((caption_source, target_subfolder / f'{new_basename}.txt'))
-            plans.append((label, source_moves))
+                        source_files.append((caption_source, target_subfolder / f'{new_basename}.txt'))
+            plans.append((label, source_files))
 
         if not plans[0][1]:
-            return jsonify({'error': 'No files found to transfer'}), 404
+            return jsonify({'error': f'No files found to {operation}'}), 404
         if any(destination.exists() for _, moves in plans for _, destination in moves):
-            return jsonify({'error': 'A generated target filename already exists; retry the transfer'}), 409
+            return jsonify({'error': f'A generated target filename already exists; retry the {operation}'}), 409
 
-        completed_moves = []
+        completed_files = []
         try:
             for _, moves in plans:
                 for source_file, target_file in moves:
                     target_file.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(source_file, target_file)
-                    completed_moves.append((source_file, target_file))
+                    if operation == 'copy':
+                        shutil.copy2(source_file, target_file)
+                    else:
+                        os.replace(source_file, target_file)
+                    completed_files.append((source_file, target_file))
         except Exception:
-            for source_file, target_file in reversed(completed_moves):
+            for source_file, target_file in reversed(completed_files):
                 try:
-                    os.replace(target_file, source_file)
+                    if operation == 'copy':
+                        target_file.unlink(missing_ok=True)
+                    else:
+                        os.replace(target_file, source_file)
                 except OSError:
                     pass
             raise
 
         def serialize_moves(moves):
+            serialization_root = DATASETS_DIR.parent.resolve()
             return [
                 {
-                    'from': str(source.relative_to(BASE_DIR)),
-                    'to': str(destination.relative_to(BASE_DIR))
+                    'from': str(source.relative_to(serialization_root)),
+                    'to': str(destination.relative_to(serialization_root))
                 }
                 for source, destination in moves
             ]
 
         response_data = {
             'success': True,
+            'operation': operation,
             'newFilename': f"{result_names['primary']}{original_ext}",
-            'transferred': serialize_moves(plans[0][1])
+            'copied' if operation == 'copy' else 'transferred': serialize_moves(plans[0][1])
         }
         if linked_folder:
-            response_data['linkedTransferred'] = serialize_moves(plans[1][1])
+            linked_key = 'linkedCopied' if operation == 'copy' else 'linkedTransferred'
+            response_data[linked_key] = serialize_moves(plans[1][1])
             response_data['linkedNewFilename'] = f"{result_names['linked']}{original_ext}"
         return jsonify(response_data)
         

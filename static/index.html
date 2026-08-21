@@ -687,10 +687,16 @@
         <div class="modal-content">
             <div class="transfer-header">
                 <div class="panel-section">
-                    <label for="target-dataset-select">Transfer to:</label>
+                    <label for="transfer-mode-select">Action:</label>
+                    <select id="transfer-mode-select">
+                        <option value="transfer">Transfer</option>
+                        <option value="copy">Copy</option>
+                    </select>
+                    <label for="target-dataset-select">Target dataset:</label>
                     <select id="target-dataset-select">
                         <option value="">-- Select target dataset --</option>
                     </select>
+                    <p id="transfer-mode-help" class="transfer-mode-help">Move this triplet to the selected dataset.</p>
                 </div>
 
                 <div class="panel-section">
@@ -905,7 +911,7 @@
 
                     <button id="transfer-btn" class="transfer-btn" title="Transfer to target dataset (↑)"
                         style="display: none;">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2">
                             <path d="M12 19V5M5 12l7-7 7 7"></path>
                         </svg>

@@ -56,7 +56,7 @@ Single-file Flask backend with these API endpoints:
 | `GET /api/image/<type>/<filename>?folder=X` | Serve image file (type: img/Control1/Control2/Control3) |
 | `GET/POST /api/caption/<filename>?folder=X` | Read/write .txt caption |
 | `DELETE /api/delete/<filename>` | Delete across all subfolders + optional linked dataset |
-| `POST /api/transfer/<filename>` | Move image set to another dataset with a new random 8-char basename |
+| `POST /api/transfer/<filename>` | Move or copy an image set to another dataset with a new random 8-char basename |
 | `POST /api/reshuffle` | Rename all files to random 8-char basenames |
 | `POST /api/compress` | Lossless PNG recompression using ThreadPoolExecutor |
 | `POST /api/augment/crop` | Crop image set; scales crop coords from reference (img) size to each control's actual size |
@@ -74,6 +74,6 @@ Frontend is `static/index.html` + `static/app.js` + `static/editor.js` (vanilla 
 
 ## Key Conventions
 
-- **Filenames**: Sequential `image_NNNNN.png` from the saver node; random 8-char alphanumeric from reshuffle/transfer operations in the web app.
+- **Filenames**: Sequential `image_NNNNN.png` from the saver node; random 8-char alphanumeric from reshuffle/transfer/copy operations in the web app.
 - **Crop scaling**: `augment/crop` receives coordinates relative to the `img/` folder image dimensions and scales them proportionally when applying to control images of different sizes.
 - **Datasets dir**: The web app resolves all datasets relative to `Datasets/` (sibling of `app.py`). The ComfyUI saver writes to ComfyUI's output directory.

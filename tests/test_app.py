@@ -134,6 +134,68 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertTrue((trash / 'img' / 'entry.txt').is_file())
         self.assertTrue((trash / 'Control1' / 'entry.jpg').is_file())
 
+    def test_transfer_moves_complete_image_set(self):
+        source = self.root / 'demo'
+        target = self.make_dataset('target')
+        self.save_image(source / 'img' / 'entry.png')
+        self.save_image(source / 'Control1' / 'entry.jpg', 'JPEG')
+        self.save_image(source / 'Control2' / 'entry.webp', 'WEBP')
+        (source / 'img' / 'entry.txt').write_text('caption', encoding='utf-8')
+
+        response = self.client.post(
+            '/api/transfer/entry.png?folder=demo',
+            json={'targetFolder': 'target', 'operation': 'transfer'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body['operation'], 'transfer')
+        new_stem = Path(body['newFilename']).stem
+        self.assertFalse((source / 'img' / 'entry.png').exists())
+        self.assertFalse((source / 'img' / 'entry.txt').exists())
+        self.assertFalse((source / 'Control1' / 'entry.jpg').exists())
+        self.assertFalse((source / 'Control2' / 'entry.webp').exists())
+        self.assertTrue((target / 'img' / f'{new_stem}.png').is_file())
+        self.assertEqual((target / 'img' / f'{new_stem}.txt').read_text(encoding='utf-8'), 'caption')
+        self.assertTrue((target / 'Control1' / f'{new_stem}.jpg').is_file())
+        self.assertTrue((target / 'Control2' / f'{new_stem}.webp').is_file())
+
+    def test_copy_keeps_original_complete_image_set(self):
+        source = self.root / 'demo'
+        target = self.make_dataset('target')
+        self.save_image(source / 'img' / 'entry.png')
+        self.save_image(source / 'Control1' / 'entry.jpg', 'JPEG')
+        self.save_image(source / 'Control2' / 'entry.webp', 'WEBP')
+        (source / 'img' / 'entry.txt').write_text('caption', encoding='utf-8')
+
+        response = self.client.post(
+            '/api/transfer/entry.png?folder=demo',
+            json={'targetFolder': 'target', 'operation': 'copy'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body['operation'], 'copy')
+        self.assertIn('copied', body)
+        new_stem = Path(body['newFilename']).stem
+        self.assertTrue((source / 'img' / 'entry.png').is_file())
+        self.assertEqual((source / 'img' / 'entry.txt').read_text(encoding='utf-8'), 'caption')
+        self.assertTrue((source / 'Control1' / 'entry.jpg').is_file())
+        self.assertTrue((source / 'Control2' / 'entry.webp').is_file())
+        self.assertTrue((target / 'img' / f'{new_stem}.png').is_file())
+        self.assertEqual((target / 'img' / f'{new_stem}.txt').read_text(encoding='utf-8'), 'caption')
+        self.assertTrue((target / 'Control1' / f'{new_stem}.jpg').is_file())
+        self.assertTrue((target / 'Control2' / f'{new_stem}.webp').is_file())
+
+    def test_transfer_rejects_unknown_operation(self):
+        self.make_dataset('target')
+        response = self.client.post(
+            '/api/transfer/entry.png?folder=demo',
+            json={'targetFolder': 'target', 'operation': 'clone'}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['error'], 'Operation must be transfer or copy')
+
     def test_reshuffle_keeps_all_related_stems_synchronized(self):
         dataset = self.root / 'demo'
         for index in range(3):

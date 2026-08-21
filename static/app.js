@@ -1,6 +1,7 @@
 // State management
 let currentFolder = '';
-let targetFolder = ''; // For transfer functionality
+let targetFolder = ''; // For transfer/copy functionality
+let transferMode = 'transfer';
 let images = [];
 let blurPreviewFilename = '';
 let mirrorPreviewFilename = '';
@@ -168,6 +169,8 @@ const exportProgressSummary = document.getElementById('export-progress-summary')
 const exportProgressDetails = document.getElementById('export-progress-details');
 const opacitySlider = document.getElementById('opacity-slider');
 const opacityValueDisplay = document.getElementById('opacity-value');
+const transferModeSelect = document.getElementById('transfer-mode-select');
+const transferModeHelp = document.getElementById('transfer-mode-help');
 const targetDatasetSelect = document.getElementById('target-dataset-select');
 const transferBtn = document.getElementById('transfer-btn');
 const captionText = document.getElementById('caption-text');
@@ -1972,6 +1975,34 @@ function updateTargetDatasetSelect() {
     transferBtn.style.display = 'none';
 }
 
+function transferActionMarkup(mode) {
+    if (mode === 'copy') {
+        return `
+            <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+            Copy (↑)
+        `;
+    }
+    return `
+        <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 19V5M5 12l7-7 7 7"></path>
+        </svg>
+        Transfer (↑)
+    `;
+}
+
+function updateTransferMode(value) {
+    transferMode = value === 'copy' ? 'copy' : 'transfer';
+    const actionLabel = transferMode === 'copy' ? 'Copy' : 'Transfer';
+    transferBtn.innerHTML = transferActionMarkup(transferMode);
+    transferBtn.title = `${actionLabel} to target dataset (↑)`;
+    transferModeHelp.textContent = transferMode === 'copy'
+        ? 'Copy this triplet to the selected dataset and keep the original.'
+        : 'Move this triplet to the selected dataset.';
+}
+
 // Handle target dataset selection
 function onTargetDatasetChange(value) {
     targetFolder = value;
@@ -2225,19 +2256,21 @@ function updateOpacity(value) {
     }
 }
 
-// Transfer current image to target dataset
+// Transfer or copy the current image set to the target dataset
 async function transferCurrentImage() {
     if (images.length === 0 || !targetFolder) return;
     if (!await checkUnsavedWork()) return;
 
     const filename = images[currentIndex];
+    const activeMode = transferMode;
+    const actionLabel = activeMode === 'copy' ? 'Copy' : 'Transfer';
 
     try {
         transferBtn.disabled = true;
-        transferBtn.textContent = 'Transferring...';
+        transferBtn.textContent = activeMode === 'copy' ? 'Copying...' : 'Transferring...';
 
         // Build request body with optional linked folder
-        const requestBody = { targetFolder: targetFolder };
+        const requestBody = { targetFolder: targetFolder, operation: activeMode };
         if (linkedDataset) {
             requestBody.linkedFolder = linkedDataset;
         }
@@ -2254,46 +2287,40 @@ async function transferCurrentImage() {
         const data = await response.json();
 
         if (data.success) {
-            // Remove from images array (file was moved)
-            images.splice(currentIndex, 1);
+            if (activeMode === 'transfer') {
+                // Remove from images array because the source files were moved.
+                images.splice(currentIndex, 1);
 
-            // Partial DOM update: remove the transferred element
-            const gridItem = imageGrid.querySelector(`.image-item[data-index="${currentIndex}"]`);
-            if (gridItem) {
-                gridItem.remove();
-                // Update indices for all subsequent items
-                const items = imageGrid.querySelectorAll('.image-item');
-                items.forEach((item, idx) => item.dataset.index = idx);
-            }
-
-            // Update UI
-            if (images.length === 0) {
-                closePreview();
-                updateImageCount();
-                imageGrid.innerHTML = '<div class="empty-state"><p>📷 No images found in this folder</p></div>';
-            } else {
-                if (currentIndex >= images.length) {
-                    currentIndex = images.length - 1;
+                const gridItem = imageGrid.querySelector(`.image-item[data-index="${currentIndex}"]`);
+                if (gridItem) {
+                    gridItem.remove();
+                    const items = imageGrid.querySelectorAll('.image-item');
+                    items.forEach((item, idx) => item.dataset.index = idx);
                 }
-                updatePreview();
-                updateImageCount();
+
+                if (images.length === 0) {
+                    closePreview();
+                    updateImageCount();
+                    imageGrid.innerHTML = '<div class="empty-state"><p>📷 No images found in this folder</p></div>';
+                } else {
+                    if (currentIndex >= images.length) {
+                        currentIndex = images.length - 1;
+                    }
+                    updatePreview();
+                    updateImageCount();
+                }
             }
 
-            console.log('Transferred:', data.transferred);
+            console.log(`${actionLabel} complete:`, activeMode === 'copy' ? data.copied : data.transferred);
         } else {
-            alert(`Failed to transfer: ${data.error || 'Unknown error'}`);
+            alert(`Failed to ${activeMode}: ${data.error || 'Unknown error'}`);
         }
     } catch (error) {
-        console.error('Failed to transfer image:', error);
-        alert('Failed to transfer image. Check console for details.');
+        console.error(`Failed to ${activeMode} image:`, error);
+        alert(`Failed to ${activeMode} image. Check console for details.`);
     } finally {
         transferBtn.disabled = false;
-        transferBtn.innerHTML = `
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 19V5M5 12l7-7 7 7"></path>
-            </svg>
-            Transfer (↑)
-        `;
+        updateTransferMode(transferMode);
     }
 }
 
@@ -3096,6 +3123,10 @@ function setupEventListeners() {
     });
 
     // Target dataset selection
+    transferModeSelect.addEventListener('change', (e) => {
+        updateTransferMode(e.target.value);
+    });
+
     targetDatasetSelect.addEventListener('change', (e) => {
         onTargetDatasetChange(e.target.value);
     });
@@ -3130,8 +3161,8 @@ function setupEventListeners() {
             return;
         }
 
-        // Don't trigger navigation if user is typing in the caption textarea
-        if (document.activeElement === captionText) {
+        // Let text and select controls handle their own keyboard input.
+        if (document.activeElement === captionText || document.activeElement?.tagName === 'SELECT') {
             return;
         }
 
