@@ -191,10 +191,28 @@ const unlinkBtn = document.getElementById('unlink-btn');
 // ── Session persistence ────────────────────────────────────────────────────
 const SESSION_KEY = 'qdm_session';
 const IMPORT_CACHE_KEY = 'qdm_import_cache';
+const EXPORT_PATH_KEY = 'qdm_export_path';
 let _saveTimer = null;
-let lastExportPath = '';
+let lastExportPath = loadLocalExportPath();
 const toolPollTimers = new Map();
 const toolJobContexts = new Map();
+
+function loadLocalExportPath() {
+    try {
+        return localStorage.getItem(EXPORT_PATH_KEY) || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+function persistExportPath(path) {
+    lastExportPath = path.trim();
+    try {
+        localStorage.setItem(EXPORT_PATH_KEY, lastExportPath);
+    } catch (e) {
+        console.warn('Failed to persist export path:', e);
+    }
+}
 
 function loadImportCache() {
     try {
@@ -2732,7 +2750,7 @@ async function exportDataset() {
     }
 
     try {
-        lastExportPath = exportPath;
+        persistExportPath(exportPath);
         exportModalError.textContent = '';
         exportModalError.classList.add('hidden');
         exportBtn.disabled = true;
@@ -3087,6 +3105,7 @@ function setupEventListeners() {
     exportCancelBtn.addEventListener('click', closeExportModal);
     exportSubmitBtn.addEventListener('click', exportDataset);
     exportPathInput.addEventListener('input', () => {
+        persistExportPath(exportPathInput.value);
         exportModalError.textContent = '';
         exportModalError.classList.add('hidden');
     });
