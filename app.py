@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from PIL import Image as PillowImage
+from trainer_service import TrainerService, create_trainer_blueprint
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('QDM_MAX_UPLOAD_MB', '128')) * 1024 * 1024
@@ -38,6 +39,10 @@ MAX_RETAINED_JOBS = 200
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
+
+TRAINER_SERVICE = TrainerService(BASE_DIR, lambda: DATASETS_DIR)
+app.register_blueprint(create_trainer_blueprint(TRAINER_SERVICE))
+TRAINER_SERVICE.start_worker()
 
 
 class InvalidPathError(ValueError):
@@ -121,6 +126,9 @@ def utc_now_iso():
 
 def claim_datasets(names, owner_id):
     normalized = sorted({validate_dataset_name(name) for name in names if name})
+    trainer_conflicts = sorted(set(normalized) & TRAINER_SERVICE.active_dataset_names())
+    if trainer_conflicts:
+        return trainer_conflicts
     with ACTIVE_DATASETS_LOCK:
         conflicts = [name for name in normalized if name in ACTIVE_DATASETS]
         if conflicts:
@@ -1178,6 +1186,12 @@ def run_tool_job(job_id, tool_name, payload):
 def index():
     """Serve the main HTML page"""
     return send_from_directory('static', 'index.html')
+
+
+@app.route('/trainer')
+def trainer_page():
+    """Serve the integrated CUDA trainer page."""
+    return send_from_directory('static', 'trainer.html')
 
 @app.route('/api/save/<filename>', methods=['POST'])
 def save_image(filename):

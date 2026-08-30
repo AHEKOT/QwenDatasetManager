@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen Dataset Manager — Trainer</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/trainer.css">
+</head>
+
+<body class="trainer-page">
+    <div class="trainer-app">
+        <header class="trainer-topbar">
+            <div class="trainer-topbar-start">
+                <a href="/" class="trainer-back-btn" aria-label="Back to Dataset Manager" title="Back to datasets">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M19 12H5"></path><path d="m12 19-7-7 7-7"></path>
+                    </svg>
+                </a>
+                <div>
+                    <span class="trainer-kicker">Qwen Dataset Manager</span>
+                    <h1>CUDA Trainer</h1>
+                </div>
+            </div>
+            <div class="trainer-topbar-actions">
+                <span id="trainer-runtime-status" class="runtime-pill is-checking">Checking runtime…</span>
+                <button id="trainer-settings-btn" class="trainer-icon-btn" type="button" aria-label="Trainer settings" title="Trainer settings">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06-2.83 2.83-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21h-4v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06-2.83-2.83.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3v-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06 2.83-2.83.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3h4v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06 2.83 2.83-.06.06A1.65 1.65 0 0 0 19.4 9c.12.37.46.63.85.63H21v4h-.09c-.39 0-.73.26-.85.63z"></path>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <div class="trainer-layout">
+            <aside class="trainer-jobs-panel" aria-label="Training jobs">
+                <div class="trainer-jobs-header">
+                    <div>
+                        <span class="trainer-section-label">Jobs</span>
+                        <strong id="trainer-job-count">0 training jobs</strong>
+                    </div>
+                    <button id="trainer-new-job-btn" class="trainer-primary-icon-btn" type="button" aria-label="Create training job" title="New training job">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                            <path d="M12 5v14M5 12h14"></path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="trainer-job-filters" role="group" aria-label="Filter jobs">
+                    <button class="trainer-filter is-active" type="button" data-job-filter="all">All</button>
+                    <button class="trainer-filter" type="button" data-job-filter="active">Active</button>
+                    <button class="trainer-filter" type="button" data-job-filter="finished">Finished</button>
+                </div>
+                <div id="trainer-jobs-list" class="trainer-jobs-list" data-preserve-scroll="jobs">
+                    <div class="trainer-empty-list">
+                        <strong>No jobs yet</strong>
+                        <span>Create a LoRA training job from your existing datasets.</span>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="trainer-workspace">
+                <section id="trainer-runtime-banner" class="trainer-runtime-banner hidden" role="status">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9"></circle><path d="M12 8v5M12 17h.01"></path>
+                    </svg>
+                    <div>
+                        <strong>CUDA trainer is not installed</strong>
+                        <span>The form and queue are available. Run the trainer installer on the NVIDIA machine before starting a job.</span>
+                    </div>
+                </section>
+
+                <section id="trainer-editor-view" class="trainer-view">
+                    <form id="trainer-job-form" novalidate>
+                        <div class="trainer-view-header">
+                            <div>
+                                <span id="trainer-editor-kicker" class="trainer-kicker">New training job</span>
+                                <h2 id="trainer-editor-title">Configure LoRA training</h2>
+                                <p>Target images and Control1–3 are mapped directly from the selected datasets.</p>
+                            </div>
+                            <div class="trainer-header-actions">
+                                <button id="trainer-cancel-edit-btn" class="trainer-btn trainer-btn-ghost hidden" type="button">Cancel</button>
+                                <button id="trainer-save-btn" class="trainer-btn trainer-btn-secondary" type="submit">Save job</button>
+                                <button id="trainer-save-start-btn" class="trainer-btn trainer-btn-primary" type="button">
+                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7V5z"></path></svg>
+                                    Save &amp; queue
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="trainer-form-error" class="trainer-form-error hidden" role="alert"></div>
+
+                        <div class="trainer-card-grid trainer-card-grid-top">
+                            <section class="trainer-card">
+                                <div class="trainer-card-heading"><span>Job</span></div>
+                                <div class="trainer-fields">
+                                    <label class="trainer-field" for="trainer-name">
+                                        <span>Training name</span>
+                                        <input id="trainer-name" name="name" type="text" value="qdm_edit_lora_v1" maxlength="96" required autocomplete="off" spellcheck="false">
+                                    </label>
+                                    <label class="trainer-field" for="trainer-gpu">
+                                        <span>GPU</span>
+                                        <select id="trainer-gpu" name="gpuIds"><option value="0">GPU 0</option></select>
+                                    </label>
+                                    <label class="trainer-field" for="trainer-trigger">
+                                        <span>Trigger word <small>optional</small></span>
+                                        <input id="trainer-trigger" name="triggerWord" type="text" autocomplete="off">
+                                    </label>
+                                </div>
+                            </section>
+
+                            <section class="trainer-card trainer-card-model">
+                                <div class="trainer-card-heading"><span>Model</span><span id="trainer-model-license" class="trainer-card-badge">Apache-2.0</span></div>
+                                <div class="trainer-fields">
+                                    <label class="trainer-field" for="trainer-model">
+                                        <span>Edit architecture</span>
+                                        <select id="trainer-model" name="model"></select>
+                                    </label>
+                                    <label class="trainer-field" for="trainer-model-path">
+                                        <span>Name or path</span>
+                                        <input id="trainer-model-path" type="text" autocomplete="off" spellcheck="false" required>
+                                    </label>
+                                    <a id="trainer-model-gate" class="trainer-model-note hidden" href="#" target="_blank" rel="noopener noreferrer">Gated model — accept access on Hugging Face</a>
+                                    <div class="trainer-toggle-row">
+                                        <label class="trainer-switch"><input id="trainer-low-vram" type="checkbox" checked><span></span>Low VRAM</label>
+                                        <label class="trainer-switch"><input id="trainer-match-resolution" type="checkbox"><span></span>Match target resolution</label>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section class="trainer-card">
+                                <div class="trainer-card-heading"><span>Quantize / compile</span></div>
+                                <div class="trainer-fields">
+                                    <label class="trainer-field" for="trainer-qtype">
+                                        <span>Transformer</span>
+                                        <select id="trainer-qtype" name="qtype"></select>
+                                    </label>
+                                    <label class="trainer-field" for="trainer-qtype-te">
+                                        <span>Text encoder</span>
+                                        <select id="trainer-qtype-te" name="qtypeTextEncoder"></select>
+                                    </label>
+                                    <div class="trainer-toggle-row">
+                                        <label class="trainer-switch"><input id="trainer-compile" type="checkbox"><span></span>Compile model</label>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section class="trainer-card">
+                                <div class="trainer-card-heading"><span>Target / save</span></div>
+                                <div class="trainer-fields trainer-two-columns">
+                                    <label class="trainer-field" for="trainer-network-type"><span>Target type</span><select id="trainer-network-type"><option value="lora">LoRA</option><option value="lokr">LoKr</option></select></label>
+                                    <label id="trainer-rank-field" class="trainer-field" for="trainer-rank"><span>Linear rank</span><input id="trainer-rank" type="number" min="1" max="1024" value="32"></label>
+                                    <label id="trainer-lokr-factor-field" class="trainer-field hidden" for="trainer-lokr-factor"><span>LoKr factor</span><select id="trainer-lokr-factor"><option value="-1">Auto</option><option value="4">4</option><option value="8">8</option><option value="16">16</option><option value="32">32</option></select></label>
+                                    <label class="trainer-field" for="trainer-save-dtype"><span>Save dtype</span><select id="trainer-save-dtype"><option value="bf16">BF16</option><option value="fp16">FP16</option><option value="fp32">FP32</option></select></label>
+                                    <label class="trainer-field" for="trainer-save-every"><span>Save every</span><input id="trainer-save-every" type="number" min="1" value="250"></label>
+                                    <label class="trainer-field" for="trainer-max-saves"><span>Max saves</span><input id="trainer-max-saves" type="number" min="1" max="1000" value="4"></label>
+                                </div>
+                            </section>
+                        </div>
+
+                        <section class="trainer-card trainer-wide-card">
+                            <div class="trainer-card-heading"><span>Training</span></div>
+                            <div class="trainer-training-grid">
+                                <label class="trainer-field" for="trainer-batch-size"><span>Batch size</span><input id="trainer-batch-size" type="number" min="1" max="128" value="1"></label>
+                                <label class="trainer-field" for="trainer-gradient-accumulation"><span>Gradient accumulation</span><input id="trainer-gradient-accumulation" type="number" min="1" max="1024" value="1"></label>
+                                <label class="trainer-field" for="trainer-steps"><span>Steps</span><input id="trainer-steps" type="number" min="1" value="3000"></label>
+                                <label class="trainer-field" for="trainer-learning-rate"><span>Learning rate</span><input id="trainer-learning-rate" type="number" min="0" step="0.000001" value="0.0001"></label>
+                                <label class="trainer-field" for="trainer-optimizer"><span>Optimizer</span><select id="trainer-optimizer"><option value="adafactor">Adafactor</option><option value="adam">Adam</option><option value="adamw">AdamW</option><option value="adamw8bit" selected>AdamW8Bit</option><option value="automagic">Automagic</option><option value="automagic2">Automagic v2</option><option value="automagic3">Automagic v3</option><option value="prodigyopt">Prodigy</option><option value="prodigy8bit">Prodigy8Bit</option></select></label>
+                                <label class="trainer-field" for="trainer-weight-decay"><span>Weight decay</span><input id="trainer-weight-decay" type="number" min="0" step="0.00001" value="0.0001"></label>
+                                <label class="trainer-field" for="trainer-timestep"><span>Timestep type</span><select id="trainer-timestep"><option value="weighted">Weighted</option><option value="sigmoid">Sigmoid</option><option value="shift">Shift</option><option value="linear">Linear</option></select></label>
+                                <label class="trainer-field" for="trainer-timestep-bias"><span>Timestep bias</span><select id="trainer-timestep-bias"><option value="balanced">Balanced</option><option value="content">High noise</option><option value="style">Low noise</option></select></label>
+                                <label class="trainer-field" for="trainer-loss"><span>Loss type</span><select id="trainer-loss"><option value="mse">Mean Squared Error</option><option value="mae">Mean Absolute Error</option><option value="wavelet">Wavelet</option><option value="stepped">Stepped Recovery</option></select></label>
+                                <label class="trainer-field" for="trainer-noise-scheduler"><span>Noise scheduler</span><input id="trainer-noise-scheduler" type="text" value="FlowMatch" readonly></label>
+                            </div>
+                            <div class="trainer-toggle-row trainer-training-toggles">
+                                <label id="trainer-unload-text-wrap" class="trainer-switch"><input id="trainer-unload-text" type="checkbox"><span></span>Unload TE</label>
+                                <label class="trainer-switch"><input id="trainer-cache-text" type="checkbox"><span></span>Cache text embeddings</label>
+                                <label class="trainer-switch"><input id="trainer-use-ema" type="checkbox"><span></span>Use EMA</label>
+                                <label id="trainer-ema-decay-field" class="trainer-inline-number hidden" for="trainer-ema-decay">EMA decay <input id="trainer-ema-decay" type="number" min="0" max="1" step="0.001" value="0.99"></label>
+                            </div>
+                        </section>
+
+                        <details class="trainer-advanced trainer-wide-card">
+                            <summary>Regularization and guidance</summary>
+                            <div class="trainer-option-groups">
+                                <section>
+                                    <label class="trainer-switch"><input id="trainer-dop" type="checkbox"><span></span>Differential Output Preservation</label>
+                                    <div id="trainer-dop-options" class="trainer-fields trainer-two-columns hidden">
+                                        <label class="trainer-field" for="trainer-dop-multiplier"><span>DOP loss multiplier</span><input id="trainer-dop-multiplier" type="number" min="0" step="0.1" value="1"></label>
+                                        <label class="trainer-field" for="trainer-dop-class"><span>DOP preservation class</span><input id="trainer-dop-class" type="text" value="person"></label>
+                                    </div>
+                                </section>
+                                <section>
+                                    <label class="trainer-switch"><input id="trainer-bpp" type="checkbox"><span></span>Blank Prompt Preservation</label>
+                                    <div id="trainer-bpp-options" class="trainer-fields hidden">
+                                        <label class="trainer-field" for="trainer-bpp-multiplier"><span>BPP loss multiplier</span><input id="trainer-bpp-multiplier" type="number" min="0" step="0.1" value="1"></label>
+                                    </div>
+                                </section>
+                                <section>
+                                    <label class="trainer-switch"><input id="trainer-guidance-loss" type="checkbox"><span></span>Contrastive Guidance Loss</label>
+                                    <div id="trainer-guidance-loss-options" class="trainer-fields hidden">
+                                        <label class="trainer-field" for="trainer-guidance-loss-target"><span>Guidance loss target</span><input id="trainer-guidance-loss-target" type="number" min="0" step="0.1" value="4"></label>
+                                    </div>
+                                </section>
+                                <section>
+                                    <label class="trainer-switch"><input id="trainer-differential-guidance" type="checkbox"><span></span>Do Differential Guidance</label>
+                                    <div id="trainer-differential-guidance-options" class="trainer-fields hidden">
+                                        <label class="trainer-field" for="trainer-differential-guidance-scale"><span>Differential guidance scale</span><input id="trainer-differential-guidance-scale" type="number" min="0" step="0.1" value="3"></label>
+                                    </div>
+                                </section>
+                            </div>
+                        </details>
+
+                        <section class="trainer-card trainer-wide-card trainer-datasets-section">
+                            <div class="trainer-card-heading trainer-datasets-heading">
+                                <div><span>Datasets</span><small id="trainer-dataset-summary">Select one or more managed datasets</small></div>
+                                <div class="trainer-dataset-picker">
+                                    <label class="sr-only" for="trainer-dataset-select">Dataset</label>
+                                    <select id="trainer-dataset-select"><option value="">Select dataset…</option></select>
+                                    <button id="trainer-add-dataset-btn" class="trainer-btn trainer-btn-secondary" type="button">Add dataset</button>
+                                </div>
+                            </div>
+                            <div id="trainer-selected-datasets" class="trainer-selected-datasets">
+                                <div class="trainer-empty-datasets">
+                                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg>
+                                    <strong>No datasets selected</strong>
+                                    <span>Choose a dataset above. Target and control folders will be mapped automatically.</span>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="trainer-card trainer-wide-card">
+                            <div class="trainer-card-heading">
+                                <span>Validation</span>
+                                <label class="trainer-switch"><input id="trainer-validation-enabled" type="checkbox"><span></span>Enable</label>
+                            </div>
+                            <div id="trainer-validation-options" class="hidden">
+                                <div class="trainer-validation-grid">
+                                    <label class="trainer-field" for="trainer-validation-every"><span>Validate every</span><input id="trainer-validation-every" type="number" min="1" value="1"></label>
+                                    <label class="trainer-field" for="trainer-validation-resolution"><span>Validation resolution</span><input id="trainer-validation-resolution" type="number" min="64" max="4096" value="1024"></label>
+                                    <label class="trainer-field" for="trainer-validation-sigmas"><span>Validation sigmas</span><select id="trainer-validation-sigmas"><option value="0.5">0.5</option><option value="1,0.5">1.0, 0.5</option><option value="1,0.66,0.33">1.0, 0.66, 0.33</option><option value="1,0.75,0.5,0.25">1.0, 0.75, 0.5, 0.25</option></select></label>
+                                </div>
+                                <div id="trainer-validation-items" class="trainer-repeat-list"></div>
+                                <button id="trainer-add-validation-btn" class="trainer-btn trainer-btn-secondary trainer-full-btn" type="button">Add validation image</button>
+                            </div>
+                        </section>
+
+                        <details class="trainer-advanced trainer-wide-card" open>
+                            <summary>Sampling</summary>
+                            <div class="trainer-sampling-content">
+                                <div class="trainer-sampling-grid">
+                                    <label class="trainer-field" for="trainer-sample-every"><span>Sample every</span><input id="trainer-sample-every" type="number" min="1" value="250"></label>
+                                    <label class="trainer-field" for="trainer-sample-start"><span>Sample start step</span><input id="trainer-sample-start" type="number" min="0" value="0"></label>
+                                    <label class="trainer-field" for="trainer-sampler"><span>Sampler</span><select id="trainer-sampler"><option value="flowmatch">FlowMatch</option><option value="ddpm">DDPM</option></select></label>
+                                    <label class="trainer-field" for="trainer-guidance-scale"><span>Guidance scale</span><input id="trainer-guidance-scale" type="number" min="0" step="0.1" value="4"></label>
+                                    <label class="trainer-field" for="trainer-sample-steps"><span>Sample steps</span><input id="trainer-sample-steps" type="number" min="1" value="30"></label>
+                                    <label class="trainer-field" for="trainer-sample-width"><span>Width</span><input id="trainer-sample-width" type="number" min="64" max="4096" value="1024"></label>
+                                    <label class="trainer-field" for="trainer-sample-height"><span>Height</span><input id="trainer-sample-height" type="number" min="64" max="4096" value="1024"></label>
+                                    <label class="trainer-field" for="trainer-sample-seed"><span>Seed</span><input id="trainer-sample-seed" type="number" min="0" value="42"></label>
+                                </div>
+                                <div class="trainer-toggle-row trainer-training-toggles">
+                                    <label class="trainer-switch"><input id="trainer-walk-seed" type="checkbox" checked><span></span>Walk seed</label>
+                                    <label class="trainer-switch"><input id="trainer-skip-first-sample" type="checkbox"><span></span>Skip first sample</label>
+                                    <label class="trainer-switch"><input id="trainer-force-first-sample" type="checkbox"><span></span>Force first sample</label>
+                                    <label class="trainer-switch"><input id="trainer-disable-sampling" type="checkbox" checked><span></span>Disable sampling</label>
+                                </div>
+                                <div class="trainer-sample-list-heading">
+                                    <span id="trainer-sample-count">Sample prompts (0)</span>
+                                </div>
+                                <div id="trainer-sample-items" class="trainer-repeat-list"></div>
+                                <button id="trainer-add-sample-btn" class="trainer-btn trainer-btn-secondary trainer-full-btn" type="button">Add edit sample</button>
+                            </div>
+                        </details>
+
+                        <details class="trainer-advanced">
+                            <summary>Advanced memory settings</summary>
+                            <div class="trainer-advanced-grid">
+                                <label class="trainer-switch"><input id="trainer-layer-offloading" type="checkbox"><span></span>Layer offloading</label>
+                                <div id="trainer-offload-sliders" class="trainer-offload-sliders hidden">
+                                    <label class="trainer-slider-field" for="trainer-transformer-offload">
+                                        <span>Transformer offload %</span>
+                                        <div class="trainer-slider-control">
+                                            <div class="trainer-slider-main">
+                                                <input id="trainer-transformer-offload" type="range" min="0" max="100" step="1" value="100">
+                                                <span class="trainer-slider-limits" aria-hidden="true"><span>0</span><span>100</span></span>
+                                            </div>
+                                            <output id="trainer-transformer-offload-value" for="trainer-transformer-offload">100</output>
+                                        </div>
+                                    </label>
+                                    <label class="trainer-slider-field" for="trainer-text-offload">
+                                        <span>Text encoder offload %</span>
+                                        <div class="trainer-slider-control">
+                                            <div class="trainer-slider-main">
+                                                <input id="trainer-text-offload" type="range" min="0" max="100" step="1" value="100">
+                                                <span class="trainer-slider-limits" aria-hidden="true"><span>0</span><span>100</span></span>
+                                            </div>
+                                            <output id="trainer-text-offload-value" for="trainer-text-offload">100</output>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+                        </details>
+
+                        <details class="trainer-advanced trainer-wide-card">
+                            <summary>Advanced AI Toolkit process config</summary>
+                            <div class="trainer-advanced-config">
+                                <p>This is the upstream advanced editor equivalent, restricted to the selected edit architecture and managed dataset paths. Generate the process JSON, edit any AI Toolkit process setting, then enable the override.</p>
+                                <div class="trainer-toggle-row">
+                                    <button id="trainer-generate-config-btn" class="trainer-btn trainer-btn-secondary" type="button">Generate from form</button>
+                                    <button id="trainer-clear-config-btn" class="trainer-btn trainer-btn-ghost" type="button">Clear override</button>
+                                    <label class="trainer-switch"><input id="trainer-use-advanced-config" type="checkbox"><span></span>Use edited process config</label>
+                                </div>
+                                <label class="trainer-field" for="trainer-advanced-config-json"><span>AI Toolkit process JSON</span><textarea id="trainer-advanced-config-json" rows="24" spellcheck="false" autocomplete="off"></textarea></label>
+                            </div>
+                        </details>
+                    </form>
+                </section>
+
+                <section id="trainer-detail-view" class="trainer-view hidden">
+                    <div class="trainer-view-header trainer-detail-header">
+                        <div>
+                            <span id="trainer-detail-kicker" class="trainer-kicker">Training job</span>
+                            <h2 id="trainer-detail-name">Job</h2>
+                            <p id="trainer-detail-model">Model</p>
+                        </div>
+                        <div class="trainer-header-actions">
+                            <button id="trainer-save-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Save now</button>
+                            <button id="trainer-sample-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Sample now</button>
+                            <button id="trainer-edit-job-btn" class="trainer-btn trainer-btn-secondary" type="button">Edit</button>
+                            <button id="trainer-delete-job-btn" class="trainer-btn trainer-btn-danger" type="button">Delete</button>
+                            <button id="trainer-stop-job-btn" class="trainer-btn trainer-btn-danger hidden" type="button">Stop</button>
+                            <button id="trainer-start-job-btn" class="trainer-btn trainer-btn-primary" type="button">
+                                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7V5z"></path></svg>
+                                Queue job
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="trainer-detail-grid">
+                        <section class="trainer-card trainer-progress-card">
+                            <div class="trainer-progress-top">
+                                <div><span id="trainer-detail-status" class="trainer-status-pill">Stopped</span><strong id="trainer-detail-info">Ready</strong></div>
+                                <strong id="trainer-detail-percent">0%</strong>
+                            </div>
+                            <div class="trainer-progress-track"><div id="trainer-detail-progress" class="trainer-progress-fill"></div></div>
+                            <div class="trainer-progress-meta">
+                                <span id="trainer-detail-step">0 / 0 steps</span>
+                                <span id="trainer-detail-speed">Waiting</span>
+                                <span id="trainer-detail-gpu">GPU 0</span>
+                            </div>
+                        </section>
+                        <section class="trainer-card trainer-summary-card">
+                            <div class="trainer-card-heading"><span>Configuration</span></div>
+                            <dl id="trainer-detail-config"></dl>
+                        </section>
+                    </div>
+
+                    <section class="trainer-card trainer-log-card">
+                        <div class="trainer-card-heading trainer-log-heading">
+                            <div><span>Trainer log</span><small>Last 200 KB</small></div>
+                            <div>
+                                <a id="trainer-download-log" class="trainer-btn trainer-btn-ghost" href="#">Download</a>
+                                <button id="trainer-refresh-log-btn" class="trainer-btn trainer-btn-secondary" type="button">Refresh</button>
+                            </div>
+                        </div>
+                        <pre id="trainer-log-output" tabindex="0">No log output yet.</pre>
+                    </section>
+                </section>
+            </main>
+        </div>
+    </div>
+
+    <div id="trainer-settings-modal" class="trainer-modal hidden" role="dialog" aria-modal="true" aria-labelledby="trainer-settings-title">
+        <div class="trainer-modal-card">
+            <div class="trainer-modal-header">
+                <div><span class="trainer-kicker">Trainer settings</span><h2 id="trainer-settings-title">Hugging Face access</h2></div>
+                <button id="trainer-settings-close" class="trainer-icon-btn" type="button" aria-label="Close settings">✕</button>
+            </div>
+            <p>FLUX.2 Klein 9B is gated. The token is stored locally in the trainer SQLite database and is never returned by the API.</p>
+            <label class="trainer-field" for="trainer-hf-token"><span>Hugging Face token</span><input id="trainer-hf-token" type="password" placeholder="hf_…" autocomplete="off"></label>
+            <label class="trainer-switch trainer-clear-token"><input id="trainer-clear-token" type="checkbox"><span></span>Remove saved token</label>
+            <div class="trainer-runtime-details">
+                <span>Upstream</span><code id="trainer-upstream-commit">—</code>
+            </div>
+            <div class="trainer-modal-actions">
+                <button id="trainer-settings-cancel" class="trainer-btn trainer-btn-ghost" type="button">Cancel</button>
+                <button id="trainer-settings-save" class="trainer-btn trainer-btn-primary" type="button">Save settings</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
+    <script src="/static/trainer.js?v=1"></script>
+</body>
+
+</html>

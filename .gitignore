@@ -6,3 +6,7 @@ Datasets/*
 .venv
 __pycache__
 
+# Local CUDA trainer runtime and generated artifacts
+trainer/.venv/
+trainer/output/
+trainer/trainer.db*

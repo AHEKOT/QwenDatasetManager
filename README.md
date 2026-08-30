@@ -12,6 +12,7 @@ A local web application for managing, reviewing, editing, and transforming Qwen 
 - 🧰 **Dataset Tools** - Reshuffle, compress, fit, blur, mirror, merge, import, export, and duplicate review
 - ✏️ **Editing** - Paint/crop images and edit captions with synchronized controls
 - 🗑️ **Recoverable Deletion** - Move complete image/control/caption sets into a hidden `.trash` folder
+- 🚀 **CUDA Trainer** - Train LoRAs for Qwen Image Edit 2511 and FLUX.2 Klein Base 4B/9B from one or more managed datasets
 
 ## Dataset Structure
 
@@ -43,6 +44,38 @@ All three folders must contain images with matching filenames (e.g., `image_0000
    Navigate to `http://127.0.0.1:5001`
 
 The server binds to localhost by default. To deliberately expose it on another interface, set `QDM_HOST` and list accepted hostnames in `QDM_TRUSTED_HOSTS`; use a trusted network and a reverse proxy with authentication. `QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are also configurable environment variables.
+
+### CUDA trainer installation
+
+The trainer is a separate, optional environment. Install it only on a Linux or Windows machine with an NVIDIA GPU:
+
+```bash
+# Linux
+./install_trainer.sh
+
+# Windows
+install_trainer.cmd
+```
+
+The installer intentionally keeps the CUDA dependency set used by the vendored AI Toolkit backend. It does not provide a macOS or MPS fallback. After installation, restart the app and open **Trainer** from the main screen.
+
+The trainer supports:
+
+- Qwen Image Edit 2511
+- FLUX.2 Klein Base 4B
+- FLUX.2 Klein Base 9B (gated model; requires Hugging Face access and is subject to the FLUX non-commercial license)
+
+Each selected dataset is passed to AI Toolkit as a separate dataset entry: `img/` is the target and every present `Control1/`, `Control2/`, and `Control3/` folder is a control-image source. Jobs, queue state, progress, and logs are stored under `trainer/`; model checkpoints are written to `trainer/output/`.
+
+The training screen mirrors the AI Toolkit LoRA Trainer settings that apply to
+these three edit architectures: the complete transformer/text-encoder
+quantization lists (including Qwen 2511 ARA), LoRA and LoKr, validation,
+sampling, schedulers, EMA, regularization, compilation and layer offloading.
+`Name or Path` accepts either a local model path or a Hugging Face repository;
+the vendored backend downloads Hugging Face models in the same way as AI
+Toolkit and uses the token saved in Trainer settings. See
+[`trainer/PARITY.md`](trainer/PARITY.md) for the audited field matrix and the
+architecture-specific restrictions retained from upstream.
 
 ## Usage
 

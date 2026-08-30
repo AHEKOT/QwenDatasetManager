@@ -71,6 +71,27 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertTrue((dataset / 'img' / 'second.jpg').is_file())
         self.assertTrue((dataset / 'img' / 'first.txt').is_file())
 
+    def test_trainer_screen_and_state_use_managed_edit_datasets(self):
+        dataset = self.root / 'demo'
+        self.save_image(dataset / 'img' / 'target.png')
+        self.save_image(dataset / 'Control1' / 'target.png')
+
+        screen = self.client.get('/trainer')
+        self.assertEqual(screen.status_code, 200)
+        self.assertIn(b'CUDA Trainer', screen.data)
+        screen.close()
+
+        state = self.client.get('/api/trainer/state')
+        self.assertEqual(state.status_code, 200)
+        body = state.get_json()
+        self.assertEqual(
+            {model['key'] for model in body['models']},
+            {'qwen_image_edit_2511', 'flux2_klein_4b', 'flux2_klein_9b'},
+        )
+        self.assertEqual(body['datasets'][0]['name'], 'demo')
+        self.assertEqual(body['datasets'][0]['controls'][0]['name'], 'Control1')
+        self.assertTrue(body['datasets'][0]['valid'])
+
     def test_cross_origin_mutation_is_rejected_and_cors_is_absent(self):
         rejected = self.client.post(
             '/api/create-dataset',

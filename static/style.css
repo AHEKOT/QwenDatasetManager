@@ -224,6 +224,19 @@ select:focus {
   box-shadow: var(--shadow-accent);
 }
 
+.trainer-nav-btn {
+  background: linear-gradient(135deg, rgba(255, 143, 163, 0.16), rgba(184, 169, 232, 0.14));
+  border-color: var(--accent-border);
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+
+.trainer-nav-btn:hover {
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: var(--shadow-accent);
+}
+
 /* ─── Link Controls ──────────────────────────────────────────────── */
 .link-controls {
   display: flex;

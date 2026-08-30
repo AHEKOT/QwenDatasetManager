@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two related tools for managing Qwen training datasets:
 
-1. **Web GUI** (`app.py` + `static/`) — A Flask web app for reviewing, editing, and managing datasets stored locally in `Datasets/`. Serves on `http://127.0.0.1:5001` by default.
+1. **Web GUI** (`app.py` + `static/`) — A Flask web app for reviewing, editing, managing, and training datasets stored locally in `Datasets/`. Serves on `http://127.0.0.1:5001` by default. The existing manager remains `/`; the CUDA trainer is the single secondary screen at `/trainer`.
 
 2. **ComfyUI Node** (`comfyui_qwenDatasetManager/`) — A custom ComfyUI node package with two nodes: `QwenDatasetSaver` (saves generated images into dataset format) and `QwenDatasetLoader` (loads dataset images back into ComfyUI workflows).
 
@@ -66,6 +66,12 @@ Single-file Flask backend with these API endpoints:
 | `POST /api/save/<filename>` | Save edited image back to dataset |
 
 Frontend is `static/index.html` + `static/app.js` + `static/editor.js` (vanilla JS, no framework).
+
+### CUDA Trainer (`trainer_service.py` + `trainer/`)
+
+`trainer_service.py` owns the `/api/trainer/*` API, SQLite-backed queue, dataset preflight, and detached CUDA process lifecycle. The single trainer UI is `static/trainer.html` + `static/trainer.js` + `static/trainer.css`.
+
+The backend under `trainer/ai_toolkit/` is vendored from AI Toolkit and pruned to register only Qwen Image Edit 2511 and FLUX.2 Klein Base 4B/9B. Do not add MPS/macOS fallbacks: `install_trainer.sh` and `install_trainer.cmd` intentionally reproduce the upstream CUDA dependency set in the separate `trainer/.venv` environment. Keep the scoped Simple UI fields and generated process keys in sync with `trainer/PARITY.md`; do not add unrelated model controls. See `trainer/UPSTREAM.md` for the source revision and local registry changes.
 
 ### ComfyUI Nodes (`comfyui_qwenDatasetManager/`)
 
