@@ -4,7 +4,9 @@ This QDM port also registers `flux2_klein_4b_rgba` and
 `flux2_klein_9b_rgba`. They reuse the same alpha-safe dataset and
 sampling-only LoRA path, but require a FLUX.2-native four-channel VAE with
 z=32. The Qwen z=16 VAE is not compatible and is rejected deliberately. No
-Klein RGBA VAE checkpoint is bundled yet.
+Klein RGBA VAE checkpoint is bundled yet. The `flux2_rgba_vae_trainer`
+process trains one shared native z=32 RGBA VAE for both Klein 4B and 9B and
+saves `ae.safetensors` plus an optional BF16 ComfyUI file.
 
 This opt-in model backend trains the existing AI Toolkit LoRA process against
 the toolkit-trained `models/TransparentQIE2511VAE_diffusers` four-channel VAE.

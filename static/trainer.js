@@ -61,12 +61,43 @@
         if (message) formError.scrollIntoView({ block: 'nearest' });
     }
 
+    const trainingChoiceValue = (preset, modelKey) => `${preset}::${modelKey}`;
+
+    function selectedTrainingChoice() {
+        const raw = $('trainer-model').value || '';
+        const separator = raw.indexOf('::');
+        if (separator > 0) {
+            return {
+                preset: raw.slice(0, separator),
+                modelKey: raw.slice(separator + 2),
+            };
+        }
+        return {
+            preset: $('trainer-preset').value || 'standard_lora',
+            modelKey: raw || state.models[0]?.key || 'qwen_image_edit_2511',
+        };
+    }
+
     function selectedModel() {
-        return state.models.find(model => model.key === $('trainer-model').value) || state.models[0];
+        const { modelKey } = selectedTrainingChoice();
+        return state.models.find(model => model.key === modelKey) || state.models[0];
     }
 
     function selectedPreset() {
-        return $('trainer-preset').value || 'standard_lora';
+        return selectedTrainingChoice().preset;
+    }
+
+    const isVaePreset = preset => preset === 'qwen_rgba_vae' || preset === 'flux2_rgba_vae';
+
+    function setTrainingChoice(modelKey, preset = 'standard_lora') {
+        const select = $('trainer-model');
+        const requested = trainingChoiceValue(preset, modelKey);
+        const fallback = trainingChoiceValue('standard_lora', modelKey);
+        const values = Array.from(select.options).map(option => option.value);
+        select.value = values.includes(requested)
+            ? requested
+            : (values.includes(fallback) ? fallback : values[0] || '');
+        $('trainer-preset').value = selectedPreset();
     }
 
     function currentJob() {
@@ -83,28 +114,65 @@
 
     function renderModelOptions() {
         const modelSelect = $('trainer-model');
-        const previous = modelSelect.value;
-        modelSelect.innerHTML = state.models.map(model =>
-            `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`
+        const previous = selectedTrainingChoice();
+        const standardOptions = state.models.map(model =>
+            `<option value="${escapeHtml(trainingChoiceValue('standard_lora', model.key))}">${escapeHtml(model.label)}</option>`
         ).join('');
-        if (state.models.some(model => model.key === previous)) modelSelect.value = previous;
+        const transparentOptions = state.models.map(model =>
+            `<option value="${escapeHtml(trainingChoiceValue('transparent_lora', model.key))}">${escapeHtml(model.label)} — Transparent RGBA LoRA</option>`
+        ).join('');
+        const qwen = state.models.find(model => model.key === 'qwen_image_edit_2511');
+        const qwenVaeOption = qwen
+            ? `<option value="${escapeHtml(trainingChoiceValue('qwen_rgba_vae', qwen.key))}">${escapeHtml(qwen.label)} — Train RGBA VAE</option>`
+            : '';
+        const klein = state.models.find(model => model.key === 'flux2_klein_4b');
+        const flux2VaeOption = klein
+            ? `<option value="${escapeHtml(trainingChoiceValue('flux2_rgba_vae', klein.key))}">FLUX.2 Klein 4B / 9B — Train RGBA VAE</option>`
+            : '';
+        modelSelect.innerHTML = [
+            `<optgroup label="Standard edit LoRA">${standardOptions}</optgroup>`,
+            `<optgroup label="Transparent RGBA LoRA">${transparentOptions}</optgroup>`,
+            (qwenVaeOption || flux2VaeOption)
+                ? `<optgroup label="VAE training">${qwenVaeOption}${flux2VaeOption}</optgroup>`
+                : '',
+        ].join('');
+        setTrainingChoice(previous.modelKey, previous.preset);
         renderModelFields();
     }
 
     function renderPresetOptions() {
-        const select = $('trainer-preset');
-        const previous = select.value || 'standard_lora';
-        select.innerHTML = state.trainingPresets.map(preset =>
-            `<option value="${escapeHtml(preset.key)}">${escapeHtml(preset.label)}</option>`
-        ).join('');
-        select.value = state.trainingPresets.some(item => item.key === previous)
-            ? previous : 'standard_lora';
+        $('trainer-preset').value = selectedPreset();
         renderPresetFields();
+    }
+
+    function setVaeSourceDefaults(force = false) {
+        const preset = selectedPreset();
+        if (!isVaePreset(preset)) return;
+        const isFlux2 = preset === 'flux2_rgba_vae';
+        const path = $('trainer-source-vae-path');
+        const subfolder = $('trainer-source-vae-subfolder');
+        const knownPaths = ['Qwen/Qwen-Image-Edit-2511', 'ai-toolkit/flux2_vae'];
+        if (force || !path.value.trim() || knownPaths.includes(path.value.trim())) {
+            path.value = isFlux2 ? 'ai-toolkit/flux2_vae' : 'Qwen/Qwen-Image-Edit-2511';
+        }
+        if (force || !subfolder.value.trim() || subfolder.value.trim() === 'vae') {
+            subfolder.value = isFlux2 ? '' : 'vae';
+        }
+        $('trainer-vae-heading').textContent = isFlux2
+            ? 'FLUX.2 Klein RGBA VAE training'
+            : 'Qwen RGBA VAE training';
+        $('trainer-source-vae-path-label').textContent = isFlux2
+            ? 'Standard FLUX.2 VAE repository / local file'
+            : 'Standard Qwen model / path';
+        $('trainer-source-vae-subfolder-label').textContent = isFlux2
+            ? 'Repository subfolder (optional)'
+            : 'VAE subfolder';
     }
 
     function renderPresetFields() {
         const preset = selectedPreset();
-        const isVae = preset === 'qwen_rgba_vae';
+        $('trainer-preset').value = preset;
+        const isVae = isVaePreset(preset);
         const isTransparent = preset === 'transparent_lora';
         document.querySelectorAll('.trainer-lora-only').forEach(element =>
             element.classList.toggle('hidden', isVae)
@@ -115,14 +183,12 @@
         document.querySelectorAll('.trainer-vae-only').forEach(element =>
             element.classList.toggle('hidden', !isVae)
         );
-        $('trainer-model').disabled = isVae;
         if (isVae) {
-            $('trainer-model').value = 'qwen_image_edit_2511';
-            renderModelFields(false, true);
             $('trainer-use-advanced-config').checked = false;
+            setVaeSourceDefaults(false);
         }
         $('trainer-editor-title').textContent = isVae
-            ? 'Configure Qwen RGBA VAE training'
+            ? (preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
             : (isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
         renderDatasetPicker();
         renderSelectedDatasets();
@@ -226,7 +292,7 @@
         const previous = select.value;
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
         const preset = selectedPreset();
-        const validityKey = preset === 'transparent_lora' ? 'transparentValid' : (preset === 'qwen_rgba_vae' ? 'vaeValid' : 'valid');
+        const validityKey = preset === 'transparent_lora' ? 'transparentValid' : (isVaePreset(preset) ? 'vaeValid' : 'valid');
         select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
             const ready = Boolean(dataset[validityKey]);
             return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)} · ${dataset.targetCount} targets · ${dataset.alphaCount || 0} alpha · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}</option>`;
@@ -287,7 +353,7 @@
             const rgbaMode = preset === 'transparent_lora'
                 ? `<label class="trainer-field"><span>RGBA control mode</span><select data-dataset-field="rgbaControlMode" data-dataset-index="${index}"><option value="edit"${settings.rgbaControlMode === 'edit' ? ' selected' : ''}>Edit / paired control</option><option value="generation"${settings.rgbaControlMode === 'generation' ? ' selected' : ''}>Generation / black Control1</option></select></label>`
                 : '';
-            const datasetSettings = preset === 'qwen_rgba_vae'
+            const datasetSettings = isVaePreset(preset)
                 ? `<div class="trainer-dataset-settings">
                     <div class="trainer-toggle-row trainer-resolution-row">
                         <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
@@ -509,13 +575,13 @@
     function checked(id) { return $(id).checked; }
 
     function collectForm(includeAdvanced = true) {
-        const isVae = selectedPreset() === 'qwen_rgba_vae';
+        const isVae = isVaePreset(selectedPreset());
         const payload = {
             name: $('trainer-name').value.trim(),
             gpuIds: $('trainer-gpu').value,
             trainingPreset: selectedPreset(),
             triggerWord: $('trainer-trigger').value.trim(),
-            model: $('trainer-model').value,
+            model: selectedModel()?.key || 'qwen_image_edit_2511',
             modelPath: $('trainer-model-path').value.trim(),
             vaePath: $('trainer-vae-path').value.trim(),
             sampleLoraPath: $('trainer-sample-lora-path').value.trim(),
@@ -601,11 +667,11 @@
 
     function validateForm(payload) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(payload.name)) return 'Training name must use letters, numbers, dots, underscores or hyphens.';
-        if (payload.trainingPreset === 'qwen_rgba_vae' && !payload.sourceVaePath) return 'Enter the standard Qwen model or VAE source path.';
-        if (payload.trainingPreset !== 'qwen_rgba_vae' && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
+        if (isVaePreset(payload.trainingPreset) && !payload.sourceVaePath) return 'Enter the standard VAE repository or local source path.';
+        if (!isVaePreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
         if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
-        const noResolutions = payload.trainingPreset === 'qwen_rgba_vae' ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
+        const noResolutions = isVaePreset(payload.trainingPreset) ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
         if (!payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
         if (!payload.disableSampling) {
@@ -683,7 +749,7 @@
         setInput('trainer-gpu', data.gpuIds);
         setInput('trainer-preset', data.trainingPreset);
         setInput('trainer-trigger', data.triggerWord);
-        setInput('trainer-model', data.model);
+        setTrainingChoice(data.model, data.trainingPreset);
         renderModelFields();
         setInput('trainer-model-path', data.modelPath || selectedModel()?.modelPath || '');
         setInput('trainer-vae-path', data.vaePath);
@@ -701,7 +767,7 @@
         setInput('trainer-lokr-factor', data.lokrFactor);
         setInput('trainer-save-dtype', data.saveDtype);
         setInput('trainer-max-saves', data.maxSaves);
-        const isVaeData = data.trainingPreset === 'qwen_rgba_vae';
+        const isVaeData = isVaePreset(data.trainingPreset);
         setInput('trainer-vae-batch-size', isVaeData ? data.batchSize : 1);
         setInput('trainer-vae-gradient-accumulation', isVaeData ? data.gradientAccumulation : 1);
         setInput('trainer-vae-steps', isVaeData ? data.steps : 5000);
@@ -798,9 +864,12 @@
         if (!job) return;
         const process = job.config.config.process[0];
         const model = state.models.find(item => item.key === job.form?.model);
-        const isVae = process.type === 'qwen_rgba_vae_trainer';
+        const isVae = ['qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'].includes(process.type);
+        const isFlux2Vae = process.type === 'flux2_rgba_vae_trainer';
         const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
-        const modelLabel = isVae ? 'Qwen RGBA VAE' : (model?.label || process.model?.arch || 'Edit model');
+        const modelLabel = isVae
+            ? (isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE')
+            : (model?.label || process.model?.arch || 'Edit model');
         $('trainer-detail-name').textContent = job.name;
         $('trainer-detail-model').textContent = presetLabel || modelLabel;
         $('trainer-detail-kicker').textContent = job.status === 'running' ? 'Active training job' : 'Training job';
@@ -813,13 +882,15 @@
         $('trainer-detail-speed').textContent = job.speed_string || 'Waiting';
         $('trainer-detail-gpu').textContent = `GPU ${job.gpu_ids}`;
         const detailItems = isVae ? [
-            ['Preset', 'Qwen RGBA VAE'],
+            ['Preset', isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE'],
             ['Datasets', (job.datasets || []).join(', ')],
             ['Scope', process.train.scope],
             ['Resolution', process.train.resolution],
             ['Learning rate', process.train.lr],
             ['Validation', `every ${process.validation.every} steps`],
-            ['Deployment', process.save.comfy_export ? 'Diffusers + ComfyUI' : 'Diffusers'],
+            ['Deployment', isFlux2Vae
+                ? (process.save.comfy_export ? 'Native FLUX.2 + ComfyUI' : 'Native FLUX.2')
+                : (process.save.comfy_export ? 'Diffusers + ComfyUI' : 'Diffusers')],
         ] : [
             ['Model', modelLabel],
             ['Datasets', (job.datasets || []).join(', ')],
@@ -971,8 +1042,15 @@
 
     function bindEvents() {
         $('trainer-new-job-btn').addEventListener('click', () => showEditor());
-        $('trainer-preset').addEventListener('change', renderPresetFields);
-        $('trainer-model').addEventListener('change', () => renderModelFields(true, true));
+        $('trainer-model').addEventListener('change', () => {
+            const previousPreset = $('trainer-preset').value;
+            $('trainer-preset').value = selectedPreset();
+            if (isVaePreset(selectedPreset()) && selectedPreset() !== previousPreset) {
+                setVaeSourceDefaults(true);
+            }
+            renderModelFields(true, true);
+            renderPresetFields();
+        });
         $('trainer-network-type').addEventListener('change', renderConditionalOptions);
         $('trainer-layer-offloading').addEventListener('change', renderConditionalOptions);
         ['trainer-transformer-offload', 'trainer-text-offload'].forEach(id =>

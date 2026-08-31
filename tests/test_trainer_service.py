@@ -575,6 +575,29 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertTrue(process['save']['comfy_export'])
         self.assertTrue(inspections[0]['vaeValid'])
 
+    def test_flux2_rgba_vae_preset_builds_native_klein_process(self):
+        root = self.make_rgba_dataset()
+        payload = self.default_payload([{'name': 'rgba', 'flipX': True}])
+        payload.update({
+            'trainingPreset': 'flux2_rgba_vae',
+            'model': 'flux2_klein_4b',
+            'sourceVaePath': 'ai-toolkit/flux2_vae',
+            'sourceVaeSubfolder': '',
+            'steps': 600,
+            'vaeResolution': 512,
+        })
+
+        _name, _gpu, config, inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['type'], 'flux2_rgba_vae_trainer')
+        self.assertEqual(process['source_vae']['name_or_path'], 'ai-toolkit/flux2_vae')
+        self.assertEqual(process['source_vae']['filename'], 'ae.safetensors')
+        self.assertEqual(process['datasets'][0]['folder_path'], str((root / 'img').resolve()))
+        self.assertEqual(process['train']['steps'], 600)
+        self.assertEqual(config['meta']['qdm']['trainingPreset'], 'flux2_rgba_vae')
+        self.assertTrue(inspections[0]['vaeValid'])
+
 
 if __name__ == '__main__':
     unittest.main()

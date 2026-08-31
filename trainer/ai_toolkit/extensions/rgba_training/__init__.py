@@ -14,6 +14,17 @@ class QwenRGBAVAETrainingExtension(Extension):
         return QwenRGBAVAETrainProcess
 
 
+class Flux2RGBAVAETrainingExtension(Extension):
+    uid = "flux2_rgba_vae_trainer"
+    name = "FLUX.2 Klein RGBA VAE Compatibility Trainer"
+
+    @classmethod
+    def get_process(cls):
+        from .flux2_rgba_vae_trainer import Flux2RGBAVAETrainProcess
+
+        return Flux2RGBAVAETrainProcess
+
+
 AI_TOOLKIT_MODELS = [
     QwenImageEditPlusRGBAModel,
     Flux2Klein4BRGBAModel,
@@ -23,4 +34,5 @@ AI_TOOLKIT_MODELS = [
 
 AI_TOOLKIT_EXTENSIONS = [
     QwenRGBAVAETrainingExtension,
+    Flux2RGBAVAETrainingExtension,
 ]

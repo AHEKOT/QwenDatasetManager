@@ -31,7 +31,9 @@ TRAINING_PRESETS = {
     'standard_lora': 'Standard edit LoRA',
     'transparent_lora': 'Transparent RGBA LoRA',
     'qwen_rgba_vae': 'Qwen RGBA VAE',
+    'flux2_rgba_vae': 'FLUX.2 Klein RGBA VAE',
 }
+VAE_TRAINING_PRESETS = {'qwen_rgba_vae', 'flux2_rgba_vae'}
 EDIT_MODELS = {
     'qwen_image_edit_2511': {
         'label': 'Qwen Image Edit 2511',
@@ -724,7 +726,9 @@ class TrainerService:
         if model_key not in EDIT_MODELS:
             raise TrainerValidationError('Unsupported edit model')
         if preset == 'qwen_rgba_vae' and model_key != 'qwen_image_edit_2511':
-            raise TrainerValidationError('The RGBA VAE trainer currently supports Qwen only')
+            raise TrainerValidationError('Qwen RGBA VAE training requires the Qwen model family')
+        if preset == 'flux2_rgba_vae' and model_key not in {'flux2_klein_4b', 'flux2_klein_9b'}:
+            raise TrainerValidationError('FLUX.2 RGBA VAE training requires the Klein model family')
         gpu_ids = str(payload.get('gpuIds', '0')).strip()
         if not re.fullmatch(r'\d+(,\d+)*', gpu_ids):
             raise TrainerValidationError('GPU IDs must be a comma-separated list of numbers')
@@ -745,14 +749,14 @@ class TrainerService:
                 raise TrainerValidationError(
                     f'Every target image must contain an alpha channel: {dataset_name}'
                 )
-            if preset == 'qwen_rgba_vae' and not inspection['vaeValid']:
+            if preset in VAE_TRAINING_PRESETS and not inspection['vaeValid']:
                 raise TrainerValidationError(
                     f'RGBA VAE training needs at least two alpha-channel images: {dataset_name}'
                 )
             inspections.append(inspection)
         return name, model_key, gpu_ids, inspections, preset
 
-    def _build_qwen_rgba_vae_config(self, payload, name, model_key, gpu_ids, inspections):
+    def _build_rgba_vae_config(self, payload, name, model_key, gpu_ids, inspections, preset):
         if payload.get('advancedProcess'):
             raise TrainerValidationError(
                 'Advanced process override is not available for the RGBA VAE preset'
@@ -788,16 +792,20 @@ class TrainerService:
             })
             normalized_datasets.append({**submitted, 'name': inspection['name']})
 
+        is_flux2 = preset == 'flux2_rgba_vae'
+        default_source = 'ai-toolkit/flux2_vae' if is_flux2 else 'Qwen/Qwen-Image-Edit-2511'
+        default_subfolder = '' if is_flux2 else 'vae'
         process = {
-            'type': 'qwen_rgba_vae_trainer',
+            'type': 'flux2_rgba_vae_trainer' if is_flux2 else 'qwen_rgba_vae_trainer',
             'training_folder': str(self.output_dir),
             'sqlite_db_path': str(self.db_path),
             'device': 'cuda',
             'source_vae': {
                 'name_or_path': str(
-                    payload.get('sourceVaePath', 'Qwen/Qwen-Image-Edit-2511')
-                ).strip() or 'Qwen/Qwen-Image-Edit-2511',
-                'subfolder': str(payload.get('sourceVaeSubfolder', 'vae')).strip(),
+                    payload.get('sourceVaePath', default_source)
+                ).strip() or default_source,
+                'subfolder': str(payload.get('sourceVaeSubfolder', default_subfolder)).strip(),
+                **({'filename': 'ae.safetensors'} if is_flux2 else {}),
                 'local_files_only': bool(payload.get('sourceVaeLocalOnly', False)),
             },
             'datasets': dataset_configs,
@@ -880,7 +888,7 @@ class TrainerService:
                 'version': '1.0',
                 'qdm': {
                     'modelKey': model_key,
-                    'trainingPreset': 'qwen_rgba_vae',
+                    'trainingPreset': preset,
                     'gpuIds': gpu_ids,
                     'datasets': normalized_datasets,
                     'form': copy.deepcopy(payload),
@@ -893,9 +901,9 @@ class TrainerService:
     def build_job_config(self, payload):
         name, model_key, gpu_ids, inspections, preset = self.validate_payload(payload)
         model = EDIT_MODELS[model_key]
-        if preset == 'qwen_rgba_vae':
-            return self._build_qwen_rgba_vae_config(
-                payload, name, model_key, gpu_ids, inspections
+        if preset in VAE_TRAINING_PRESETS:
+            return self._build_rgba_vae_config(
+                payload, name, model_key, gpu_ids, inspections, preset
             )
         qtype = payload.get('qtype', model['defaultQtype'])
         allowed_qtypes = set(QTYPE_OPTIONS) | set(model['accuracyRecoveryAdapters'].values())
@@ -1298,7 +1306,7 @@ class TrainerService:
             ready = inspection['valid']
             if preset == 'transparent_lora':
                 ready = inspection['transparentValid']
-            elif preset == 'qwen_rgba_vae':
+            elif preset in VAE_TRAINING_PRESETS:
                 ready = inspection['vaeValid']
             if not ready:
                 raise TrainerValidationError(f"Dataset is not ready: {item['name']}")
@@ -1428,6 +1436,7 @@ def create_trainer_blueprint(service: TrainerService):
                 'standard_lora': 'valid',
                 'transparent_lora': 'transparentValid',
                 'qwen_rgba_vae': 'vaeValid',
+                'flux2_rgba_vae': 'vaeValid',
             }.get(preset, 'valid')
             return jsonify({
                 'datasets': inspections,

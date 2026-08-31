@@ -15,7 +15,9 @@ upstream entries:
 
 - `qwen_image_edit_plus_rgba`, `flux2_klein_4b_rgba`, and
   `flux2_klein_9b_rgba` for transparent-target LoRA training;
-- `qwen_rgba_vae_trainer` for Qwen four-channel VAE compatibility training.
+- `qwen_rgba_vae_trainer` for Qwen four-channel VAE compatibility training;
+- `flux2_rgba_vae_trainer` for the shared FLUX.2 Klein 4B/9B native z=32
+  four-channel VAE.
 
 ## Forwarded settings
 

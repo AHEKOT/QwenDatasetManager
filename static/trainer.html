@@ -103,10 +103,7 @@
                                         <span>GPU</span>
                                         <select id="trainer-gpu" name="gpuIds"><option value="0">GPU 0</option></select>
                                     </label>
-                                    <label class="trainer-field" for="trainer-preset">
-                                        <span>Training preset</span>
-                                        <select id="trainer-preset" name="trainingPreset"></select>
-                                    </label>
+                                    <input id="trainer-preset" name="trainingPreset" type="hidden" value="standard_lora">
                                     <label class="trainer-field trainer-lora-only" for="trainer-trigger">
                                         <span>Trigger word <small>optional</small></span>
                                         <input id="trainer-trigger" name="triggerWord" type="text" autocomplete="off">
@@ -114,19 +111,19 @@
                                 </div>
                             </section>
 
-                            <section class="trainer-card trainer-card-model trainer-lora-only">
+                            <section class="trainer-card trainer-card-model">
                                 <div class="trainer-card-heading"><span>Model</span><span id="trainer-model-license" class="trainer-card-badge">Apache-2.0</span></div>
                                 <div class="trainer-fields">
                                     <label class="trainer-field" for="trainer-model">
-                                        <span>Edit architecture</span>
+                                        <span>Training type / architecture</span>
                                         <select id="trainer-model" name="model"></select>
                                     </label>
-                                    <label class="trainer-field" for="trainer-model-path">
+                                    <label class="trainer-field trainer-lora-only" for="trainer-model-path">
                                         <span>Name or path</span>
                                         <input id="trainer-model-path" type="text" autocomplete="off" spellcheck="false" required>
                                     </label>
-                                    <a id="trainer-model-gate" class="trainer-model-note hidden" href="#" target="_blank" rel="noopener noreferrer">Gated model — accept access on Hugging Face</a>
-                                    <div class="trainer-toggle-row">
+                                    <a id="trainer-model-gate" class="trainer-model-note trainer-lora-only hidden" href="#" target="_blank" rel="noopener noreferrer">Gated model — accept access on Hugging Face</a>
+                                    <div class="trainer-toggle-row trainer-lora-only">
                                         <label class="trainer-switch"><input id="trainer-low-vram" type="checkbox" checked><span></span>Low VRAM</label>
                                         <label class="trainer-switch"><input id="trainer-match-resolution" type="checkbox"><span></span>Match target resolution</label>
                                     </div>
@@ -228,10 +225,10 @@
                         </section>
 
                         <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
-                            <div class="trainer-card-heading"><span>Qwen RGBA VAE training</span><span class="trainer-card-badge">round-trip validation</span></div>
+                            <div class="trainer-card-heading"><span id="trainer-vae-heading">Qwen RGBA VAE training</span><span class="trainer-card-badge">round-trip validation</span></div>
                             <div class="trainer-training-grid">
-                                <label class="trainer-field trainer-span-2" for="trainer-source-vae-path"><span>Standard Qwen model / path</span><input id="trainer-source-vae-path" type="text" value="Qwen/Qwen-Image-Edit-2511" autocomplete="off" spellcheck="false"></label>
-                                <label class="trainer-field" for="trainer-source-vae-subfolder"><span>VAE subfolder</span><input id="trainer-source-vae-subfolder" type="text" value="vae"></label>
+                                <label class="trainer-field trainer-span-2" for="trainer-source-vae-path"><span id="trainer-source-vae-path-label">Standard Qwen model / path</span><input id="trainer-source-vae-path" type="text" value="Qwen/Qwen-Image-Edit-2511" autocomplete="off" spellcheck="false"></label>
+                                <label class="trainer-field" for="trainer-source-vae-subfolder"><span id="trainer-source-vae-subfolder-label">VAE subfolder</span><input id="trainer-source-vae-subfolder" type="text" value="vae"></label>
                                 <label class="trainer-field" for="trainer-vae-batch-size"><span>Batch size</span><input id="trainer-vae-batch-size" type="number" min="1" max="128" value="1"></label>
                                 <label class="trainer-field" for="trainer-vae-gradient-accumulation"><span>Gradient accumulation</span><input id="trainer-vae-gradient-accumulation" type="number" min="1" max="1024" value="1"></label>
                                 <label class="trainer-field" for="trainer-vae-steps"><span>Steps</span><input id="trainer-vae-steps" type="number" min="1" value="5000"></label>
@@ -438,7 +435,7 @@
     </div>
 
     <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
-    <script src="/static/trainer.js?v=1"></script>
+    <script src="/static/trainer.js?v=3"></script>
 </body>
 
 </html>
