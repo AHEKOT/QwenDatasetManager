@@ -51,6 +51,7 @@ let comparisonControlView = null; // Which control is shown in comparison view (
 let linkedDataset = null; // Linked dataset for synchronized operations
 let mainEditor = null; // Main editor instance
 let comparisonEditor = null; // Comparison editor instance
+let previewLoadToken = 0;
 let captionRequestController = null;
 let captionLoadToken = 0;
 let captionLoadedKey = '';
@@ -2048,6 +2049,11 @@ function updatePreview() {
     const filename = images[currentIndex];
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
+    const targetUrl = activeControlView
+        ? `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`
+        : `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
+    const primaryControlUrl = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
+    const loadToken = ++previewLoadToken;
     const imageContainer = document.querySelector('.image-container');
 
     if (!imageContainer) {
@@ -2071,13 +2077,6 @@ function updatePreview() {
         console.log('Removed comparison-mode class');
     }
 
-    // Update preview images
-    if (activeControlView) {
-        previewImg.src = `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`;
-    } else {
-        previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
-    }
-    previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
 
     // Load caption
@@ -2098,32 +2097,65 @@ function updatePreview() {
         setTimeout(() => comparisonEditor.fitToScreen(), 50);
     }
 
-    // Initialize main canvas editor
-    previewImg.onload = () => {
+    // Initialize the canvas as soon as the target loads. Control1 is optional:
+    // target-only datasets (for example TransparentVAE) must still be viewable.
+    const initializeMainEditor = (controlImage) => {
+        if (loadToken !== previewLoadToken) return;
+
+        const canvas = document.getElementById('edit-canvas');
+        const subfolder = activeControlView || 'img';
+        if (!mainEditor) {
+            mainEditor = new ImageEditor(canvas, previewImg, controlImage, previewControl, subfolder);
+            mainEditor.onStateChange = syncEditorButtons;
+        } else {
+            mainEditor.targetImageElement = previewImg;
+            mainEditor.controlImageElement = controlImage;
+            mainEditor.overlayElement = previewControl;
+            mainEditor.subfolder = subfolder;
+            mainEditor.onStateChange = syncEditorButtons;
+            mainEditor.history = [];
+            mainEditor.hasChanges = false;
+            mainEditor.setupCanvas();
+        }
+        mainEditor.currentFilename = filename;
+        mainEditor.currentFolder = currentFolder;
+        mainEditor.updateSaveButton();
+    };
+
+    let targetLoadHandled = false;
+    const handleTargetLoad = () => {
+        if (targetLoadHandled || loadToken !== previewLoadToken) return;
+        targetLoadHandled = true;
+
         const controlImg = new Image();
         controlImg.crossOrigin = 'anonymous';
-        controlImg.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
-        controlImg.onload = () => {
-            const canvas = document.getElementById('edit-canvas');
-            const subfolder = activeControlView || 'img';
-            if (!mainEditor) {
-                mainEditor = new ImageEditor(canvas, previewImg, controlImg, previewControl, subfolder);
-                mainEditor.onStateChange = syncEditorButtons;
-            } else {
-                mainEditor.targetImageElement = previewImg;
-                mainEditor.controlImageElement = controlImg;
-                mainEditor.overlayElement = previewControl;
-                mainEditor.subfolder = subfolder;
-                mainEditor.onStateChange = syncEditorButtons;
-                mainEditor.history = [];
-                mainEditor.hasChanges = false;
-                mainEditor.setupCanvas();
-            }
-            mainEditor.currentFilename = filename;
-            mainEditor.currentFolder = currentFolder;
-            mainEditor.updateSaveButton();
+        let controlLoadHandled = false;
+        const finishControlLoad = (image) => {
+            if (controlLoadHandled) return;
+            controlLoadHandled = true;
+            initializeMainEditor(image);
         };
+        controlImg.onload = () => finishControlLoad(controlImg);
+        controlImg.onerror = () => finishControlLoad(previewImg);
+        controlImg.src = primaryControlUrl;
+
+        // Reassigning an already cached URL does not consistently emit load in
+        // every browser, so handle the completed state explicitly as well.
+        if (controlImg.complete) {
+            finishControlLoad(controlImg.naturalWidth > 0 ? controlImg : previewImg);
+        }
     };
+    previewImg.onload = handleTargetLoad;
+    previewImg.onerror = () => {
+        if (loadToken === previewLoadToken) {
+            console.error(`Failed to load preview image: ${targetUrl}`);
+        }
+    };
+    previewImg.src = targetUrl;
+    previewControl.src = primaryControlUrl;
+    if (previewImg.complete && previewImg.naturalWidth > 0) {
+        handleTargetLoad();
+    }
 
     // Initialize comparison canvas editor if comparison mode is active
     if (comparisonControlView) {
