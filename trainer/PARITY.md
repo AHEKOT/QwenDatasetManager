@@ -10,12 +10,19 @@ Trainer) Simple UI for these architecture entries:
 - `flux2_klein_4b`
 - `flux2_klein_9b`
 
+QDM additionally exposes opt-in local presets that do not replace those
+upstream entries:
+
+- `qwen_image_edit_plus_rgba`, `flux2_klein_4b_rgba`, and
+  `flux2_klein_9b_rgba` for transparent-target LoRA training;
+- `qwen_rgba_vae_trainer` for Qwen four-channel VAE compatibility training.
+
 ## Forwarded settings
 
 | AI Toolkit section | Forwarded settings |
 |---|---|
 | Job | name, GPU, trigger word |
-| Model | architecture, editable Hugging Face name/local path, gated-model link/token, low VRAM, match target resolution |
+| Model | architecture, editable Hugging Face name/local path, gated-model link/token, low VRAM, match target resolution, optional sampling-only Turbo LoRA |
 | Quantize / Compile | complete upstream transformer qtype list, Qwen 2511 ARA, complete text-encoder qtype list, compile + `block_compile` |
 | Layer offloading | enable, transformer percentage, text-encoder percentage |
 | Target | LoRA/LoKr, linear rank, LoKr factor |
@@ -28,6 +35,25 @@ Trainer) Simple UI for these architecture entries:
 | Dataset | target/control mapping, network weight, repeats, per-dataset batch size, default caption, dropout, caption extension, cache latents, regularization flag, flips, complete resolution list |
 | Sampling | cadence/start, FlowMatch/DDPM sampler, guidance, steps, size, seed/walk, skip/force/disable, edit-instruction list, per-sample size/seed/network multiplier, independently uploaded `ctrl_img_1`–`ctrl_img_3` |
 | Runtime | queue, stop, save now, sample now, progress, speed and logs |
+
+## Local RGBA preset behavior
+
+- RGBA targets retain their alpha channel through crop, resize, latent cache
+  identity, decode and PNG output. Hidden RGB below the alpha threshold is
+  cleared and chroma-key spill cleanup is selectable.
+- Each transparent dataset visibly selects `edit` or `generation`. Edit uses
+  paired Control1–3 when present and otherwise makes an RGB composite;
+  generation ignores paired controls and creates an opaque black Control1.
+- The Qwen preset accepts the QIE2511 Lightning sampling LoRA, keeps it inactive
+  during training, and forces its intended four steps / CFG 1 during previews.
+  Klein 4B/9B expose the same sampling-only path and loader; step/CFG values
+  remain user-selected because no Klein Turbo checkpoint is bundled.
+- Qwen transparent training requires a Qwen z=16 RGBA VAE. Klein transparent
+  training requires a separately trained FLUX.2 z=32 RGBA VAE; cross-loading
+  either family is rejected before training.
+- Qwen VAE readiness uses deterministic RGBA round trips instead of diffusion
+  sampling. The queue's “Sample now” action runs validation, “Save now” writes
+  a checkpoint, and Stop is polled directly by the VAE process.
 | Advanced editor | full process JSON override with model architecture, CUDA device and managed dataset paths locked to the selected QDM job |
 
 ## Deliberate model-scoped behavior

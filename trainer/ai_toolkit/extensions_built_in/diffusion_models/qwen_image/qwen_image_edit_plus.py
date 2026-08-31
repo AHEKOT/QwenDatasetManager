@@ -8,6 +8,7 @@ from toolkit import train_tools
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from PIL import Image
 from toolkit.models.base_model import BaseModel
+from toolkit.sampling_lora import SamplingLoRAMixin
 from toolkit.basic import flush
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
@@ -41,7 +42,7 @@ except ImportError:
     )
 
 
-class QwenImageEditPlusModel(QwenImageModel):
+class QwenImageEditPlusModel(SamplingLoRAMixin, QwenImageModel):
     arch = "qwen_image_edit_plus"
     _qwen_image_keep_visual = True
     _qwen_pipeline = QwenImageEditPlusCustomPipeline

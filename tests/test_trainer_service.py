@@ -38,6 +38,20 @@ class TrainerServiceTests(unittest.TestCase):
                 )
         return root
 
+    def make_rgba_dataset(self, name='rgba', control_count=0):
+        root = self.datasets_root / name
+        (root / 'img').mkdir(parents=True)
+        for index in range(1, 4):
+            (root / f'Control{index}').mkdir()
+        for stem in ('one', 'two', 'three'):
+            Image.new('RGBA', (16, 12), (20, 40, 60, 128)).save(root / 'img' / f'{stem}.png')
+            (root / 'img' / f'{stem}.txt').write_text(f'caption {stem}', encoding='utf-8')
+            for index in range(1, control_count + 1):
+                Image.new('RGB', (16, 12), (30, 40, 50)).save(
+                    root / f'Control{index}' / f'{stem}.png'
+                )
+        return root
+
     def default_payload(self, datasets=None):
         return {
             'name': 'edit_lora_v1',
@@ -445,6 +459,121 @@ class TrainerServiceTests(unittest.TestCase):
         with self.service.connect() as connection:
             row = connection.execute('SELECT save_now, sample_now FROM Job WHERE id = ?', (job['id'],)).fetchone()
         self.assertEqual((row['save_now'], row['sample_now']), (1, 1))
+
+    def test_transparent_qwen_generation_dataset_uses_rgba_and_black_control_mode(self):
+        root = self.make_rgba_dataset()
+        vae = self.project_root / 'qwen-rgba-vae'
+        vae.mkdir()
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'vaePath': str(vae),
+        })
+
+        _name, _gpu, config, inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        dataset = process['datasets'][0]
+        self.assertEqual(process['model']['arch'], 'qwen_image_edit_plus_rgba')
+        self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
+        self.assertEqual(process['sample']['format'], 'png')
+        self.assertEqual(dataset['folder_path'], str((root / 'img').resolve()))
+        self.assertEqual(dataset['pixel_channels'], 'rgba')
+        self.assertTrue(dataset['rgba_generate_control'])
+        self.assertEqual(dataset['rgba_control_mode'], 'generation')
+        self.assertNotIn('control_path', dataset)
+        self.assertTrue(inspections[0]['transparentValid'])
+
+    def test_transparent_edit_mode_keeps_paired_controls(self):
+        root = self.make_rgba_dataset(control_count=2)
+        vae = self.project_root / 'qwen-rgba-vae'
+        vae.mkdir()
+        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512], 'rgbaControlMode': 'edit'}])
+        payload.update({'trainingPreset': 'transparent_lora', 'vaePath': str(vae)})
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        dataset = config['config']['process'][0]['datasets'][0]
+        self.assertEqual(dataset['control_path'], [
+            str((root / 'Control1').resolve()), str((root / 'Control2').resolve())
+        ])
+        self.assertNotIn('rgba_generate_control', dataset)
+
+    def test_turbo_sampling_lora_is_forwarded_and_forces_qwen_four_step_preview(self):
+        self.make_rgba_dataset(control_count=1)
+        vae = self.project_root / 'qwen-rgba-vae'
+        vae.mkdir()
+        turbo = self.project_root / 'qwen-lightning.safetensors'
+        turbo.write_bytes(b'test')
+        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512]}])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'vaePath': str(vae),
+            'sampleLoraPath': str(turbo),
+            'guidanceScale': 7,
+            'sampleSteps': 40,
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['model']['sample_lora_path'], str(turbo.resolve()))
+        self.assertEqual(process['sample']['guidance_scale'], 1.0)
+        self.assertEqual(process['sample']['sample_steps'], 4)
+
+    def test_klein_transparent_preset_requires_its_own_rgba_vae_and_keeps_turbo_fields(self):
+        self.make_rgba_dataset(control_count=1)
+        vae = self.project_root / 'flux2-rgba-vae.safetensors'
+        vae.write_bytes(b'test')
+        turbo = self.project_root / 'klein-turbo.safetensors'
+        turbo.write_bytes(b'test')
+        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512]}])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'flux2_klein_9b',
+            'qtype': 'qfloat8',
+            'vaePath': str(vae),
+            'sampleLoraPath': str(turbo),
+            'sampleSteps': 8,
+            'guidanceScale': 2,
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['model']['arch'], 'flux2_klein_9b_rgba')
+        self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
+        self.assertEqual(process['model']['sample_lora_path'], str(turbo.resolve()))
+        self.assertEqual(process['sample']['sample_steps'], 8)
+        self.assertEqual(process['sample']['guidance_scale'], 2)
+
+    def test_qwen_rgba_vae_preset_builds_extension_process_and_readiness_validation(self):
+        root = self.make_rgba_dataset()
+        payload = self.default_payload([{'name': 'rgba', 'flipX': True}])
+        payload.update({
+            'trainingPreset': 'qwen_rgba_vae',
+            'steps': 700,
+            'learningRate': 0.00001,
+            'vaeResolution': 512,
+            'vaeStopWhenReady': True,
+        })
+
+        _name, _gpu, config, inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['type'], 'qwen_rgba_vae_trainer')
+        self.assertEqual(process['datasets'][0]['folder_path'], str((root / 'img').resolve()))
+        self.assertEqual(process['train']['steps'], 700)
+        self.assertEqual(process['train']['lr'], 0.00001)
+        self.assertTrue(process['validation']['stop_when_ready'])
+        self.assertEqual(process['sample']['sampler'], 'vae_roundtrip')
+        self.assertEqual(process['sample']['format'], 'png')
+        self.assertTrue(process['save']['comfy_export'])
+        self.assertTrue(inspections[0]['vaeValid'])
 
 
 if __name__ == '__main__':

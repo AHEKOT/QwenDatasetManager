@@ -31,6 +31,17 @@ Qwen Dataset Manager supplies the UI, job queue, dataset mapping and settings.
 - the model registry exposes only Qwen Image Edit Plus and FLUX.2 Klein;
 - built-in legacy model imports were removed from `toolkit/util/get_model.py`;
 - `jobs/__init__.py` imports only `BaseJob` and `ExtensionJob`.
+- `extensions/rgba_training/` adds opt-in transparent LoRA architectures and a
+  Qwen RGBA VAE process without changing the standard model entries;
+- the dataloader can preserve RGBA targets, sanitize hidden matte RGB, resize
+  alpha safely, and create edit/generation controls;
+- sampling-only LoRAs use AI Toolkit's native adapter hooks and are inactive
+  outside preview generation;
+- alpha-bearing samples and thumbnails are saved as PNG;
+- the local Qwen VAE process reports progress and consumes stop/save/validation
+  flags from QDM's SQLite queue.
+- upstream `info.py` and `version.py` are retained because the shared metadata
+  module imports them during every model backend startup.
 
 Training math, dataloading, quantization, model loading, LoRA creation,
 checkpoint saving and sampling remain upstream implementations.

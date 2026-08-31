@@ -30,34 +30,84 @@ All three folders must contain images with matching filenames (e.g., `image_0000
 
 ## Installation
 
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+The full installer creates separate virtual environments for the application
+and CUDA trainer, installs their pinned dependencies, and runs import,
+dependency, and CUDA checks.
 
-2. **Run the server**:
-   ```bash
-   python app.py
-   ```
+### Windows
 
-3. **Open your browser**:
-   Navigate to `http://127.0.0.1:5001`
+Requirements: 64-bit Windows, Git, an NVIDIA GPU with a current driver, an
+internet connection, and at least 10 GB of free space. Python does not need to
+be installed in advance: the installer downloads the signed official Python
+3.12.10 installer and installs it for the current user when necessary.
 
-The server binds to localhost by default. To deliberately expose it on another interface, set `QDM_HOST` and list accepted hostnames in `QDM_TRUSTED_HOSTS`; use a trusted network and a reverse proxy with authentication. `QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are also configurable environment variables.
+Double-click `install.cmd`, or run it from a terminal:
 
-### CUDA trainer installation
+```cmd
+install.cmd
+```
 
-The trainer is a separate, optional environment. Install it only on a Linux or Windows machine with an NVIDIA GPU:
+Useful variants:
+
+```powershell
+# Install only the dataset manager, without CUDA dependencies
+.\install.ps1 -SkipTrainer
+
+# Install or repair only the CUDA trainer
+install_trainer.cmd
+
+# Do not pause the cmd wrapper (useful for CI and scripts)
+set QDM_NO_PAUSE=1
+install.cmd
+```
+
+If Python 3.12 is installed in a non-standard location, set
+`QDM_PYTHON312` to its `python.exe` before running the installer. Re-running
+the installer is safe: compatible environments and installed packages are
+reused, while incomplete environments are repaired.
+
+### Linux
+
+Install Python 3.12 with its `venv` module, Git, and the current NVIDIA driver,
+then run:
+
+```bash
+./install.sh
+```
+
+Use `./install.sh --skip-trainer` on a machine that only needs the dataset
+manager. `./install_trainer.sh` installs or repairs only the trainer. The CUDA
+trainer is not supported on macOS.
+
+### Run
+
+```cmd
+# Windows
+run.cmd
+```
 
 ```bash
 # Linux
-./install_trainer.sh
-
-# Windows
-install_trainer.cmd
+./run.sh
 ```
 
-The installer intentionally keeps the CUDA dependency set used by the vendored AI Toolkit backend. It does not provide a macOS or MPS fallback. After installation, restart the app and open **Trainer** from the main screen.
+The server prints both the local URL and every detected LAN URL at startup. It
+binds to all local interfaces by default and automatically trusts the machine
+hostname and detected local IP addresses. To restrict it to this computer, set
+`QDM_HOST=127.0.0.1`. Use `QDM_TRUSTED_HOSTS` to override accepted hostnames.
+`QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are
+also configurable environment variables.
+
+LAN access should only be enabled on a trusted network. Internet exposure
+requires a reverse proxy or VPN with authentication; do not forward the Flask
+development server port directly to the internet.
+
+### CUDA trainer
+
+The trainer remains isolated in `trainer/.venv`. The installer intentionally
+keeps the CUDA dependency set used by the vendored AI Toolkit backend and does
+not provide a macOS or MPS fallback. After installation, start or restart the
+app and open **Trainer** from the main screen.
 
 The trainer supports:
 

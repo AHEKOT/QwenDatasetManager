@@ -4,6 +4,7 @@ import os
 import re
 import json
 import random
+import socket
 import shutil
 import uuid
 import threading
@@ -14,11 +15,48 @@ from urllib.parse import urlparse
 from PIL import Image as PillowImage
 from trainer_service import TrainerService, create_trainer_blueprint
 
+
+def discover_local_ipv4_addresses():
+    """Return usable local IPv4 addresses with the default route first."""
+    addresses = []
+
+    def add(address):
+        if (
+            address
+            and address not in addresses
+            and not address.startswith('127.')
+            and not address.startswith('169.254.')
+            and address != '0.0.0.0'
+        ):
+            addresses.append(address)
+
+    # A UDP connect selects the default route without sending application data.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+            route_socket.connect(('8.8.8.8', 80))
+            add(route_socket.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for address in socket.gethostbyname_ex(socket.gethostname())[2]:
+            add(address)
+    except OSError:
+        pass
+
+    return addresses
+
+
+def default_trusted_hosts():
+    hosts = ['localhost', '127.0.0.1', '[::1]', socket.gethostname()]
+    hosts.extend(discover_local_ipv4_addresses())
+    return list(dict.fromkeys(host for host in hosts if host))
+
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('QDM_MAX_UPLOAD_MB', '128')) * 1024 * 1024
 app.config['TRUSTED_HOSTS'] = [
     host.strip()
-    for host in os.environ.get('QDM_TRUSTED_HOSTS', 'localhost,127.0.0.1,[::1]').split(',')
+    for host in os.environ.get('QDM_TRUSTED_HOSTS', ','.join(default_trusted_hosts())).split(',')
     if host.strip()
 ]
 PillowImage.MAX_IMAGE_PIXELS = int(os.environ.get('QDM_MAX_IMAGE_PIXELS', '100000000'))
@@ -3688,10 +3726,15 @@ def stitch_images():
 
 
 if __name__ == '__main__':
-    host = os.environ.get('QDM_HOST', '127.0.0.1')
+    host = os.environ.get('QDM_HOST', '0.0.0.0')
     port = int(os.environ.get('QDM_PORT', '5001'))
     debug = os.environ.get('QDM_DEBUG', '').lower() in {'1', 'true', 'yes'}
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")
-    print(f"Open http://{host}:{port} in your browser")
+    if host in {'0.0.0.0', '::'}:
+        print(f"Local URL: http://127.0.0.1:{port}")
+        for address in discover_local_ipv4_addresses():
+            print(f"Network URL: http://{address}:{port}")
+    else:
+        print(f"Open http://{host}:{port} in your browser")
     app.run(debug=debug, host=host, port=port)

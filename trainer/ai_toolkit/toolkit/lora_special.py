@@ -61,6 +61,7 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
             network: 'LoRASpecialNetwork' = None,
             use_bias: bool = False,
             is_ara: bool = False,
+            initialize_weights: bool = True,
             **kwargs
     ):
         self.can_merge_in = True
@@ -117,9 +118,13 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
 
         # same as microsoft's
-        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        if not self.full_rank:
-            torch.nn.init.zeros_(self.lora_up.weight)
+        # Inference-only networks immediately overwrite both projections from a
+        # checkpoint.  Skipping initialization avoids touching hundreds of MB
+        # of throwaway memory before load_state_dict copies the real tensors.
+        if initialize_weights:
+            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+            if not self.full_rank:
+                torch.nn.init.zeros_(self.lora_up.weight)
 
         self.multiplier: Union[float, List[float]] = multiplier
         # wrap the original module so it doesn't get weights updated
@@ -338,6 +343,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             is_transformer: bool = False,
             base_model: 'StableDiffusion' = None,
             is_ara: bool = False,
+            initialize_weights: bool = True,
             **kwargs
     ) -> None:
         """
@@ -400,6 +406,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         self.is_assistant_adapter = is_assistant_adapter
         self.full_rank = network_type.lower() == "fullrank"
         self.is_ara = is_ara
+        self.initialize_weights = initialize_weights
         if self.network_type.lower() == "dora":
             self.module_class = DoRAModule
             module_class = DoRAModule
@@ -603,6 +610,8 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             
                             if self.is_ara:
                                 module_kwargs["is_ara"] = True
+                            if not self.initialize_weights and self.network_type.lower() == "lora":
+                                module_kwargs["initialize_weights"] = False
 
                             lora = module_class(
                                 lora_name,

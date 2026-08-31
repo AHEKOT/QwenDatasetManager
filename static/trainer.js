@@ -3,6 +3,7 @@
 
     const state = {
         models: [],
+        trainingPresets: [],
         qtypes: [],
         datasets: [],
         jobs: [],
@@ -64,6 +65,10 @@
         return state.models.find(model => model.key === $('trainer-model').value) || state.models[0];
     }
 
+    function selectedPreset() {
+        return $('trainer-preset').value || 'standard_lora';
+    }
+
     function currentJob() {
         return state.jobs.find(job => job.id === state.selectedJobId) || null;
     }
@@ -86,7 +91,44 @@
         renderModelFields();
     }
 
-    function renderModelFields(resetPath = false) {
+    function renderPresetOptions() {
+        const select = $('trainer-preset');
+        const previous = select.value || 'standard_lora';
+        select.innerHTML = state.trainingPresets.map(preset =>
+            `<option value="${escapeHtml(preset.key)}">${escapeHtml(preset.label)}</option>`
+        ).join('');
+        select.value = state.trainingPresets.some(item => item.key === previous)
+            ? previous : 'standard_lora';
+        renderPresetFields();
+    }
+
+    function renderPresetFields() {
+        const preset = selectedPreset();
+        const isVae = preset === 'qwen_rgba_vae';
+        const isTransparent = preset === 'transparent_lora';
+        document.querySelectorAll('.trainer-lora-only').forEach(element =>
+            element.classList.toggle('hidden', isVae)
+        );
+        document.querySelectorAll('.trainer-transparent-only').forEach(element =>
+            element.classList.toggle('hidden', !isTransparent)
+        );
+        document.querySelectorAll('.trainer-vae-only').forEach(element =>
+            element.classList.toggle('hidden', !isVae)
+        );
+        $('trainer-model').disabled = isVae;
+        if (isVae) {
+            $('trainer-model').value = 'qwen_image_edit_2511';
+            renderModelFields(false, true);
+            $('trainer-use-advanced-config').checked = false;
+        }
+        $('trainer-editor-title').textContent = isVae
+            ? 'Configure Qwen RGBA VAE training'
+            : (isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
+        renderDatasetPicker();
+        renderSelectedDatasets();
+    }
+
+    function renderModelFields(resetPath = false, resetAssets = false) {
         const model = selectedModel();
         if (!model) return;
         if (resetPath || !$('trainer-model-path').value) $('trainer-model-path').value = model.modelPath;
@@ -97,6 +139,17 @@
         $('trainer-noise-scheduler').value = model.noiseScheduler === 'flowmatch' ? 'FlowMatch' : model.noiseScheduler;
         $('trainer-unload-text-wrap').classList.toggle('hidden', !model.allowUnloadTextEncoder);
         if (!model.allowUnloadTextEncoder) $('trainer-unload-text').checked = false;
+        if (resetAssets) {
+            $('trainer-sample-lora-path').value = model.defaultSampleLoraPath || '';
+            $('trainer-vae-path').value = model.defaultRgbaVaePath || '';
+        } else {
+            if (!$('trainer-sample-lora-path').value && model.defaultSampleLoraPath) {
+                $('trainer-sample-lora-path').value = model.defaultSampleLoraPath;
+            }
+            if (!$('trainer-vae-path').value && model.defaultRgbaVaePath) {
+                $('trainer-vae-path').value = model.defaultRgbaVaePath;
+            }
+        }
 
         const qtype = $('trainer-qtype');
         const previous = qtype.value || model.defaultQtype;
@@ -158,9 +211,10 @@
         }
         jobsList.innerHTML = jobs.map(job => {
             const model = state.models.find(item => item.key === job.form?.model);
+            const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
             return `<button class="trainer-job-item${job.id === state.selectedJobId ? ' is-selected' : ''}" type="button" data-job-id="${escapeHtml(job.id)}">
                 <span class="trainer-job-item-top"><strong>${escapeHtml(job.name)}</strong><span class="trainer-mini-status" data-status="${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></span>
-                <span class="trainer-job-item-meta"><span>${escapeHtml(model?.label || job.config?.config?.process?.[0]?.model?.arch || 'Edit model')}</span><span>${escapeHtml(job.step)} / ${escapeHtml(job.total_steps)}</span></span>
+                <span class="trainer-job-item-meta"><span>${escapeHtml(presetLabel || model?.label || job.config?.config?.process?.[0]?.model?.arch || 'Training')}</span><span>${escapeHtml(job.step)} / ${escapeHtml(job.total_steps)}</span></span>
                 <span class="trainer-job-item-progress"><span style="width:${Number(job.progress) || 0}%"></span></span>
             </button>`;
         }).join('');
@@ -171,9 +225,12 @@
         const select = $('trainer-dataset-select');
         const previous = select.value;
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
-        select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset =>
-            `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !dataset.valid ? ' disabled' : ''}>${escapeHtml(dataset.name)} · ${dataset.targetCount} targets · ${dataset.controls.length} controls${dataset.valid ? '' : ' · not ready'}</option>`
-        ).join('');
+        const preset = selectedPreset();
+        const validityKey = preset === 'transparent_lora' ? 'transparentValid' : (preset === 'qwen_rgba_vae' ? 'vaeValid' : 'valid');
+        select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
+            const ready = Boolean(dataset[validityKey]);
+            return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)} · ${dataset.targetCount} targets · ${dataset.alphaCount || 0} alpha · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}</option>`;
+        }).join('');
         if (state.datasets.some(dataset => dataset.name === previous && !selectedNames.has(previous))) select.value = previous;
     }
 
@@ -193,6 +250,7 @@
             isRegularization: Boolean(settings.isRegularization),
             flipX: Boolean(settings.flipX),
             flipY: Boolean(settings.flipY),
+            rgbaControlMode: settings.rgbaControlMode || 'edit',
         });
         renderSelectedDatasets();
     }
@@ -221,7 +279,37 @@
             const dataset = state.datasets.find(item => item.name === settings.name);
             if (!dataset) return '';
             const controls = dataset.controls.map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
-            const warnings = dataset.warnings.length ? `<div class="trainer-dataset-warning">${escapeHtml(dataset.warnings.join(' · '))}</div>` : '';
+            const preset = selectedPreset();
+            const relevantWarnings = dataset.warnings.filter(warning =>
+                preset === 'standard_lora' || !warning.includes('no control images')
+            );
+            const warnings = relevantWarnings.length ? `<div class="trainer-dataset-warning">${escapeHtml(relevantWarnings.join(' · '))}</div>` : '';
+            const rgbaMode = preset === 'transparent_lora'
+                ? `<label class="trainer-field"><span>RGBA control mode</span><select data-dataset-field="rgbaControlMode" data-dataset-index="${index}"><option value="edit"${settings.rgbaControlMode === 'edit' ? ' selected' : ''}>Edit / paired control</option><option value="generation"${settings.rgbaControlMode === 'generation' ? ' selected' : ''}>Generation / black Control1</option></select></label>`
+                : '';
+            const datasetSettings = preset === 'qwen_rgba_vae'
+                ? `<div class="trainer-dataset-settings">
+                    <div class="trainer-toggle-row trainer-resolution-row">
+                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
+                    </div>
+                    <p class="trainer-help">All alpha-channel targets in this img folder join the deterministic train/validation split. Captions and Control folders are not used by the VAE process.</p>
+                </div>`
+                : `<div class="trainer-dataset-settings">
+                    <label class="trainer-field"><span>Repeats</span><input data-dataset-field="repeats" data-dataset-index="${index}" type="number" min="1" max="1000" value="${settings.repeats}"></label>
+                    <label class="trainer-field"><span>LoRA weight</span><input data-dataset-field="weight" data-dataset-index="${index}" type="number" min="0" max="100" step="0.1" value="${settings.weight}"></label>
+                    <label class="trainer-field"><span>Batch size</span><input data-dataset-field="batchSize" data-dataset-index="${index}" type="number" min="1" max="128" value="${settings.batchSize}"></label>
+                    <label class="trainer-field"><span>Caption dropout</span><input data-dataset-field="captionDropout" data-dataset-index="${index}" type="number" min="0" max="1" step="0.01" value="${settings.captionDropout}"></label>
+                    <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
+                    <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
+                    ${rgbaMode}
+                    <div class="trainer-resolution-row"><span>Resolutions</span>${[256, 512, 768, 1024, 1280, 1328, 1536, 2048].map(value => resolutionChip(index, value, settings.resolutions.includes(value))).join('')}</div>
+                    <div class="trainer-toggle-row trainer-resolution-row">
+                        <label class="trainer-switch"><input data-dataset-field="cacheLatents" data-dataset-index="${index}" type="checkbox"${settings.cacheLatents ? ' checked' : ''}><span></span>Cache latents</label>
+                        <label class="trainer-switch"><input data-dataset-field="isRegularization" data-dataset-index="${index}" type="checkbox"${settings.isRegularization ? ' checked' : ''}><span></span>Is regularization</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}><span></span>Flip Y</label>
+                    </div>
+                </div>`;
             return `<article class="trainer-dataset-card" data-dataset-card="${index}">
                 <div class="trainer-dataset-title">
                     <strong title="${escapeHtml(dataset.name)}">${escapeHtml(dataset.name)}</strong>
@@ -231,23 +319,9 @@
                 <div class="trainer-dataset-metrics">
                     <div class="trainer-dataset-metric"><strong>${dataset.targetCount}</strong><span>targets</span></div>
                     <div class="trainer-dataset-metric"><strong>${dataset.captionCount}</strong><span>captions</span></div>
-                    <div class="trainer-dataset-metric"><strong>${dataset.controls.length}</strong><span>controls</span></div>
+                    <div class="trainer-dataset-metric"><strong>${dataset.alphaCount || 0}</strong><span>alpha</span></div>
                 </div>
-                <div class="trainer-dataset-settings">
-                    <label class="trainer-field"><span>Repeats</span><input data-dataset-field="repeats" data-dataset-index="${index}" type="number" min="1" max="1000" value="${settings.repeats}"></label>
-                    <label class="trainer-field"><span>LoRA weight</span><input data-dataset-field="weight" data-dataset-index="${index}" type="number" min="0" max="100" step="0.1" value="${settings.weight}"></label>
-                    <label class="trainer-field"><span>Batch size</span><input data-dataset-field="batchSize" data-dataset-index="${index}" type="number" min="1" max="128" value="${settings.batchSize}"></label>
-                    <label class="trainer-field"><span>Caption dropout</span><input data-dataset-field="captionDropout" data-dataset-index="${index}" type="number" min="0" max="1" step="0.01" value="${settings.captionDropout}"></label>
-                    <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
-                    <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
-                    <div class="trainer-resolution-row"><span>Resolutions</span>${[256, 512, 768, 1024, 1280, 1328, 1536, 2048].map(value => resolutionChip(index, value, settings.resolutions.includes(value))).join('')}</div>
-                    <div class="trainer-toggle-row trainer-resolution-row">
-                        <label class="trainer-switch"><input data-dataset-field="cacheLatents" data-dataset-index="${index}" type="checkbox"${settings.cacheLatents ? ' checked' : ''}><span></span>Cache latents</label>
-                        <label class="trainer-switch"><input data-dataset-field="isRegularization" data-dataset-index="${index}" type="checkbox"${settings.isRegularization ? ' checked' : ''}><span></span>Is regularization</label>
-                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
-                        <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}><span></span>Flip Y</label>
-                    </div>
-                </div>
+                ${datasetSettings}
                 <div class="trainer-dataset-actions">
                     <button class="trainer-icon-btn" type="button" data-duplicate-dataset="${index}" aria-label="Duplicate ${escapeHtml(dataset.name)}" title="Duplicate dataset"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg></button>
                     <button class="trainer-icon-btn trainer-remove-dataset" type="button" data-remove-dataset="${index}" aria-label="Remove ${escapeHtml(dataset.name)}" title="Remove dataset"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
@@ -435,12 +509,19 @@
     function checked(id) { return $(id).checked; }
 
     function collectForm(includeAdvanced = true) {
+        const isVae = selectedPreset() === 'qwen_rgba_vae';
         const payload = {
             name: $('trainer-name').value.trim(),
             gpuIds: $('trainer-gpu').value,
+            trainingPreset: selectedPreset(),
             triggerWord: $('trainer-trigger').value.trim(),
             model: $('trainer-model').value,
             modelPath: $('trainer-model-path').value.trim(),
+            vaePath: $('trainer-vae-path').value.trim(),
+            sampleLoraPath: $('trainer-sample-lora-path').value.trim(),
+            rgbaEdgeCorrection: $('trainer-rgba-edge-correction').value,
+            rgbaEdgeWidth: numberValue('trainer-rgba-edge-width'),
+            rgbaAlphaThreshold: numberValue('trainer-rgba-alpha-threshold'),
             qtype: $('trainer-qtype').value,
             qtypeTextEncoder: $('trainer-qtype-te').value,
             lowVram: checked('trainer-low-vram'),
@@ -450,17 +531,17 @@
             rank: numberValue('trainer-rank'),
             lokrFactor: numberValue('trainer-lokr-factor'),
             saveDtype: $('trainer-save-dtype').value,
-            maxSaves: numberValue('trainer-max-saves'),
-            batchSize: numberValue('trainer-batch-size'),
-            gradientAccumulation: numberValue('trainer-gradient-accumulation'),
-            steps: numberValue('trainer-steps'),
-            learningRate: numberValue('trainer-learning-rate'),
+            maxSaves: numberValue(isVae ? 'trainer-vae-max-saves' : 'trainer-max-saves'),
+            batchSize: numberValue(isVae ? 'trainer-vae-batch-size' : 'trainer-batch-size'),
+            gradientAccumulation: numberValue(isVae ? 'trainer-vae-gradient-accumulation' : 'trainer-gradient-accumulation'),
+            steps: numberValue(isVae ? 'trainer-vae-steps' : 'trainer-steps'),
+            learningRate: numberValue(isVae ? 'trainer-vae-learning-rate' : 'trainer-learning-rate'),
             optimizer: $('trainer-optimizer').value,
-            weightDecay: numberValue('trainer-weight-decay'),
+            weightDecay: numberValue(isVae ? 'trainer-vae-weight-decay' : 'trainer-weight-decay'),
             timestepType: $('trainer-timestep').value,
             timestepBias: $('trainer-timestep-bias').value,
             lossType: $('trainer-loss').value,
-            saveEvery: numberValue('trainer-save-every'),
+            saveEvery: numberValue(isVae ? 'trainer-vae-save-every' : 'trainer-save-every'),
             cacheTextEmbeddings: checked('trainer-cache-text'),
             unloadTextEncoder: checked('trainer-unload-text'),
             useEma: checked('trainer-use-ema'),
@@ -496,6 +577,21 @@
             transformerOffload: numberValue('trainer-transformer-offload') / 100,
             textEncoderOffload: numberValue('trainer-text-offload') / 100,
             datasets: state.selectedDatasets.map(item => ({ ...item, resolutions: [...item.resolutions] })),
+            sourceVaePath: $('trainer-source-vae-path').value.trim(),
+            sourceVaeSubfolder: $('trainer-source-vae-subfolder').value.trim(),
+            sourceVaeLocalOnly: checked('trainer-source-vae-local'),
+            vaeResolution: numberValue('trainer-vae-resolution'),
+            vaeTrainScope: $('trainer-vae-scope').value,
+            vaeDtype: $('trainer-vae-dtype').value,
+            vaeAlphaLrMultiplier: numberValue('trainer-vae-alpha-lr'),
+            vaeWorkers: numberValue('trainer-vae-workers'),
+            vaeMaxGradNorm: numberValue('trainer-vae-max-grad'),
+            vaeValidateEvery: numberValue('trainer-vae-validate-every'),
+            vaeValidationMaxImages: numberValue('trainer-vae-validation-images'),
+            vaeRequiredPasses: numberValue('trainer-vae-required-passes'),
+            vaeGradientCheckpointing: checked('trainer-vae-gradient-checkpointing'),
+            vaeStopWhenReady: checked('trainer-vae-stop-ready'),
+            vaeComfyExport: checked('trainer-vae-comfy-export'),
         };
         if (includeAdvanced && checked('trainer-use-advanced-config') && $('trainer-advanced-config-json').value.trim()) {
             payload.advancedProcess = $('trainer-advanced-config-json').value.trim();
@@ -505,13 +601,15 @@
 
     function validateForm(payload) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(payload.name)) return 'Training name must use letters, numbers, dots, underscores or hyphens.';
-        if (!payload.modelPath) return 'Enter a Hugging Face model name or local path.';
+        if (payload.trainingPreset === 'qwen_rgba_vae' && !payload.sourceVaePath) return 'Enter the standard Qwen model or VAE source path.';
+        if (payload.trainingPreset !== 'qwen_rgba_vae' && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
+        if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
-        const noResolutions = payload.datasets.find(dataset => !dataset.resolutions.length);
+        const noResolutions = payload.trainingPreset === 'qwen_rgba_vae' ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
         if (!payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
         if (!payload.disableSampling) {
-            const sampleWithoutImage = payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
+            const sampleWithoutImage = payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
             if (sampleWithoutImage) return 'Add at least one image to edit for every sample.';
             const sampleWithoutInstruction = payload.samples.find(sample => [1, 2, 3].some(index => sampleControlPath(sample, index)) && !String(sample.prompt || '').trim());
             if (sampleWithoutInstruction) return 'Enter an edit instruction for every sample.';
@@ -561,7 +659,7 @@
 
     function populateForm(payload = {}) {
         const defaults = {
-            name: 'qdm_edit_lora_v1', gpuIds: '0', triggerWord: '', model: state.models[0]?.key || 'qwen_image_edit_2511',
+            name: 'qdm_edit_lora_v1', gpuIds: '0', trainingPreset: 'standard_lora', triggerWord: '', model: state.models[0]?.key || 'qwen_image_edit_2511',
             modelPath: '', qtype: 'qfloat8', qtypeTextEncoder: 'qfloat8', lowVram: true,
             matchTargetResolution: false, compileModel: false, networkType: 'lora', rank: 32, lokrFactor: -1, saveDtype: 'bf16', maxSaves: 4,
             batchSize: 1, gradientAccumulation: 1, steps: 3000, learningRate: 0.0001, optimizer: 'adamw8bit',
@@ -574,14 +672,25 @@
             sampler: 'flowmatch', guidanceScale: 4, sampleSteps: 30, sampleWidth: 1024, sampleHeight: 1024,
             sampleSeed: 42, walkSeed: true, skipFirstSample: false, forceFirstSample: false, disableSampling: true, samples: [],
             layerOffloading: false, transformerOffload: 1, textEncoderOffload: 1, advancedProcess: '', datasets: [],
+            vaePath: null, sampleLoraPath: null, rgbaEdgeCorrection: 'matte_despill', rgbaEdgeWidth: 3, rgbaAlphaThreshold: 1 / 255,
+            sourceVaePath: 'Qwen/Qwen-Image-Edit-2511', sourceVaeSubfolder: 'vae', sourceVaeLocalOnly: false,
+            vaeResolution: 512, vaeTrainScope: 'full', vaeDtype: 'bf16', vaeAlphaLrMultiplier: 10,
+            vaeWorkers: 2, vaeMaxGradNorm: 1, vaeValidateEvery: 250, vaeValidationMaxImages: 32,
+            vaeRequiredPasses: 2, vaeGradientCheckpointing: true, vaeStopWhenReady: false, vaeComfyExport: true,
         };
         const data = { ...defaults, ...payload };
         setInput('trainer-name', data.name);
         setInput('trainer-gpu', data.gpuIds);
+        setInput('trainer-preset', data.trainingPreset);
         setInput('trainer-trigger', data.triggerWord);
         setInput('trainer-model', data.model);
         renderModelFields();
         setInput('trainer-model-path', data.modelPath || selectedModel()?.modelPath || '');
+        setInput('trainer-vae-path', data.vaePath);
+        setInput('trainer-sample-lora-path', data.sampleLoraPath);
+        setInput('trainer-rgba-edge-correction', data.rgbaEdgeCorrection);
+        setInput('trainer-rgba-edge-width', data.rgbaEdgeWidth);
+        setInput('trainer-rgba-alpha-threshold', data.rgbaAlphaThreshold);
         setInput('trainer-qtype', data.qtype);
         setInput('trainer-qtype-te', data.qtypeTextEncoder);
         setInput('trainer-low-vram', data.lowVram);
@@ -592,6 +701,14 @@
         setInput('trainer-lokr-factor', data.lokrFactor);
         setInput('trainer-save-dtype', data.saveDtype);
         setInput('trainer-max-saves', data.maxSaves);
+        const isVaeData = data.trainingPreset === 'qwen_rgba_vae';
+        setInput('trainer-vae-batch-size', isVaeData ? data.batchSize : 1);
+        setInput('trainer-vae-gradient-accumulation', isVaeData ? data.gradientAccumulation : 1);
+        setInput('trainer-vae-steps', isVaeData ? data.steps : 5000);
+        setInput('trainer-vae-learning-rate', isVaeData ? data.learningRate : 0.00001);
+        setInput('trainer-vae-weight-decay', isVaeData ? data.weightDecay : 0);
+        setInput('trainer-vae-save-every', isVaeData ? data.saveEvery : 250);
+        setInput('trainer-vae-max-saves', isVaeData ? data.maxSaves : 4);
         setInput('trainer-batch-size', data.batchSize);
         setInput('trainer-gradient-accumulation', data.gradientAccumulation);
         setInput('trainer-steps', data.steps);
@@ -631,6 +748,21 @@
         setInput('trainer-skip-first-sample', data.skipFirstSample);
         setInput('trainer-force-first-sample', data.forceFirstSample);
         setInput('trainer-disable-sampling', data.disableSampling ?? !data.sampleEnabled);
+        setInput('trainer-source-vae-path', data.sourceVaePath);
+        setInput('trainer-source-vae-subfolder', data.sourceVaeSubfolder);
+        setInput('trainer-source-vae-local', data.sourceVaeLocalOnly);
+        setInput('trainer-vae-resolution', data.vaeResolution);
+        setInput('trainer-vae-scope', data.vaeTrainScope);
+        setInput('trainer-vae-dtype', data.vaeDtype);
+        setInput('trainer-vae-alpha-lr', data.vaeAlphaLrMultiplier);
+        setInput('trainer-vae-workers', data.vaeWorkers);
+        setInput('trainer-vae-max-grad', data.vaeMaxGradNorm);
+        setInput('trainer-vae-validate-every', data.vaeValidateEvery);
+        setInput('trainer-vae-validation-images', data.vaeValidationMaxImages);
+        setInput('trainer-vae-required-passes', data.vaeRequiredPasses);
+        setInput('trainer-vae-gradient-checkpointing', data.vaeGradientCheckpointing);
+        setInput('trainer-vae-stop-ready', data.vaeStopWhenReady);
+        setInput('trainer-vae-comfy-export', data.vaeComfyExport);
         setInput('trainer-layer-offloading', data.layerOffloading);
         setInput('trainer-transformer-offload', Number(data.transformerOffload) * 100);
         setInput('trainer-text-offload', Number(data.textEncoderOffload) * 100);
@@ -645,6 +777,7 @@
         state.validationItems = (data.validationItems || []).map(item => ({ ...item }));
         renderSelectedDatasets();
         renderConditionalOptions();
+        renderPresetFields();
     }
 
     function showEditor(job = null) {
@@ -665,8 +798,11 @@
         if (!job) return;
         const process = job.config.config.process[0];
         const model = state.models.find(item => item.key === job.form?.model);
+        const isVae = process.type === 'qwen_rgba_vae_trainer';
+        const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
+        const modelLabel = isVae ? 'Qwen RGBA VAE' : (model?.label || process.model?.arch || 'Edit model');
         $('trainer-detail-name').textContent = job.name;
-        $('trainer-detail-model').textContent = model?.label || process.model.arch;
+        $('trainer-detail-model').textContent = presetLabel || modelLabel;
         $('trainer-detail-kicker').textContent = job.status === 'running' ? 'Active training job' : 'Training job';
         $('trainer-detail-status').textContent = job.status;
         $('trainer-detail-status').dataset.status = job.status;
@@ -676,20 +812,30 @@
         $('trainer-detail-step').textContent = `${job.step || 0} / ${job.total_steps || process.train.steps} steps`;
         $('trainer-detail-speed').textContent = job.speed_string || 'Waiting';
         $('trainer-detail-gpu').textContent = `GPU ${job.gpu_ids}`;
-        $('trainer-detail-config').innerHTML = [
-            ['Model', model?.label || process.model.arch],
+        const detailItems = isVae ? [
+            ['Preset', 'Qwen RGBA VAE'],
+            ['Datasets', (job.datasets || []).join(', ')],
+            ['Scope', process.train.scope],
+            ['Resolution', process.train.resolution],
+            ['Learning rate', process.train.lr],
+            ['Validation', `every ${process.validation.every} steps`],
+            ['Deployment', process.save.comfy_export ? 'Diffusers + ComfyUI' : 'Diffusers'],
+        ] : [
+            ['Model', modelLabel],
             ['Datasets', (job.datasets || []).join(', ')],
             ['Target', process.network.type === 'lokr' ? `LoKr · factor ${process.network.lokr_factor}` : `LoRA · rank ${process.network.linear}`],
             ['Optimizer', process.train.optimizer],
             ['Learning rate', process.train.lr],
             ['Sampler', process.sample.sampler],
             ['Quantization', process.model.quantize ? process.model.qtype : 'None'],
-        ].map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>`).join('');
+        ];
+        $('trainer-detail-config').innerHTML = detailItems.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>`).join('');
         const active = ['queued', 'running', 'stopping'].includes(job.status);
         const running = job.status === 'running';
         $('trainer-stop-job-btn').classList.toggle('hidden', !active);
         $('trainer-save-now-btn').classList.toggle('hidden', !running);
-        $('trainer-sample-now-btn').classList.toggle('hidden', !running || process.train.disable_sampling);
+        $('trainer-sample-now-btn').classList.toggle('hidden', !running || (!isVae && process.train.disable_sampling));
+        $('trainer-sample-now-btn').textContent = isVae ? 'Validate now' : 'Sample now';
         $('trainer-start-job-btn').classList.toggle('hidden', active);
         $('trainer-edit-job-btn').disabled = active;
         $('trainer-delete-job-btn').disabled = active;
@@ -725,6 +871,7 @@
     async function refreshState({ initial = false } = {}) {
         const result = await api('/api/trainer/state');
         state.models = result.models || [];
+        state.trainingPresets = result.trainingPresets || [];
         state.qtypes = result.qtypes || [];
         state.datasets = result.datasets || [];
         state.jobs = result.jobs || [];
@@ -732,6 +879,7 @@
         state.trainerInstalled = Boolean(result.trainerInstalled);
         renderRuntime();
         renderModelOptions();
+        renderPresetOptions();
         renderGpuOptions();
         renderDatasetPicker();
         renderJobs();
@@ -823,7 +971,8 @@
 
     function bindEvents() {
         $('trainer-new-job-btn').addEventListener('click', () => showEditor());
-        $('trainer-model').addEventListener('change', () => renderModelFields(true));
+        $('trainer-preset').addEventListener('change', renderPresetFields);
+        $('trainer-model').addEventListener('change', () => renderModelFields(true, true));
         $('trainer-network-type').addEventListener('change', renderConditionalOptions);
         $('trainer-layer-offloading').addEventListener('change', renderConditionalOptions);
         ['trainer-transformer-offload', 'trainer-text-offload'].forEach(id =>

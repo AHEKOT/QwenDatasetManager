@@ -84,6 +84,12 @@ class QwenImageModel(BaseModel):
     def get_bucket_divisibility(self):
         return 16 * 2  # 16 for the VAE, 2 for patch size
 
+    def _load_qwen_vae(self, base_model_path, dtype):
+        """Load the default Qwen VAE; opt-in extensions may override this hook."""
+        return AutoencoderKLQwenImage.from_pretrained(
+            base_model_path, subfolder="vae", torch_dtype=dtype
+        )
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Qwen Image model")
@@ -177,9 +183,7 @@ class QwenImageModel(BaseModel):
             flush()
 
         self.print_and_status_update("Loading VAE")
-        vae = AutoencoderKLQwenImage.from_pretrained(
-            base_model_path, subfolder="vae", torch_dtype=dtype
-        )
+        vae = self._load_qwen_vae(base_model_path, dtype)
 
         self.noise_scheduler = QwenImageModel.get_train_scheduler()
 

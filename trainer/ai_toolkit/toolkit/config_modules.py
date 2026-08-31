@@ -90,7 +90,9 @@ class SampleConfig:
         self.sample_steps = kwargs.get('sample_steps', 20)
         self.network_multiplier = kwargs.get('network_multiplier', 1)
         self.guidance_rescale = kwargs.get('guidance_rescale', 0.0)
-        self.ext: ImgExt = kwargs.get('format', 'jpg')
+        # `format` is the documented key. Keep accepting the old `ext` alias so
+        # existing configs continue to work (RGBA examples used it previously).
+        self.ext: ImgExt = kwargs.get('format', kwargs.get('ext', 'jpg'))
         self.adapter_conditioning_scale = kwargs.get('adapter_conditioning_scale', 1.0)
         self.refiner_start_at = kwargs.get('refiner_start_at',
                                            0.5)  # step to start using refiner on sample if it exists
@@ -651,6 +653,9 @@ class ModelConfig:
         # mainly for decompression loras for distilled models
         self.assistant_lora_path = kwargs.get('assistant_lora_path', None)
         self.inference_lora_path = kwargs.get('inference_lora_path', None)
+        # Optional adapter activated only while periodic/sample generation runs.
+        # Unlike assistant_lora_path it is never part of the training forward pass.
+        self.sample_lora_path = kwargs.get('sample_lora_path', None)
         # a lora that stays inactive except during the unconditional (negative)
         # CFG pass -- used to learn the unconditional branch without a second model
         self.unconditional_lora_path = kwargs.get('unconditional_lora_path', None)
@@ -989,6 +994,58 @@ class DatasetConfig:
         # instead of cropping ot match image, it will serve the full size control image (clip images ie for ip adapters)
         self.full_size_control_images: bool = kwargs.get('full_size_control_images', True)
         self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
+        # RGBA targets are distinct from alpha_mask: the alpha channel is encoded by
+        # a four-channel VAE instead of being consumed as a spatial loss mask.
+        self.pixel_channels: str = str(kwargs.get('pixel_channels', 'rgb')).lower()
+        if kwargs.get('rgba', False):
+            self.pixel_channels = 'rgba'
+        if self.pixel_channels not in ['rgb', 'rgba']:
+            raise ValueError("pixel_channels must be either 'rgb' or 'rgba'")
+        self.rgba_mode: bool = self.pixel_channels == 'rgba'
+        self.rgba_require_alpha: bool = kwargs.get('rgba_require_alpha', True)
+        self.rgba_alpha_threshold: float = float(kwargs.get('rgba_alpha_threshold', 1.0 / 255.0))
+        self.rgba_hidden_rgb_color: List[int] = kwargs.get('rgba_hidden_rgb_color', [0, 0, 0])
+        self.rgba_unblend_background: Union[List[int], None] = kwargs.get('rgba_unblend_background', None)
+        self.rgba_edge_color_correction: str = kwargs.get('rgba_edge_color_correction', 'none')
+        self.rgba_edge_matte_color: List[int] = kwargs.get('rgba_edge_matte_color', [0, 255, 0])
+        self.rgba_edge_width: float = float(kwargs.get('rgba_edge_width', 3.0))
+        if self.rgba_edge_color_correction not in ['none', 'nearest_opaque', 'matte_despill']:
+            raise ValueError(
+                "rgba_edge_color_correction must be 'none', 'nearest_opaque', or 'matte_despill'"
+            )
+        if (
+            len(self.rgba_edge_matte_color) != 3
+            or any(not 0 <= int(x) <= 255 for x in self.rgba_edge_matte_color)
+        ):
+            raise ValueError("rgba_edge_matte_color must contain three integers in [0, 255]")
+        if self.rgba_edge_width <= 0:
+            raise ValueError("rgba_edge_width must be positive")
+        if self.rgba_unblend_background is not None and self.rgba_edge_color_correction != 'none':
+            raise ValueError(
+                "rgba_unblend_background and rgba_edge_color_correction cannot be enabled together"
+            )
+        self.rgba_generate_control: bool = kwargs.get('rgba_generate_control', False)
+        # edit: composite the RGBA target over a deterministic RGB background.
+        # generation: provide an empty black Control1 while keeping the RGBA
+        # image as the training target.
+        self.rgba_control_mode: str = str(kwargs.get('rgba_control_mode', 'edit')).lower()
+        if self.rgba_control_mode not in ['edit', 'generation']:
+            raise ValueError("rgba_control_mode must be either 'edit' or 'generation'")
+        rgba_control_backgrounds = kwargs.get(
+            'rgba_control_backgrounds',
+            kwargs.get('rgba_control_background', [[255, 255, 255], [127, 127, 127], [0, 0, 0]])
+        )
+        if len(rgba_control_backgrounds) == 3 and all(isinstance(x, (int, float)) for x in rgba_control_backgrounds):
+            rgba_control_backgrounds = [rgba_control_backgrounds]
+        self.rgba_control_backgrounds: List[List[int]] = rgba_control_backgrounds
+        if self.rgba_mode and self.alpha_mask:
+            raise ValueError("pixel_channels: rgba cannot be combined with alpha_mask")
+        if self.rgba_generate_control and not self.rgba_mode:
+            raise ValueError("rgba_generate_control requires pixel_channels: rgba")
+        if self.rgba_generate_control and self.control_path is not None:
+            raise ValueError("rgba_generate_control cannot be combined with an explicit control_path")
+        if self.rgba_control_mode == 'generation' and not self.rgba_generate_control:
+            raise ValueError("rgba_control_mode: generation requires rgba_generate_control: true")
         self.mask_path: str = kwargs.get('mask_path',
                                          None)  # focus mask (black and white. White has higher loss than black)
         self.unconditional_path: str = kwargs.get('unconditional_path',
@@ -1010,6 +1067,10 @@ class DatasetConfig:
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
         self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
+        # A generated QIE control is derived from the processed RGBA target. Keep
+        # that tensor available when latents have already been cached.
+        if self.rgba_generate_control:
+            self.load_image_when_caching_latents = True
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)
 
@@ -1017,6 +1078,14 @@ class DatasetConfig:
         # augmentations are returned as a separate image and cannot currently be cached
         self.augmentations: List[dict] = kwargs.get('augmentations', None)
         self.shuffle_augmentations: bool = kwargs.get('shuffle_augmentations', False)
+
+        if self.rgba_mode and self.standardize_images:
+            raise ValueError("standardize_images is not defined for four-channel RGBA targets")
+        if self.rgba_mode and (len(self.augments) > 0 or self.augmentations):
+            raise ValueError(
+                "RGBA mode currently supports crop/resize/flip augmentations only; "
+                "color augments can corrupt the alpha channel"
+            )
 
         has_augmentations = self.augmentations is not None and len(self.augmentations) > 0
 
@@ -1270,17 +1339,20 @@ class GenerateImageConfig:
         for file in files:
             tmp_thumb = os.path.join(tmp_folder, file + '.thumb')
             try:
-                if self._generate_thumbnail(os.path.join(tmp_folder, file), tmp_thumb):
+                thumb_ext = self._generate_thumbnail(os.path.join(tmp_folder, file), tmp_thumb)
+                if thumb_ext:
                     os.makedirs(thumbs_folder, exist_ok=True)
-                    os.replace(tmp_thumb, os.path.join(thumbs_folder, file + '.jpg'))
+                    os.replace(tmp_thumb, os.path.join(thumbs_folder, file + thumb_ext))
             except Exception as e:
                 print(f"Failed to generate thumbnail for {file}: {e}")
         for file in files:
             os.replace(os.path.join(tmp_folder, file), os.path.join(real_folder, file))
 
     def _generate_thumbnail(self, media_path, thumb_path):
-        # 300x300 center-cropped 90% jpg. Returns True if one was written.
+        # 300x300 center-cropped preview. Alpha-bearing images stay RGBA PNG;
+        # opaque images and video frames retain the compact JPEG path.
         from PIL import Image as PILImage
+        from toolkit.rgba_utils import image_has_alpha, resize_rgba_alpha_safe
         ext = os.path.splitext(media_path)[1].lower()
         img = None
         if ext in ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']:
@@ -1293,15 +1365,21 @@ class GenerateImageConfig:
             if ok:
                 img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if img is None:
-            return False
-        img = img.convert('RGB')
+            return None
+        preserve_alpha = image_has_alpha(img)
+        img = img.convert('RGBA' if preserve_alpha else 'RGB')
         w, h = img.size
         side = min(w, h)
         left = (w - side) // 2
         top = (h - side) // 2
-        img = img.crop((left, top, left + side, top + side)).resize((300, 300), PILImage.LANCZOS)
+        img = img.crop((left, top, left + side, top + side))
+        if preserve_alpha:
+            img = resize_rgba_alpha_safe(img, (300, 300), PILImage.Resampling.LANCZOS)
+            img.save(thumb_path, format='PNG', optimize=True)
+            return '.png'
+        img = img.resize((300, 300), PILImage.Resampling.LANCZOS)
         img.save(thumb_path, format='JPEG', quality=90)
-        return True
+        return '.jpg'
 
     def save_image(self, image, count: int = 0, max_count=0):
         # make parent dirs

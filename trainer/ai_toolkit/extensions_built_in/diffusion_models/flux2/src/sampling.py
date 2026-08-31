@@ -68,6 +68,11 @@ def encode_image_refs(
     for img in img_ctx_prep:
         if img.ndim == 3:
             img = img.unsqueeze(0)
+        # Transparent FLUX.2 presets use a four-channel VAE while edit controls
+        # remain ordinary RGB images. Treat controls as fully opaque RGBA.
+        expected_channels = getattr(getattr(ae, "encoder", None), "in_channels", 3)
+        if expected_channels == 4 and img.shape[1] == 3:
+            img = torch.cat((img, torch.ones_like(img[:, :1])), dim=1)
         encoded = ae.encode(img.to(ae.device, ae.dtype))[0]
         encoded_refs.append(encoded)
 

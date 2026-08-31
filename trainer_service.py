@@ -27,11 +27,17 @@ from PIL import Image
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 ACTIVE_STATUSES = {'queued', 'running', 'stopping'}
+TRAINING_PRESETS = {
+    'standard_lora': 'Standard edit LoRA',
+    'transparent_lora': 'Transparent RGBA LoRA',
+    'qwen_rgba_vae': 'Qwen RGBA VAE',
+}
 EDIT_MODELS = {
     'qwen_image_edit_2511': {
         'label': 'Qwen Image Edit 2511',
         'modelPath': 'Qwen/Qwen-Image-Edit-2511',
         'arch': 'qwen_image_edit_plus',
+        'transparentArch': 'qwen_image_edit_plus_rgba',
         'license': 'Apache-2.0',
         'gated': False,
         'gateUrl': None,
@@ -46,6 +52,7 @@ EDIT_MODELS = {
         'label': 'FLUX.2 Klein Base 4B',
         'modelPath': 'black-forest-labs/FLUX.2-klein-base-4B',
         'arch': 'flux2_klein_4b',
+        'transparentArch': 'flux2_klein_4b_rgba',
         'license': 'Apache-2.0',
         'gated': False,
         'gateUrl': None,
@@ -58,6 +65,7 @@ EDIT_MODELS = {
         'label': 'FLUX.2 Klein Base 9B',
         'modelPath': 'black-forest-labs/FLUX.2-klein-base-9B',
         'arch': 'flux2_klein_9b',
+        'transparentArch': 'flux2_klein_9b_rgba',
         'license': 'FLUX Non-Commercial License',
         'gated': True,
         'gateUrl': 'https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B',
@@ -385,9 +393,31 @@ class TrainerService:
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
         }
 
+    @staticmethod
+    def _image_files(folder):
+        if not folder.is_dir():
+            return []
+        return sorted(
+            (
+                path for path in folder.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            ),
+            key=lambda path: path.name.lower(),
+        )
+
     def inspect_dataset(self, name):
         dataset_dir = self._resolve_dataset(name)
-        target_stems = self._image_stems(dataset_dir / 'img')
+        target_files = self._image_files(dataset_dir / 'img')
+        target_stems = {path.stem for path in target_files}
+        alpha_count = 0
+        unreadable_alpha = []
+        for path in target_files:
+            try:
+                with Image.open(path) as image:
+                    if 'A' in image.getbands() or 'transparency' in image.info:
+                        alpha_count += 1
+            except OSError:
+                unreadable_alpha.append(path.name)
         controls = []
         warnings = []
         for index in range(1, 4):
@@ -414,14 +444,21 @@ class TrainerService:
             warnings.append('Dataset has no control images')
         if caption_count < len(target_stems):
             warnings.append(f'{len(target_stems) - caption_count} target files have no caption')
+        if target_files and alpha_count < len(target_files):
+            warnings.append(f'{len(target_files) - alpha_count} target files have no alpha channel')
+        if unreadable_alpha:
+            warnings.append(f'{len(unreadable_alpha)} target files could not be inspected')
         return {
             'name': name,
             'targetPath': str(dataset_dir / 'img'),
             'targetCount': len(target_stems),
+            'alphaCount': alpha_count,
             'captionCount': caption_count,
             'controls': controls,
             'warnings': warnings,
             'valid': bool(target_stems and controls),
+            'transparentValid': bool(target_stems and alpha_count == len(target_files)),
+            'vaeValid': bool(len(target_files) >= 2 and alpha_count == len(target_files)),
         }
 
     @staticmethod
@@ -454,6 +491,45 @@ class TrainerService:
             if parsed in RESOLUTION_OPTIONS:
                 normalized.add(parsed)
         return sorted(normalized) or [512, 768, 1024]
+
+    def _first_existing_asset(self, *relative_or_absolute):
+        for value in relative_or_absolute:
+            path = Path(value)
+            if not path.is_absolute():
+                path = self.project_root / path
+            if path.exists():
+                return str(path.resolve())
+        return ''
+
+    def default_qwen_turbo_lora(self):
+        filename = 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
+        return self._first_existing_asset(
+            Path('models') / filename,
+            Path('trainer') / 'models' / filename,
+            Path(r'D:\AiToolkitNew\AI-Toolkit\models') / filename,
+        )
+
+    def default_qwen_rgba_vae(self):
+        dirname = 'TransparentQIE2511VAE_diffusers'
+        return self._first_existing_asset(
+            Path('models') / dirname,
+            Path('trainer') / 'models' / dirname,
+            Path(r'D:\AiToolkitNew\AI-Toolkit\models') / dirname,
+        )
+
+    @staticmethod
+    def _validate_local_asset(value, label, *, directory=False, optional=False):
+        text = str(value or '').strip()
+        if not text:
+            if optional:
+                return ''
+            raise TrainerValidationError(f'{label} is required')
+        path = Path(text).expanduser().resolve()
+        valid = path.is_dir() if directory else path.is_file()
+        if not valid:
+            kind = 'directory' if directory else 'file'
+            raise TrainerValidationError(f'{label} {kind} does not exist: {path}')
+        return str(path)
 
     def _resolve_managed_target(self, dataset_name, filename=''):
         dataset_dir = self._resolve_dataset(dataset_name)
@@ -502,7 +578,15 @@ class TrainerService:
             raise TrainerValidationError('Invalid sample image filename')
         return self.resolve_sample_image(str(self.sample_images_dir / filename))
 
-    def _build_sample_items(self, payload, inspections):
+    def _black_sample_control(self, width, height):
+        width = clamp_number(width, 64, 4096, 1024, integer=True)
+        height = clamp_number(height, 64, 4096, 1024, integer=True)
+        destination = self.sample_images_dir / f'rgba-generation-black-{width}x{height}.png'
+        if not destination.is_file():
+            Image.new('RGB', (width, height), (0, 0, 0)).save(destination, format='PNG')
+        return destination.resolve()
+
+    def _build_sample_items(self, payload, inspections, preset='standard_lora'):
         raw_samples = payload.get('samples', [])
         if not isinstance(raw_samples, list):
             raise TrainerValidationError('Samples must be a list')
@@ -531,6 +615,24 @@ class TrainerService:
                 samples.append(sample)
                 continue
 
+            if preset == 'transparent_lora' and not raw.get('image') and not raw.get('dataset'):
+                width = raw.get('width') or payload.get('sampleWidth') or 1024
+                height = raw.get('height') or payload.get('sampleHeight') or 1024
+                sample = {
+                    'prompt': str(raw.get('prompt', '')).strip()
+                    or 'Generate an isolated RGBA image with a transparent background',
+                    'ctrl_img_1': str(self._black_sample_control(width, height)),
+                }
+                for key in ('width', 'height', 'seed'):
+                    value = raw.get(key)
+                    if value not in (None, ''):
+                        sample[key] = clamp_number(value, 0, 100_000, 0, integer=True)
+                multiplier = raw.get('networkMultiplier', raw.get('network_multiplier'))
+                if multiplier not in (None, ''):
+                    sample['network_multiplier'] = clamp_number(multiplier, -100, 100, 1)
+                samples.append(sample)
+                continue
+
             # Compatibility for jobs saved before sample images were separated
             # from managed training datasets.
             dataset_name = raw.get('dataset') or inspections[0]['name']
@@ -548,7 +650,7 @@ class TrainerService:
             for control_index in range(1, 4):
                 control = self._matching_image(dataset_dir / f'Control{control_index}', target.stem)
                 if control is not None:
-                    sample[f'ctrl_img_{control_index}'] = str(control)
+                    sample[f'ctrl_img_{control_index}'] = control.as_posix()
             if not any(key.startswith('ctrl_img_') for key in sample):
                 raise TrainerValidationError(f'No matching control image for sample: {target.name}')
             for key, submitted_key in (('width', 'width'), ('height', 'height'), ('seed', 'seed')):
@@ -615,9 +717,14 @@ class TrainerService:
         name = str(payload.get('name', '')).strip()
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', name):
             raise TrainerValidationError('Job name must use letters, numbers, dots, underscores or hyphens')
+        preset = payload.get('trainingPreset', 'standard_lora')
+        if preset not in TRAINING_PRESETS:
+            raise TrainerValidationError('Unsupported training preset')
         model_key = payload.get('model')
         if model_key not in EDIT_MODELS:
             raise TrainerValidationError('Unsupported edit model')
+        if preset == 'qwen_rgba_vae' and model_key != 'qwen_image_edit_2511':
+            raise TrainerValidationError('The RGBA VAE trainer currently supports Qwen only')
         gpu_ids = str(payload.get('gpuIds', '0')).strip()
         if not re.fullmatch(r'\d+(,\d+)*', gpu_ids):
             raise TrainerValidationError('GPU IDs must be a comma-separated list of numbers')
@@ -632,14 +739,164 @@ class TrainerService:
                 raise TrainerValidationError('Invalid dataset configuration')
             dataset_name = dataset.get('name')
             inspection = self.inspect_dataset(dataset_name)
-            if not inspection['valid']:
+            if preset == 'standard_lora' and not inspection['valid']:
                 raise TrainerValidationError(f'Dataset is not ready for edit training: {dataset_name}')
+            if preset == 'transparent_lora' and not inspection['transparentValid']:
+                raise TrainerValidationError(
+                    f'Every target image must contain an alpha channel: {dataset_name}'
+                )
+            if preset == 'qwen_rgba_vae' and not inspection['vaeValid']:
+                raise TrainerValidationError(
+                    f'RGBA VAE training needs at least two alpha-channel images: {dataset_name}'
+                )
             inspections.append(inspection)
-        return name, model_key, gpu_ids, inspections
+        return name, model_key, gpu_ids, inspections, preset
+
+    def _build_qwen_rgba_vae_config(self, payload, name, model_key, gpu_ids, inspections):
+        if payload.get('advancedProcess'):
+            raise TrainerValidationError(
+                'Advanced process override is not available for the RGBA VAE preset'
+            )
+        steps = clamp_number(payload.get('steps'), 1, 10_000_000, 5000, integer=True)
+        save_every = clamp_number(payload.get('saveEvery'), 1, steps, 250, integer=True)
+        validate_every = clamp_number(
+            payload.get('vaeValidateEvery', save_every), 1, steps, save_every, integer=True
+        )
+        vae_scope = str(payload.get('vaeTrainScope', 'full')).strip().lower()
+        if vae_scope not in {'full', 'alpha_boundary'}:
+            raise TrainerValidationError('Unsupported RGBA VAE training scope')
+        vae_dtype = str(payload.get('vaeDtype', 'bf16')).strip().lower()
+        if vae_dtype not in {'bf16', 'fp16', 'fp32'}:
+            raise TrainerValidationError('Unsupported RGBA VAE compute dtype')
+        edge_mode = str(payload.get('rgbaEdgeCorrection', 'matte_despill'))
+        if edge_mode not in {'none', 'nearest_opaque', 'matte_despill'}:
+            raise TrainerValidationError('Unsupported RGBA edge cleanup mode')
+        dataset_configs = []
+        normalized_datasets = []
+        for submitted, inspection in zip(payload['datasets'], inspections):
+            dataset_configs.append({
+                'folder_path': inspection['targetPath'],
+                'recursive': False,
+                'rgba_alpha_threshold': clamp_number(
+                    payload.get('rgbaAlphaThreshold'), 0, 1, 1 / 255
+                ),
+                'rgba_hidden_rgb_color': [0, 0, 0],
+                'rgba_edge_color_correction': edge_mode,
+                'rgba_edge_matte_color': [0, 255, 0],
+                'rgba_edge_width': clamp_number(payload.get('rgbaEdgeWidth'), 0.1, 128, 3),
+                'flip_x': bool(submitted.get('flipX', False)),
+            })
+            normalized_datasets.append({**submitted, 'name': inspection['name']})
+
+        process = {
+            'type': 'qwen_rgba_vae_trainer',
+            'training_folder': str(self.output_dir),
+            'sqlite_db_path': str(self.db_path),
+            'device': 'cuda',
+            'source_vae': {
+                'name_or_path': str(
+                    payload.get('sourceVaePath', 'Qwen/Qwen-Image-Edit-2511')
+                ).strip() or 'Qwen/Qwen-Image-Edit-2511',
+                'subfolder': str(payload.get('sourceVaeSubfolder', 'vae')).strip(),
+                'local_files_only': bool(payload.get('sourceVaeLocalOnly', False)),
+            },
+            'datasets': dataset_configs,
+            'train': {
+                'scope': vae_scope,
+                'resolution': clamp_number(payload.get('vaeResolution'), 64, 2048, 512, integer=True),
+                'batch_size': clamp_number(payload.get('batchSize'), 1, 128, 1, integer=True),
+                'gradient_accumulation': clamp_number(
+                    payload.get('gradientAccumulation'), 1, 1024, 1, integer=True
+                ),
+                'steps': steps,
+                'lr': clamp_number(payload.get('learningRate'), 1e-9, 1, 1e-5),
+                'weight_decay': clamp_number(payload.get('weightDecay'), 0, 1, 0),
+                'max_grad_norm': clamp_number(payload.get('vaeMaxGradNorm'), 0, 1000, 1),
+                'dtype': vae_dtype,
+                'gradient_checkpointing': bool(payload.get('vaeGradientCheckpointing', True)),
+                'alpha_lr_multiplier': clamp_number(
+                    payload.get('vaeAlphaLrMultiplier'), 0.1, 1000, 10
+                ),
+                'alpha_encoder_zero_dc': bool(payload.get('vaeAlphaEncoderZeroDc', False)),
+                'num_workers': clamp_number(payload.get('vaeWorkers'), 0, 64, 2, integer=True),
+            },
+            'loss': {
+                'visible_rgb': clamp_number(payload.get('vaeLossVisibleRgb'), 0, 1000, 1),
+                'alpha': clamp_number(payload.get('vaeLossAlpha'), 0, 1000, 2),
+                'alpha_edge': clamp_number(payload.get('vaeLossAlphaEdge'), 0, 1000, 1),
+                'composite': clamp_number(payload.get('vaeLossComposite'), 0, 1000, 1),
+                'opaque_latent': clamp_number(payload.get('vaeLossOpaqueLatent'), 0, 1000, 5),
+                'opaque_rgb': clamp_number(payload.get('vaeLossOpaqueRgb'), 0, 1000, 1),
+                'opaque_alpha': clamp_number(payload.get('vaeLossOpaqueAlpha'), 0, 1000, 0.5),
+                'latent_delta': clamp_number(payload.get('vaeLossLatentDelta'), 0, 1000, 0.01),
+                'perceptual': clamp_number(payload.get('vaeLossPerceptual'), 0, 1000, 0.1),
+            },
+            'save': {
+                'every': save_every,
+                'max_to_keep': clamp_number(payload.get('maxSaves'), 1, 1000, 4, integer=True),
+                'comfy_export': bool(payload.get('vaeComfyExport', True)),
+            },
+            'validation': {
+                'every': validate_every,
+                'fraction': clamp_number(payload.get('vaeValidationFraction'), 0.001, 0.99, 0.05),
+                'min_images': clamp_number(payload.get('vaeValidationMinImages'), 1, 10000, 8, integer=True),
+                'max_images': clamp_number(payload.get('vaeValidationMaxImages'), 1, 10000, 32, integer=True),
+                'preview_images': clamp_number(payload.get('vaePreviewImages'), 1, 100, 4, integer=True),
+                'required_consecutive_passes': clamp_number(
+                    payload.get('vaeRequiredPasses'), 1, 100, 2, integer=True
+                ),
+                'stop_when_ready': bool(payload.get('vaeStopWhenReady', False)),
+                'thresholds': {
+                    'finite_fraction': 1.0,
+                    'visible_rgb_mae': clamp_number(payload.get('vaeReadyVisibleRgb'), 0, 1000, 0.06),
+                    'alpha_mae': clamp_number(payload.get('vaeReadyAlpha'), 0, 1000, 0.08),
+                    'alpha_edge_mae': clamp_number(payload.get('vaeReadyAlphaEdge'), 0, 1000, 0.12),
+                    'composite_mae': clamp_number(payload.get('vaeReadyComposite'), 0, 1000, 0.05),
+                    'alpha_iou': clamp_number(payload.get('vaeReadyAlphaIou'), 0, 1, 0.90),
+                    'opaque_latent_rmse': clamp_number(
+                        payload.get('vaeReadyOpaqueLatent'), 0, 1000, 0.03
+                    ),
+                },
+            },
+            'sample': {
+                'sampler': 'vae_roundtrip',
+                'format': 'png',
+                'sample_every': validate_every,
+                'sample_start_step': 0,
+                'width': clamp_number(payload.get('vaeResolution'), 64, 2048, 512, integer=True),
+                'height': clamp_number(payload.get('vaeResolution'), 64, 2048, 512, integer=True),
+                'samples': [{'prompt': 'RGBA VAE round-trip validation'}],
+                'seed': 0,
+                'walk_seed': False,
+                'guidance_scale': 0,
+                'sample_steps': 0,
+            },
+        }
+        config = {
+            'job': 'extension',
+            'config': {'name': name, 'process': [process]},
+            'meta': {
+                'name': '[name]',
+                'version': '1.0',
+                'qdm': {
+                    'modelKey': model_key,
+                    'trainingPreset': 'qwen_rgba_vae',
+                    'gpuIds': gpu_ids,
+                    'datasets': normalized_datasets,
+                    'form': copy.deepcopy(payload),
+                    'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
+                },
+            },
+        }
+        return name, gpu_ids, config, inspections
 
     def build_job_config(self, payload):
-        name, model_key, gpu_ids, inspections = self.validate_payload(payload)
+        name, model_key, gpu_ids, inspections, preset = self.validate_payload(payload)
         model = EDIT_MODELS[model_key]
+        if preset == 'qwen_rgba_vae':
+            return self._build_qwen_rgba_vae_config(
+                payload, name, model_key, gpu_ids, inspections
+            )
         qtype = payload.get('qtype', model['defaultQtype'])
         allowed_qtypes = set(QTYPE_OPTIONS) | set(model['accuracyRecoveryAdapters'].values())
         if qtype not in allowed_qtypes:
@@ -650,6 +907,23 @@ class TrainerService:
         model_path = str(payload.get('modelPath', model['modelPath'])).strip()
         if not model_path or len(model_path) > 1024 or '\x00' in model_path:
             raise TrainerValidationError('Model name or path is invalid')
+        transparent = preset == 'transparent_lora'
+        model_arch = model['transparentArch'] if transparent else model['arch']
+        vae_path = ''
+        if transparent:
+            submitted_vae_path = payload.get('vaePath')
+            if not submitted_vae_path and model_key == 'qwen_image_edit_2511':
+                submitted_vae_path = self.default_qwen_rgba_vae()
+            vae_path = self._validate_local_asset(
+                submitted_vae_path,
+                'RGBA VAE path',
+                directory=model_key == 'qwen_image_edit_2511',
+            )
+        sample_lora_path = self._validate_local_asset(
+            payload.get('sampleLoraPath'), 'Turbo sampling LoRA', optional=True
+        )
+        if sample_lora_path and Path(sample_lora_path).suffix.lower() != '.safetensors':
+            raise TrainerValidationError('Turbo sampling LoRA must be a .safetensors file')
 
         dataset_configs = []
         normalized_datasets = []
@@ -674,8 +948,39 @@ class TrainerService:
                 'flip_x': bool(submitted.get('flipX', False)),
                 'flip_y': bool(submitted.get('flipY', False)),
             }
+            if transparent:
+                rgba_control_mode = str(submitted.get('rgbaControlMode', 'edit')).lower()
+                if rgba_control_mode not in {'edit', 'generation'}:
+                    raise TrainerValidationError('RGBA dataset mode must be edit or generation')
+                edge_mode = str(payload.get('rgbaEdgeCorrection', 'matte_despill'))
+                if edge_mode not in {'none', 'nearest_opaque', 'matte_despill'}:
+                    raise TrainerValidationError('Unsupported RGBA edge cleanup mode')
+                dataset_config.update({
+                    'pixel_channels': 'rgba',
+                    'rgba_require_alpha': True,
+                    'rgba_alpha_threshold': clamp_number(
+                        payload.get('rgbaAlphaThreshold'), 0, 1, 1 / 255
+                    ),
+                    'rgba_hidden_rgb_color': [0, 0, 0],
+                    'rgba_edge_color_correction': edge_mode,
+                    'rgba_edge_matte_color': [0, 255, 0],
+                    'rgba_edge_width': clamp_number(payload.get('rgbaEdgeWidth'), 0.1, 128, 3),
+                })
+                if rgba_control_mode == 'generation' or not control_paths:
+                    dataset_config.pop('control_path', None)
+                    dataset_config['rgba_generate_control'] = True
+                    dataset_config['rgba_control_mode'] = rgba_control_mode
+                    if rgba_control_mode == 'edit':
+                        dataset_config['rgba_control_backgrounds'] = [
+                            [255, 255, 255], [127, 127, 127], [0, 0, 0]
+                        ]
             dataset_configs.append(dataset_config)
-            normalized_datasets.append({**submitted, 'name': inspection['name'], 'resolutions': resolutions})
+            normalized_datasets.append({
+                **submitted,
+                'name': inspection['name'],
+                'resolutions': resolutions,
+                **({'rgbaControlMode': str(submitted.get('rgbaControlMode', 'edit')).lower()} if transparent else {}),
+            })
 
         rank = clamp_number(payload.get('rank'), 1, 1024, 32, integer=True)
         steps = clamp_number(payload.get('steps'), 1, 10_000_000, 3000, integer=True)
@@ -706,7 +1011,7 @@ class TrainerService:
             raise TrainerValidationError('Unsupported save data type')
 
         disable_sampling = bool(payload.get('disableSampling', not payload.get('sampleEnabled', False)))
-        samples = [] if disable_sampling else self._build_sample_items(payload, inspections)
+        samples = [] if disable_sampling else self._build_sample_items(payload, inspections, preset)
         validation_config = self._build_validation_config(payload, inspections)
         model_kwargs = {'match_target_res': bool(payload.get('matchTargetResolution', False))}
         unload_text_encoder = bool(payload.get('unloadTextEncoder', False)) and model['allowUnloadTextEncoder']
@@ -789,7 +1094,7 @@ class TrainerService:
                     'logging': {'log_every': 1, 'use_ui_logger': True},
                     'model': {
                         'name_or_path': model_path,
-                        'arch': model['arch'],
+                        'arch': model_arch,
                         'quantize': bool(qtype),
                         'qtype': qtype or 'qfloat8',
                         'quantize_te': bool(qtype_te),
@@ -800,10 +1105,13 @@ class TrainerService:
                         'layer_offloading_text_encoder_percent': clamp_number(payload.get('textEncoderOffload'), 0, 1, 1),
                         'model_kwargs': model_kwargs,
                         'compile': compile_model,
+                        **({'vae_path': vae_path} if vae_path else {}),
+                        **({'sample_lora_path': sample_lora_path} if sample_lora_path else {}),
                         **({'block_compile': True} if compile_model else {}),
                     },
                     'sample': {
                         'sampler': sampler,
+                        **({'format': 'png'} if transparent else {}),
                         'sample_every': clamp_number(payload.get('sampleEvery'), 1, steps, save_every, integer=True),
                         'sample_start_step': clamp_number(payload.get('sampleStartStep'), 0, steps, 0, integer=True),
                         'width': clamp_number(payload.get('sampleWidth'), 64, 4096, 1024, integer=True),
@@ -812,8 +1120,14 @@ class TrainerService:
                         'neg': '',
                         'seed': clamp_number(payload.get('sampleSeed'), 0, 2**32 - 1, 42, integer=True),
                         'walk_seed': bool(payload.get('walkSeed', True)),
-                        'guidance_scale': clamp_number(payload.get('guidanceScale'), 0, 1000, 4),
-                        'sample_steps': clamp_number(payload.get('sampleSteps'), 1, 1000, 30, integer=True),
+                        'guidance_scale': (
+                            1.0 if sample_lora_path and model_key == 'qwen_image_edit_2511'
+                            else clamp_number(payload.get('guidanceScale'), 0, 1000, 4)
+                        ),
+                        'sample_steps': (
+                            4 if sample_lora_path and model_key == 'qwen_image_edit_2511'
+                            else clamp_number(payload.get('sampleSteps'), 1, 1000, 30, integer=True)
+                        ),
                     },
                 }],
             },
@@ -822,6 +1136,7 @@ class TrainerService:
                 'version': '1.0',
                 'qdm': {
                     'modelKey': model_key,
+                    'trainingPreset': preset,
                     'gpuIds': gpu_ids,
                     'datasets': normalized_datasets,
                     'form': copy.deepcopy(payload),
@@ -844,7 +1159,7 @@ class TrainerService:
             advanced_model = advanced_process.get('model')
             if not isinstance(advanced_model, dict):
                 raise TrainerValidationError('Advanced process config is missing model settings')
-            if advanced_model.get('arch', model['arch']) != model['arch']:
+            if advanced_model.get('arch', model_arch) != model_arch:
                 raise TrainerValidationError('Advanced config cannot change the selected edit architecture')
             advanced_qtype = advanced_model.get('qtype', model['defaultQtype']) if advanced_model.get('quantize', True) else ''
             if advanced_qtype not in allowed_qtypes:
@@ -862,6 +1177,11 @@ class TrainerService:
             advanced_sample = advanced_process.get('sample')
             if not isinstance(advanced_sample, dict) or advanced_sample.get('sampler', 'flowmatch') not in SAMPLER_OPTIONS:
                 raise TrainerValidationError('Unsupported sampler in advanced config')
+            if transparent:
+                advanced_sample['format'] = 'png'
+            if sample_lora_path and model_key == 'qwen_image_edit_2511':
+                advanced_sample['sample_steps'] = 4
+                advanced_sample['guidance_scale'] = 1.0
             advanced_process.update({
                 'type': 'diffusion_trainer',
                 'training_folder': str(self.output_dir),
@@ -870,7 +1190,15 @@ class TrainerService:
                 'performance_log_every': 10,
                 'datasets': dataset_configs,
             })
-            advanced_model['arch'] = model['arch']
+            advanced_model['arch'] = model_arch
+            if vae_path:
+                advanced_model['vae_path'] = vae_path
+            else:
+                advanced_model.pop('vae_path', None)
+            if sample_lora_path:
+                advanced_model['sample_lora_path'] = sample_lora_path
+            else:
+                advanced_model.pop('sample_lora_path', None)
             config['config']['process'][0] = advanced_process
         return name, gpu_ids, config, inspections
 
@@ -963,9 +1291,16 @@ class TrainerService:
         if row['status'] in {'running', 'stopping'}:
             raise TrainerValidationError('Job is already active')
         config = json.loads(row['job_config'])
-        for item in config.get('meta', {}).get('qdm', {}).get('datasets', []):
+        qdm_meta = config.get('meta', {}).get('qdm', {})
+        preset = qdm_meta.get('trainingPreset', 'standard_lora')
+        for item in qdm_meta.get('datasets', []):
             inspection = self.inspect_dataset(item['name'])
-            if not inspection['valid']:
+            ready = inspection['valid']
+            if preset == 'transparent_lora':
+                ready = inspection['transparentValid']
+            elif preset == 'qwen_rgba_vae':
+                ready = inspection['vaeValid']
+            if not ready:
                 raise TrainerValidationError(f"Dataset is not ready: {item['name']}")
         with self._db_lock, self.connect() as connection:
             highest = connection.execute('SELECT MAX(queue_position) AS value FROM "Job"').fetchone()['value'] or 0
@@ -1037,8 +1372,21 @@ class TrainerService:
             return handle.read().decode('utf-8', errors='replace')
 
     def state(self):
+        models = []
+        for key, value in EDIT_MODELS.items():
+            item = {**value, 'key': key}
+            item['defaultSampleLoraPath'] = (
+                self.default_qwen_turbo_lora() if key == 'qwen_image_edit_2511' else ''
+            )
+            item['defaultRgbaVaePath'] = (
+                self.default_qwen_rgba_vae() if key == 'qwen_image_edit_2511' else ''
+            )
+            models.append(item)
         return {
-            'models': [{**value, 'key': key} for key, value in EDIT_MODELS.items()],
+            'models': models,
+            'trainingPresets': [
+                {'key': key, 'label': label} for key, label in TRAINING_PRESETS.items()
+            ],
             'qtypes': list(QTYPE_OPTIONS),
             'optimizers': sorted(OPTIMIZER_OPTIONS),
             'samplers': sorted(SAMPLER_OPTIONS),
@@ -1075,7 +1423,16 @@ def create_trainer_blueprint(service: TrainerService):
         try:
             payload = request.get_json() or {}
             inspections = [service.inspect_dataset(name) for name in payload.get('datasets', [])]
-            return jsonify({'datasets': inspections, 'valid': bool(inspections) and all(item['valid'] for item in inspections)})
+            preset = payload.get('trainingPreset', 'standard_lora')
+            validity_key = {
+                'standard_lora': 'valid',
+                'transparent_lora': 'transparentValid',
+                'qwen_rgba_vae': 'vaeValid',
+            }.get(preset, 'valid')
+            return jsonify({
+                'datasets': inspections,
+                'valid': bool(inspections) and all(item[validity_key] for item in inspections),
+            })
         except Exception as exc:
             return handle_error(exc)
 

@@ -31,6 +31,12 @@ from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
+from toolkit.rgba_utils import (
+    choose_deterministic_background,
+    prepare_rgba_image,
+    resize_rgba_alpha_safe,
+    rgba_tensor_to_rgb_control,
+)
 from toolkit.accelerator import get_accelerator
 from toolkit.prompt_utils import PromptEmbeds
 from torchvision.transforms import functional as TF
@@ -898,7 +904,19 @@ class ImageProcessingDTOMixin:
             print_acc(f"Error: {e}")
             print_acc(f"Error loading image: {self.path}")
 
-        if self.use_alpha_as_mask:
+        is_rgba_target = self.dataset_config.rgba_mode
+        if is_rgba_target:
+            img = prepare_rgba_image(
+                img,
+                require_alpha=self.dataset_config.rgba_require_alpha,
+                alpha_threshold=self.dataset_config.rgba_alpha_threshold,
+                hidden_rgb_color=self.dataset_config.rgba_hidden_rgb_color,
+                unblend_background=self.dataset_config.rgba_unblend_background,
+                edge_color_correction=self.dataset_config.rgba_edge_color_correction,
+                edge_matte_color=self.dataset_config.rgba_edge_matte_color,
+                edge_width=self.dataset_config.rgba_edge_width,
+            )
+        elif self.use_alpha_as_mask:
             # we do this to make sure it does not replace the alpha with another color
             # we want the image just without the alpha channel
             np_img = np.array(img)
@@ -906,7 +924,19 @@ class ImageProcessingDTOMixin:
             np_img = np_img[:, :, :3]
             img = Image.fromarray(np_img)
 
-        img = img.convert('RGB')
+        if not is_rgba_target:
+            img = img.convert('RGB')
+
+        def resize_target(target_img, size):
+            if is_rgba_target:
+                return resize_rgba_alpha_safe(
+                    target_img,
+                    size,
+                    Image.Resampling.BICUBIC,
+                    hidden_rgb_color=self.dataset_config.rgba_hidden_rgb_color,
+                )
+            return target_img.resize(size, Image.Resampling.BICUBIC)
+
         w, h = img.size
         if w > h and self.scale_to_width < self.scale_to_height:
             # throw error, they should match
@@ -926,7 +956,7 @@ class ImageProcessingDTOMixin:
 
         if self.dataset_config.buckets:
             # scale and crop based on file item
-            img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
+            img = resize_target(img, (self.scale_to_width, self.scale_to_height))
             # crop to x_crop, y_crop, x_crop + crop_width, y_crop + crop_height
             if img.width < self.crop_x + self.crop_width or img.height < self.crop_y + self.crop_height:
                 # todo look into this. This still happens sometimes
@@ -942,9 +972,10 @@ class ImageProcessingDTOMixin:
         else:
             # Downscale the source image first
             # TODO this is nto right
-            img = img.resize(
+            img = resize_target(
+                img,
                 (int(img.size[0] * self.dataset_config.scale), int(img.size[1] * self.dataset_config.scale)),
-                Image.BICUBIC)
+            )
             min_img_size = min(img.size)
             if self.dataset_config.random_crop:
                 if self.dataset_config.random_scale and min_img_size > self.dataset_config.resolution:
@@ -957,11 +988,11 @@ class ImageProcessingDTOMixin:
                     scaler = scale_size / min_img_size
                     scale_width = int((img.width + 5) * scaler)
                     scale_height = int((img.height + 5) * scaler)
-                    img = img.resize((scale_width, scale_height), Image.BICUBIC)
+                    img = resize_target(img, (scale_width, scale_height))
                 img = transforms.RandomCrop(self.dataset_config.resolution)(img)
             else:
                 img = transforms.CenterCrop(min_img_size)(img)
-                img = img.resize((self.dataset_config.resolution, self.dataset_config.resolution), Image.BICUBIC)
+                img = resize_target(img, (self.dataset_config.resolution, self.dataset_config.resolution))
 
         if self.augments is not None and len(self.augments) > 0:
             # do augmentations
@@ -976,8 +1007,12 @@ class ImageProcessingDTOMixin:
             img = transform(img)
 
         self.tensor = img
+        if self.dataset_config.rgba_generate_control:
+            # Text-embedding caching requests only_load_latents=True, but QIE's
+            # visual prompt embedding still needs this generated RGB control.
+            self.load_control_image()
         if not only_load_latents:
-            if self.has_control_image:
+            if self.has_control_image and not self.dataset_config.rgba_generate_control:
                 self.load_control_image()
             if self.has_inpaint_image:
                 self.load_inpaint_image()
@@ -1125,6 +1160,11 @@ class ControlFileItemDTOMixin:
             # assume we have them. We will pull them on load.
             self.full_size_control_images = dataset_config.full_size_control_images
             self.has_control_image = True
+        if dataset_config.rgba_generate_control:
+            # QIE still receives RGB conditioning. It is generated after the
+            # target has gone through the exact same crop/resize/flip path.
+            self.full_size_control_images = True
+            self.has_control_image = True
 
     def get_new_control_paths(self: 'FileItemDTO'):
         if self.dataset_config.control_from_same_folder:
@@ -1144,6 +1184,23 @@ class ControlFileItemDTOMixin:
             return self.control_path
 
     def load_control_image(self: 'FileItemDTO'):
+        if self.dataset_config.rgba_generate_control:
+            if self.tensor is None:
+                raise ValueError("cannot generate an RGBA control before the target tensor is loaded")
+            if self.dataset_config.rgba_control_mode == 'generation':
+                # QIE2511 is still an edit architecture and requires Control1.
+                # An empty opaque-black RGB image teaches the transformer that
+                # the target must be generated rather than copied/edited.
+                self.control_tensor = torch.zeros_like(self.tensor[:3])
+            else:
+                background = choose_deterministic_background(
+                    self.path,
+                    self.dataset_config.rgba_control_backgrounds,
+                )
+                self.control_tensor = rgba_tensor_to_rgb_control(self.tensor, background)
+            self.control_tensor_list = None
+            return
+
         control_tensors = []
         control_path_list = self.get_new_control_paths()
         if not isinstance(control_path_list, list):
@@ -1822,6 +1879,15 @@ class LatentCachingFileItemDTOMixin:
         if self.dataset_config.cache_tensors_to_disk:
             # tensor is stored in the cache file, invalidate caches made without it
             item["cache_tensors_to_disk"] = True
+        if self.dataset_config.rgba_mode:
+            item["pixel_channels"] = "rgba"
+            item["rgba_preprocess_version"] = 1
+            item["rgba_alpha_threshold"] = self.dataset_config.rgba_alpha_threshold
+            item["rgba_hidden_rgb_color"] = self.dataset_config.rgba_hidden_rgb_color
+            item["rgba_unblend_background"] = self.dataset_config.rgba_unblend_background
+            item["rgba_edge_color_correction"] = self.dataset_config.rgba_edge_color_correction
+            item["rgba_edge_matte_color"] = self.dataset_config.rgba_edge_matte_color
+            item["rgba_edge_width"] = self.dataset_config.rgba_edge_width
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -2134,6 +2200,21 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+        if self.encode_control_in_text_embeddings and self.dataset_config.rgba_generate_control:
+            item["rgba_generated_control"] = True
+            if self.dataset_config.rgba_control_mode == 'generation':
+                # The explicit marker prevents a copied edit cache from being
+                # reused for an empty-black visual prompt.  Keep legacy edit
+                # keys unchanged so existing valid caches remain reusable.
+                item["rgba_control_mode"] = 'generation'
+            else:
+                item["rgba_control_backgrounds"] = self.dataset_config.rgba_control_backgrounds
+            item["rgba_alpha_threshold"] = self.dataset_config.rgba_alpha_threshold
+            item["rgba_hidden_rgb_color"] = self.dataset_config.rgba_hidden_rgb_color
+            item["rgba_unblend_background"] = self.dataset_config.rgba_unblend_background
+            item["rgba_edge_color_correction"] = self.dataset_config.rgba_edge_color_correction
+            item["rgba_edge_matte_color"] = self.dataset_config.rgba_edge_matte_color
+            item["rgba_edge_width"] = self.dataset_config.rgba_edge_width
         if self.encode_control_in_text_embeddings and getattr(self, 'control_video_paths', None):
             item["control_videos"] = sorted(self.control_video_paths)
             # v2: reference-video vision blocks are no longer resampled by the
@@ -2316,9 +2397,21 @@ class TextEmbeddingCachingMixin:
 
                     control_video_paths = getattr(file_item, 'control_video_paths', None) or []
                     if file_item.encode_control_in_text_embeddings and (
-                        file_item.control_path is not None or len(control_video_paths) > 0
+                        file_item.control_path is not None
+                        or len(control_video_paths) > 0
+                        or file_item.dataset_config.rgba_generate_control
                     ):
                         ctrl_img_list = []
+                        if file_item.dataset_config.rgba_generate_control:
+                            file_item.load_and_process_image(self.transform, only_load_latents=True)
+                            if file_item.control_tensor is None:
+                                raise ValueError(
+                                    f"Failed to generate RGB control for RGBA target: {file_item.path}"
+                                )
+                            ctrl_img_list.append(file_item.control_tensor.unsqueeze(0).to(
+                                self.sd.device_torch,
+                                dtype=self.sd.torch_dtype,
+                            ))
                         control_path_list = file_item.control_path
                         if control_path_list is None:
                             control_path_list = []

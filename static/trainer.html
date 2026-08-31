@@ -103,14 +103,18 @@
                                         <span>GPU</span>
                                         <select id="trainer-gpu" name="gpuIds"><option value="0">GPU 0</option></select>
                                     </label>
-                                    <label class="trainer-field" for="trainer-trigger">
+                                    <label class="trainer-field" for="trainer-preset">
+                                        <span>Training preset</span>
+                                        <select id="trainer-preset" name="trainingPreset"></select>
+                                    </label>
+                                    <label class="trainer-field trainer-lora-only" for="trainer-trigger">
                                         <span>Trigger word <small>optional</small></span>
                                         <input id="trainer-trigger" name="triggerWord" type="text" autocomplete="off">
                                     </label>
                                 </div>
                             </section>
 
-                            <section class="trainer-card trainer-card-model">
+                            <section class="trainer-card trainer-card-model trainer-lora-only">
                                 <div class="trainer-card-heading"><span>Model</span><span id="trainer-model-license" class="trainer-card-badge">Apache-2.0</span></div>
                                 <div class="trainer-fields">
                                     <label class="trainer-field" for="trainer-model">
@@ -129,7 +133,7 @@
                                 </div>
                             </section>
 
-                            <section class="trainer-card">
+                            <section class="trainer-card trainer-lora-only">
                                 <div class="trainer-card-heading"><span>Quantize / compile</span></div>
                                 <div class="trainer-fields">
                                     <label class="trainer-field" for="trainer-qtype">
@@ -146,7 +150,7 @@
                                 </div>
                             </section>
 
-                            <section class="trainer-card">
+                            <section class="trainer-card trainer-lora-only">
                                 <div class="trainer-card-heading"><span>Target / save</span></div>
                                 <div class="trainer-fields trainer-two-columns">
                                     <label class="trainer-field" for="trainer-network-type"><span>Target type</span><select id="trainer-network-type"><option value="lora">LoRA</option><option value="lokr">LoKr</option></select></label>
@@ -159,7 +163,7 @@
                             </section>
                         </div>
 
-                        <section class="trainer-card trainer-wide-card">
+                        <section class="trainer-card trainer-wide-card trainer-lora-only">
                             <div class="trainer-card-heading"><span>Training</span></div>
                             <div class="trainer-training-grid">
                                 <label class="trainer-field" for="trainer-batch-size"><span>Batch size</span><input id="trainer-batch-size" type="number" min="1" max="128" value="1"></label>
@@ -181,7 +185,7 @@
                             </div>
                         </section>
 
-                        <details class="trainer-advanced trainer-wide-card">
+                        <details class="trainer-advanced trainer-wide-card trainer-lora-only">
                             <summary>Regularization and guidance</summary>
                             <div class="trainer-option-groups">
                                 <section>
@@ -212,6 +216,48 @@
                             </div>
                         </details>
 
+                        <section class="trainer-card trainer-wide-card trainer-transparent-only hidden">
+                            <div class="trainer-card-heading"><span>Transparent RGBA preset</span><span class="trainer-card-badge">alpha-safe</span></div>
+                            <div class="trainer-training-grid">
+                                <label class="trainer-field trainer-span-2" for="trainer-vae-path"><span>Compatible RGBA VAE path</span><input id="trainer-vae-path" type="text" autocomplete="off" spellcheck="false" placeholder="Local Diffusers directory for Qwen; .safetensors for Klein"></label>
+                                <label class="trainer-field" for="trainer-rgba-edge-correction"><span>Edge cleanup</span><select id="trainer-rgba-edge-correction"><option value="matte_despill">Green matte despill</option><option value="nearest_opaque">Nearest opaque</option><option value="none">None</option></select></label>
+                                <label class="trainer-field" for="trainer-rgba-edge-width"><span>Edge width</span><input id="trainer-rgba-edge-width" type="number" min="0.1" step="0.1" value="3"></label>
+                                <label class="trainer-field" for="trainer-rgba-alpha-threshold"><span>Hidden RGB alpha threshold</span><input id="trainer-rgba-alpha-threshold" type="number" min="0" max="1" step="0.0001" value="0.0039215686"></label>
+                            </div>
+                            <p class="trainer-help">Targets stay RGBA. Fully transparent hidden RGB is cleared, resizing is performed in premultiplied-alpha space, and green spill can be corrected only at the alpha boundary. Klein requires its own z=32 four-channel VAE; the Qwen z=16 VAE is intentionally rejected.</p>
+                        </section>
+
+                        <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
+                            <div class="trainer-card-heading"><span>Qwen RGBA VAE training</span><span class="trainer-card-badge">round-trip validation</span></div>
+                            <div class="trainer-training-grid">
+                                <label class="trainer-field trainer-span-2" for="trainer-source-vae-path"><span>Standard Qwen model / path</span><input id="trainer-source-vae-path" type="text" value="Qwen/Qwen-Image-Edit-2511" autocomplete="off" spellcheck="false"></label>
+                                <label class="trainer-field" for="trainer-source-vae-subfolder"><span>VAE subfolder</span><input id="trainer-source-vae-subfolder" type="text" value="vae"></label>
+                                <label class="trainer-field" for="trainer-vae-batch-size"><span>Batch size</span><input id="trainer-vae-batch-size" type="number" min="1" max="128" value="1"></label>
+                                <label class="trainer-field" for="trainer-vae-gradient-accumulation"><span>Gradient accumulation</span><input id="trainer-vae-gradient-accumulation" type="number" min="1" max="1024" value="1"></label>
+                                <label class="trainer-field" for="trainer-vae-steps"><span>Steps</span><input id="trainer-vae-steps" type="number" min="1" value="5000"></label>
+                                <label class="trainer-field" for="trainer-vae-learning-rate"><span>Learning rate</span><input id="trainer-vae-learning-rate" type="number" min="0" step="0.000001" value="0.00001"></label>
+                                <label class="trainer-field" for="trainer-vae-weight-decay"><span>Weight decay</span><input id="trainer-vae-weight-decay" type="number" min="0" step="0.00001" value="0"></label>
+                                <label class="trainer-field" for="trainer-vae-save-every"><span>Save every</span><input id="trainer-vae-save-every" type="number" min="1" value="250"></label>
+                                <label class="trainer-field" for="trainer-vae-max-saves"><span>Max saves</span><input id="trainer-vae-max-saves" type="number" min="1" value="4"></label>
+                                <label class="trainer-field" for="trainer-vae-resolution"><span>Resolution</span><input id="trainer-vae-resolution" type="number" min="64" max="2048" value="512"></label>
+                                <label class="trainer-field" for="trainer-vae-scope"><span>Training scope</span><select id="trainer-vae-scope"><option value="full">Full VAE</option><option value="alpha_boundary">Alpha boundary only</option></select></label>
+                                <label class="trainer-field" for="trainer-vae-dtype"><span>Compute dtype</span><select id="trainer-vae-dtype"><option value="bf16">BF16</option><option value="fp16">FP16</option><option value="fp32">FP32</option></select></label>
+                                <label class="trainer-field" for="trainer-vae-alpha-lr"><span>Alpha LR multiplier</span><input id="trainer-vae-alpha-lr" type="number" min="0.1" step="0.1" value="10"></label>
+                                <label class="trainer-field" for="trainer-vae-workers"><span>Data workers</span><input id="trainer-vae-workers" type="number" min="0" max="64" value="2"></label>
+                                <label class="trainer-field" for="trainer-vae-max-grad"><span>Max grad norm</span><input id="trainer-vae-max-grad" type="number" min="0" step="0.1" value="1"></label>
+                                <label class="trainer-field" for="trainer-vae-validate-every"><span>Validate every</span><input id="trainer-vae-validate-every" type="number" min="1" value="250"></label>
+                                <label class="trainer-field" for="trainer-vae-validation-images"><span>Validation images</span><input id="trainer-vae-validation-images" type="number" min="1" value="32"></label>
+                                <label class="trainer-field" for="trainer-vae-required-passes"><span>READY passes</span><input id="trainer-vae-required-passes" type="number" min="1" value="2"></label>
+                            </div>
+                            <div class="trainer-toggle-row trainer-training-toggles">
+                                <label class="trainer-switch"><input id="trainer-source-vae-local" type="checkbox"><span></span>Local source files only</label>
+                                <label class="trainer-switch"><input id="trainer-vae-gradient-checkpointing" type="checkbox" checked><span></span>Gradient checkpointing</label>
+                                <label class="trainer-switch"><input id="trainer-vae-stop-ready" type="checkbox"><span></span>Stop when READY</label>
+                                <label class="trainer-switch"><input id="trainer-vae-comfy-export" type="checkbox" checked><span></span>Export ComfyUI VAE</label>
+                            </div>
+                            <p class="trainer-help">There is no diffusion sampling. A fixed holdout is encoded and decoded as RGBA; READY requires consecutive passes for visible RGB, alpha, alpha edge, composites, finite values, IoU and opaque-latent compatibility. “Sample now” runs this validation.</p>
+                        </section>
+
                         <section class="trainer-card trainer-wide-card trainer-datasets-section">
                             <div class="trainer-card-heading trainer-datasets-heading">
                                 <div><span>Datasets</span><small id="trainer-dataset-summary">Select one or more managed datasets</small></div>
@@ -230,7 +276,7 @@
                             </div>
                         </section>
 
-                        <section class="trainer-card trainer-wide-card">
+                        <section class="trainer-card trainer-wide-card trainer-lora-only">
                             <div class="trainer-card-heading">
                                 <span>Validation</span>
                                 <label class="trainer-switch"><input id="trainer-validation-enabled" type="checkbox"><span></span>Enable</label>
@@ -246,10 +292,11 @@
                             </div>
                         </section>
 
-                        <details class="trainer-advanced trainer-wide-card" open>
+                        <details class="trainer-advanced trainer-wide-card trainer-lora-only" open>
                             <summary>Sampling</summary>
                             <div class="trainer-sampling-content">
                                 <div class="trainer-sampling-grid">
+                                    <label class="trainer-field trainer-span-2" for="trainer-sample-lora-path"><span>Turbo sampling LoRA path <small>optional, sampling only</small></span><input id="trainer-sample-lora-path" type="text" autocomplete="off" spellcheck="false" placeholder="Local .safetensors file"></label>
                                     <label class="trainer-field" for="trainer-sample-every"><span>Sample every</span><input id="trainer-sample-every" type="number" min="1" value="250"></label>
                                     <label class="trainer-field" for="trainer-sample-start"><span>Sample start step</span><input id="trainer-sample-start" type="number" min="0" value="0"></label>
                                     <label class="trainer-field" for="trainer-sampler"><span>Sampler</span><select id="trainer-sampler"><option value="flowmatch">FlowMatch</option><option value="ddpm">DDPM</option></select></label>
@@ -273,7 +320,7 @@
                             </div>
                         </details>
 
-                        <details class="trainer-advanced">
+                        <details class="trainer-advanced trainer-lora-only">
                             <summary>Advanced memory settings</summary>
                             <div class="trainer-advanced-grid">
                                 <label class="trainer-switch"><input id="trainer-layer-offloading" type="checkbox"><span></span>Layer offloading</label>
@@ -302,7 +349,7 @@
                             </div>
                         </details>
 
-                        <details class="trainer-advanced trainer-wide-card">
+                        <details class="trainer-advanced trainer-wide-card trainer-lora-only">
                             <summary>Advanced AI Toolkit process config</summary>
                             <div class="trainer-advanced-config">
                                 <p>This is the upstream advanced editor equivalent, restricted to the selected edit architecture and managed dataset paths. Generate the process JSON, edit any AI Toolkit process setting, then enable the override.</p>

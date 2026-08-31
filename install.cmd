@@ -1,25 +1,18 @@
 @echo off
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
-echo 🚀 Installing Qwen Dataset Manager...
 
-REM Create virtual environment
-echo 📦 Creating virtual environment...
-python -m venv .venv
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*
+set "QDM_INSTALL_EXIT=%ERRORLEVEL%"
 
-REM Activate virtual environment
-echo ✅ Activating virtual environment...
-call .venv\Scripts\activate.bat
+if not "%QDM_INSTALL_EXIT%"=="0" (
+    echo.
+    echo Installation failed. See the error above.
+) else (
+    echo.
+    echo Installation finished successfully.
+)
 
-REM Install dependencies
-echo 📥 Installing dependencies...
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-
-echo.
-echo ✅ Installation complete!
-echo.
-echo To run the application:
-echo   run.cmd
-echo.
-pause
+if not defined QDM_NO_PAUSE pause
+exit /b %QDM_INSTALL_EXIT%

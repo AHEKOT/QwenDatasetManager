@@ -8,6 +8,7 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.memory_management.manager import MemoryManager
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
+from toolkit.sampling_lora import SamplingLoRAMixin
 from toolkit.basic import flush
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
@@ -53,7 +54,7 @@ FLUX2_TRANSFORMER_FILENAME = "flux2-dev.safetensors"
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
-class Flux2Model(BaseModel):
+class Flux2Model(SamplingLoRAMixin, BaseModel):
     arch = "flux2"
     flux2_te_type: str = "mistral"  # "mistral" or "qwen"
     flux2_vae_path: str = None
@@ -90,6 +91,26 @@ class Flux2Model(BaseModel):
 
     def get_flux2_params(self):
         return Flux2Params()
+
+    def get_flux2_autoencoder_params(self, vae_state_dict):
+        params = AutoEncoderParams()
+        if vae_state_dict['decoder.up.0.block.0.conv1.bias'].shape[0] == 96:
+            params = AutoEncoderSmallDecoderParams()
+        return params
+
+    def load_flux2_vae(self, vae_path, dtype):
+        vae_state_dict = load_file(vae_path, device="cpu")
+        autoencoder_params = self.get_flux2_autoencoder_params(vae_state_dict)
+        with torch.device("meta"):
+            vae = AutoEncoder(autoencoder_params)
+        for key in vae_state_dict:
+            vae_state_dict[key] = vae_state_dict[key].to(dtype)
+        vae.load_state_dict(vae_state_dict, assign=True)
+        return vae
+
+    def prepare_vae_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Allow opt-in VAE variants to normalize their channel layout."""
+        return image
 
     def load_te(self):
         dtype = self.torch_dtype
@@ -207,21 +228,7 @@ class Flux2Model(BaseModel):
                 token=HF_TOKEN,
             )
         
-        vae_state_dict = load_file(vae_path, device="cpu")
-        
-        autoencoder_params = AutoEncoderParams()
-        if vae_state_dict['decoder.up.0.block.0.conv1.bias'].shape[0] == 96:
-            # this is the small decoder version
-            autoencoder_params = AutoEncoderSmallDecoderParams()
-        
-        with torch.device("meta"):
-            vae = AutoEncoder(autoencoder_params)
-
-        # cast to dtype
-        for key in vae_state_dict:
-            vae_state_dict[key] = vae_state_dict[key].to(dtype)
-
-        vae.load_state_dict(vae_state_dict, assign=True)
+        vae = self.load_flux2_vae(vae_path, dtype)
 
         self.noise_scheduler = Flux2Model.get_train_scheduler()
 
@@ -407,6 +414,7 @@ class Flux2Model(BaseModel):
 
                         # scale to -1 to 1
                         control_img = control_img * 2 - 1
+                        control_img = self.prepare_vae_image(control_img)
                         controls.append(control_img)
 
                     if self.vae.device == torch.device("cpu"):
@@ -529,7 +537,10 @@ class Flux2Model(BaseModel):
         if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
         # move to device and dtype
-        image_list = [image.to(device, dtype=dtype) for image in image_list]
+        image_list = [
+            self.prepare_vae_image(image.to(device, dtype=dtype))
+            for image in image_list
+        ]
         images = torch.stack(image_list).to(device, dtype=dtype)
 
         latents = self.vae.encode(images)
