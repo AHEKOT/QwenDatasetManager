@@ -60,11 +60,26 @@ intentionally not automatic because an inexact matte can create magenta fringes.
 
 ## Controls
 
-QIE2511 is an edit model and requires an RGB control image. If no paired control
-folder exists, use `rgba_generate_control: true`. The loader composites the
-processed RGBA target over a deterministic background selected from
-`rgba_control_backgrounds`. The generated control receives the same crop and
-flip as the target.
+QIE2511 is an edit model and requires an RGB control image. Transparent jobs
+always use `rgba_generate_control: true` and choose one of two per-dataset modes:
+
+```yaml
+rgba_control_mode: edit
+rgba_control_background_path: D:/datasets/backgrounds/img
+```
+
+Edit mode chooses a random opaque image from that folder for every training
+sample, resizes it to cover the processed RGBA target, and composites it under
+the target alpha. Text-embedding caching must be disabled because the visual
+conditioning changes between samples. Target latent caching remains supported.
+
+```yaml
+rgba_control_mode: generation
+```
+
+Generation mode supplies an empty opaque-black Control1. Paired Control1–3
+folders and the former synthetic RGB background palette are not used by either
+transparent mode.
 
 ## Commands
 

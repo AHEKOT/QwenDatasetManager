@@ -16,6 +16,7 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python312Version = '3.12.10'
 $PipVersion = '26.2.1'
 $HatchlingVersion = '1.32.0'
+$TritonWindowsVersion = '3.7.1.post27'
 $PythonInstallerUrl = "https://www.python.org/ftp/python/$Python312Version/python-$Python312Version-amd64.exe"
 $PythonInstallerSha256 = '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb'
 $PipWheelUrl = 'https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/pip-26.2.1-py3-none-any.whl'
@@ -260,14 +261,23 @@ function Install-Application {
     Write-Section 'Installing Qwen Dataset Manager'
     $ApplicationPython = Ensure-Venv $BootstrapPython (Join-Path $ProjectRoot '.venv')
     Ensure-Pip $ApplicationPython
+    $LlamaCppWheelIndex = 'https://abetlen.github.io/llama-cpp-python/whl/cpu'
+    if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) {
+        $LlamaCppWheelIndex = 'https://abetlen.github.io/llama-cpp-python/whl/cu130'
+        Write-Host 'Installing the CUDA 13.0 llama.cpp wheel for local vision captioning.'
+    }
+    else {
+        Write-Host 'NVIDIA GPU was not detected; installing the CPU llama.cpp wheel.'
+    }
     Invoke-Native $ApplicationPython @(
         '-m', 'pip', 'install',
         '--disable-pip-version-check',
         '--no-cache-dir',
+        '--extra-index-url', $LlamaCppWheelIndex,
         '-r', (Join-Path $ProjectRoot 'requirements.txt')
     )
     Invoke-Native $ApplicationPython @('-m', 'pip', 'check')
-    Invoke-Native $ApplicationPython @('-c', "import flask, PIL, app; print('Application import check passed.')")
+    Invoke-Native $ApplicationPython @('-c', "import flask, PIL, llama_cpp, app; print('Application import check passed; llama.cpp:', llama_cpp.__version__)")
 }
 
 function Install-Trainer {
@@ -310,6 +320,16 @@ function Install-Trainer {
         '--index-url', 'https://download.pytorch.org/whl/cu130'
     )
 
+    # PyTorch CUDA wheels do not declare Triton on Windows. Install the Windows
+    # build explicitly so torch.compile and the trainer's fused ConvRot/NVFP4
+    # kernels use their accelerated paths on supported NVIDIA GPUs.
+    Invoke-Native $TrainerPython @(
+        '-m', 'pip', 'install',
+        '--disable-pip-version-check',
+        '--no-cache-dir',
+        "triton-windows==$TritonWindowsVersion"
+    )
+
     # Installing the build backend first and disabling build isolation avoids a
     # reproducible hang while pip prepares the pinned diffusers revision.
     Invoke-Native $TrainerPython @(
@@ -329,7 +349,7 @@ function Install-Trainer {
     Invoke-Native $TrainerPython @('-m', 'pip', 'check')
     Invoke-Native $TrainerPython @(
         '-c',
-        "import torch, diffusers, transformers, bitsandbytes, peft; assert torch.cuda.is_available(), 'PyTorch installed, but CUDA is not available'; print('CUDA trainer ready:', torch.__version__, torch.cuda.get_device_name(0))"
+        "import torch, triton, diffusers, transformers, bitsandbytes, peft; from torch.utils._triton import has_triton; assert torch.cuda.is_available(), 'PyTorch installed, but CUDA is not available'; assert has_triton(), 'Triton is installed but unavailable to PyTorch'; print('CUDA trainer ready:', torch.__version__, 'Triton', triton.__version__, torch.cuda.get_device_name(0))"
     )
     Invoke-Native $TrainerPython @((Join-Path $ProjectRoot 'trainer\ai_toolkit\run.py'), '--help')
 }

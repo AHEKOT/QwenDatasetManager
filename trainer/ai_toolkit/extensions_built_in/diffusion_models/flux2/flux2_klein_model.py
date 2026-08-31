@@ -69,6 +69,7 @@ class Flux2KleinModel(Flux2Model):
 
 class Flux2Klein4BModel(Flux2KleinModel):
     arch = "flux2_klein_4b"
+    sampling_lora_hidden_size = 3072
     flux2_klein_te_path: str = "Qwen/Qwen3-4B"
     flux2_te_filename: str = "flux-2-klein-base-4b.safetensors"
 
@@ -81,6 +82,7 @@ class Flux2Klein4BModel(Flux2KleinModel):
 
 class Flux2Klein9BModel(Flux2KleinModel):
     arch = "flux2_klein_9b"
+    sampling_lora_hidden_size = 4096
     flux2_klein_te_path: str = "Qwen/Qwen3-8B"
     flux2_te_filename: str = "flux-2-klein-base-9b.safetensors"
 

@@ -79,6 +79,12 @@ class DatasetManagerApiTests(unittest.TestCase):
         screen = self.client.get('/trainer')
         self.assertEqual(screen.status_code, 200)
         self.assertIn(b'CUDA Trainer', screen.data)
+        self.assertIn(b'id="trainer-bootstrap" type="application/json">{"models":', screen.data)
+        self.assertIn(b'id="trainer-job-count">', screen.data)
+        self.assertNotIn(b'<!--TRAINER_JOB_COUNT-->', screen.data)
+        self.assertNotIn(b'<!--TRAINER_JOBS-->', screen.data)
+        self.assertNotIn(b'<!--TRAINER_BOOTSTRAP-->', screen.data)
+        self.assertEqual(screen.headers['Cache-Control'], 'no-store')
         screen.close()
 
         state = self.client.get('/api/trainer/state')

@@ -12,9 +12,11 @@ from toolkit.data_loader import RescaleTransform
 from toolkit.data_transfer_object.data_loader import FileItemDTO
 from toolkit.rgba_utils import (
     ensure_normalized_rgba_tensor,
+    fit_rgb_background,
     prepare_rgba_image,
     resize_rgba_alpha_safe,
     rgba_tensor_to_rgb_control,
+    rgba_tensor_to_rgb_control_image,
 )
 
 
@@ -94,6 +96,9 @@ class RGBAPreprocessingTests(unittest.TestCase):
     def test_dataset_path_preserves_alpha_and_generates_rgb_control(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "character.png"
+            backgrounds = Path(temp_dir) / "backgrounds"
+            backgrounds.mkdir()
+            Image.new("RGB", (12, 10), (255, 255, 255)).save(backgrounds / "white.jpg")
             source = np.zeros((8, 8, 4), dtype=np.uint8)
             source[:] = [0, 255, 0, 0]
             source[2:6, 2:6] = [255, 0, 0, 255]
@@ -105,7 +110,7 @@ class RGBAPreprocessingTests(unittest.TestCase):
                 buckets=True,
                 pixel_channels="rgba",
                 rgba_generate_control=True,
-                rgba_control_background=[255, 255, 255],
+                rgba_control_background_path=str(backgrounds),
                 num_workers=0,
             )
             transform = transforms.Compose([transforms.ToTensor(), RescaleTransform()])
@@ -130,6 +135,65 @@ class RGBAPreprocessingTests(unittest.TestCase):
             self.assertTrue(torch.equal(item.tensor[:3, 0, 0], torch.full((3,), -1.0)))
             # The generated visual control composites that transparent pixel to white.
             self.assertTrue(torch.equal(item.control_tensor[:, 0, 0], torch.ones(3)))
+
+    def test_real_background_image_is_composited_under_alpha(self):
+        rgba = torch.tensor(
+            [[[-1.0, 1.0]], [[-1.0, -1.0]], [[-1.0, -1.0]], [[-1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        blue_background = torch.tensor(
+            [[[0.0, 0.0]], [[0.0, 0.0]], [[1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        control = rgba_tensor_to_rgb_control_image(rgba, blue_background)
+        self.assertTrue(torch.equal(control[:, 0, 0], torch.tensor([0.0, 0.0, 1.0])))
+        self.assertTrue(torch.equal(control[:, 0, 1], torch.tensor([1.0, 0.0, 0.0])))
+
+    def test_background_fit_handles_tiny_extreme_aspects_and_color_modes(self):
+        cases = (
+            (Image.new("RGB", (1, 1), (17, 43, 91)), (13, 7)),
+            (Image.new("L", (2, 71), 123), (19, 5)),
+            (Image.new("P", (83, 3), 0), (7, 23)),
+            (Image.new("CMYK", (3, 89), (0, 128, 255, 0)), (31, 9)),
+        )
+        for source, target_size in cases:
+            with self.subTest(source_size=source.size, mode=source.mode, target_size=target_size):
+                result = fit_rgb_background(source, target_size)
+                self.assertEqual(result.mode, "RGB")
+                self.assertEqual(result.size, target_size)
+
+    def test_background_fit_crops_to_cover_instead_of_stretching(self):
+        wide = np.zeros((3, 101, 3), dtype=np.uint8)
+        wide[:, :35] = [255, 0, 0]
+        wide[:, 35:66] = [0, 255, 0]
+        wide[:, 66:] = [0, 0, 255]
+        wide_result = np.asarray(fit_rgb_background(Image.fromarray(wide, "RGB"), (7, 19)))
+
+        tall = np.zeros((101, 3, 3), dtype=np.uint8)
+        tall[:35, :] = [255, 0, 0]
+        tall[35:66, :] = [0, 255, 0]
+        tall[66:, :] = [0, 0, 255]
+        tall_result = np.asarray(fit_rgb_background(Image.fromarray(tall, "RGB"), (19, 7)))
+
+        self.assertGreater(float(wide_result[..., 1].mean()), 250)
+        self.assertLess(float(wide_result[..., [0, 2]].mean()), 3)
+        self.assertGreater(float(tall_result[..., 1].mean()), 250)
+        self.assertLess(float(tall_result[..., [0, 2]].mean()), 3)
+
+    def test_odd_sized_composite_preserves_target_and_opaque_foreground(self):
+        rgba = torch.linspace(-1.0, 1.0, steps=4 * 11 * 7).reshape(4, 11, 7)
+        rgba[3].fill_(-1.0)
+        rgba[3, 3:8, 2:5] = 1.0
+        original = rgba.clone()
+        background = torch.rand((3, 11, 7), generator=torch.Generator().manual_seed(7))
+
+        control = rgba_tensor_to_rgb_control_image(rgba, background)
+
+        self.assertEqual(tuple(control.shape), (3, 11, 7))
+        self.assertTrue(torch.equal(rgba, original))
+        self.assertTrue(torch.allclose(control[:, 0, 0], background[:, 0, 0]))
+        expected_foreground = ((rgba[:3, 3:8, 2:5] + 1.0) * 0.5).clamp(0.0, 1.0)
+        self.assertTrue(torch.allclose(control[:, 3:8, 2:5], expected_foreground))
 
     def test_generation_dataset_builds_empty_black_control(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -178,6 +242,15 @@ class RGBAPreprocessingTests(unittest.TestCase):
                 pixel_channels="rgba",
                 rgba_generate_control=False,
                 rgba_control_mode="generation",
+            )
+
+    def test_edit_control_mode_requires_background_images(self):
+        with self.assertRaisesRegex(ValueError, "rgba_control_background_path"):
+            DatasetConfig(
+                folder_path="unused",
+                pixel_channels="rgba",
+                rgba_generate_control=True,
+                rgba_control_mode="edit",
             )
 
     def test_rgba_dataset_rejects_rgb_only_files(self):

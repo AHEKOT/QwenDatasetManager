@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +77,11 @@ EDIT_MODELS = {
         'allowUnloadTextEncoder': True,
         'accuracyRecoveryAdapters': {},
     },
+}
+DEFAULT_TURBO_LORA_FILENAMES = {
+    'qwen_image_edit_2511': 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors',
+    'flux2_klein_4b': 'klein4b_turbo_r128.safetensors',
+    'flux2_klein_9b': 'Flux_Klein_9b_Turbo_lora_rank_256_fp8_standard.safetensors',
 }
 QTYPE_OPTIONS = (
     '', 'qfloat8', 'float8', 'convrot8', 'convrot4', 'nvfp4',
@@ -272,6 +278,7 @@ class TrainerService:
             return
 
         config = json.loads(row['job_config'])
+        self._apply_job_asset_defaults(config)
         process_config = config['config']['process'][0]
         process_config['sqlite_db_path'] = str(self.db_path)
         process_config['training_folder'] = str(self.output_dir)
@@ -412,12 +419,15 @@ class TrainerService:
         target_files = self._image_files(dataset_dir / 'img')
         target_stems = {path.stem for path in target_files}
         alpha_count = 0
+        opaque_background_count = 0
         unreadable_alpha = []
         for path in target_files:
             try:
                 with Image.open(path) as image:
                     if 'A' in image.getbands() or 'transparency' in image.info:
                         alpha_count += 1
+                    else:
+                        opaque_background_count += 1
             except OSError:
                 unreadable_alpha.append(path.name)
         controls = []
@@ -455,11 +465,17 @@ class TrainerService:
             'targetPath': str(dataset_dir / 'img'),
             'targetCount': len(target_stems),
             'alphaCount': alpha_count,
+            'opaqueBackgroundCount': opaque_background_count,
             'captionCount': caption_count,
             'controls': controls,
             'warnings': warnings,
             'valid': bool(target_stems and controls),
             'transparentValid': bool(target_stems and alpha_count == len(target_files)),
+            'backgroundValid': bool(
+                target_files
+                and opaque_background_count == len(target_files)
+                and not unreadable_alpha
+            ),
             'vaeValid': bool(len(target_files) >= 2 and alpha_count == len(target_files)),
         }
 
@@ -503,13 +519,16 @@ class TrainerService:
                 return str(path.resolve())
         return ''
 
-    def default_qwen_turbo_lora(self):
-        filename = 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
+    def default_turbo_lora(self, model_key):
+        filename = DEFAULT_TURBO_LORA_FILENAMES.get(model_key)
+        if not filename:
+            return ''
         return self._first_existing_asset(
-            Path('models') / filename,
-            Path('trainer') / 'models' / filename,
-            Path(r'D:\AiToolkitNew\AI-Toolkit\models') / filename,
+            Path('models') / 'turbo_lora' / filename,
         )
+
+    def default_qwen_turbo_lora(self):
+        return self.default_turbo_lora('qwen_image_edit_2511')
 
     def default_qwen_rgba_vae(self):
         dirname = 'TransparentQIE2511VAE_diffusers'
@@ -517,6 +536,11 @@ class TrainerService:
             Path('models') / dirname,
             Path('trainer') / 'models' / dirname,
             Path(r'D:\AiToolkitNew\AI-Toolkit\models') / dirname,
+        )
+
+    def default_flux2_klein_rgba_vae(self):
+        return self._first_existing_asset(
+            Path('models') / 'vae' / 'flux2-klein-rgba.safetensors',
         )
 
     @staticmethod
@@ -713,6 +737,20 @@ class TrainerService:
                 datasets.append(self.inspect_dataset(path.name))
         return datasets
 
+    def list_dataset_names(self):
+        """Match AI Toolkit's dataset-list route: enumerate folders without inspecting images."""
+        root = self.datasets_dir
+        if not root.is_dir():
+            return []
+        return [
+            path.name
+            for path in sorted(root.iterdir(), key=lambda item: item.name.lower())
+            if path.is_dir()
+            and not path.is_symlink()
+            and not path.name.startswith('.')
+            and (path / 'img').is_dir()
+        ]
+
     def validate_payload(self, payload):
         if not isinstance(payload, dict):
             raise TrainerValidationError('Invalid job payload')
@@ -908,7 +946,15 @@ class TrainerService:
         qtype = payload.get('qtype', model['defaultQtype'])
         allowed_qtypes = set(QTYPE_OPTIONS) | set(model['accuracyRecoveryAdapters'].values())
         if qtype not in allowed_qtypes:
-            raise TrainerValidationError('Unsupported quantization type')
+            known_model_adapters = {
+                adapter
+                for candidate in EDIT_MODELS.values()
+                for adapter in candidate['accuracyRecoveryAdapters'].values()
+            }
+            if qtype in known_model_adapters:
+                qtype = model['defaultQtype']
+            else:
+                raise TrainerValidationError('Unsupported quantization type')
         qtype_te = payload.get('qtypeTextEncoder', model['defaultQtype'])
         if qtype_te not in QTYPE_OPTIONS:
             raise TrainerValidationError('Unsupported text encoder quantization type')
@@ -922,19 +968,25 @@ class TrainerService:
             submitted_vae_path = payload.get('vaePath')
             if not submitted_vae_path and model_key == 'qwen_image_edit_2511':
                 submitted_vae_path = self.default_qwen_rgba_vae()
+            elif not submitted_vae_path and model_key in {'flux2_klein_4b', 'flux2_klein_9b'}:
+                submitted_vae_path = self.default_flux2_klein_rgba_vae()
             vae_path = self._validate_local_asset(
                 submitted_vae_path,
                 'RGBA VAE path',
                 directory=model_key == 'qwen_image_edit_2511',
             )
+        submitted_sample_lora_path = (
+            payload.get('sampleLoraPath') or self.default_turbo_lora(model_key)
+        )
         sample_lora_path = self._validate_local_asset(
-            payload.get('sampleLoraPath'), 'Turbo sampling LoRA', optional=True
+            submitted_sample_lora_path, 'Turbo sampling LoRA', optional=True
         )
         if sample_lora_path and Path(sample_lora_path).suffix.lower() != '.safetensors':
             raise TrainerValidationError('Turbo sampling LoRA must be a .safetensors file')
 
         dataset_configs = []
         normalized_datasets = []
+        dynamic_rgba_backgrounds = False
         for submitted, inspection in zip(payload['datasets'], inspections):
             control_paths = [item['path'] for item in inspection['controls'][:3]]
             resolutions = self._normalize_resolutions(submitted.get('resolutions'))
@@ -974,20 +1026,33 @@ class TrainerService:
                     'rgba_edge_matte_color': [0, 255, 0],
                     'rgba_edge_width': clamp_number(payload.get('rgbaEdgeWidth'), 0.1, 128, 3),
                 })
-                if rgba_control_mode == 'generation' or not control_paths:
-                    dataset_config.pop('control_path', None)
-                    dataset_config['rgba_generate_control'] = True
-                    dataset_config['rgba_control_mode'] = rgba_control_mode
-                    if rgba_control_mode == 'edit':
-                        dataset_config['rgba_control_backgrounds'] = [
-                            [255, 255, 255], [127, 127, 127], [0, 0, 0]
-                        ]
+                dataset_config.pop('control_path', None)
+                dataset_config['rgba_generate_control'] = True
+                dataset_config['rgba_control_mode'] = rgba_control_mode
+                background_dataset_name = ''
+                if rgba_control_mode == 'edit':
+                    background_dataset_name = str(
+                        submitted.get('rgbaBackgroundDataset', '')
+                    ).strip()
+                    if not background_dataset_name:
+                        raise TrainerValidationError(
+                            f'Select a background dataset for RGBA edit mode: {inspection["name"]}'
+                        )
+                    background_inspection = self.inspect_dataset(background_dataset_name)
+                    if not background_inspection['backgroundValid']:
+                        raise TrainerValidationError(
+                            f'Background dataset must contain only readable opaque images: '
+                            f'{background_dataset_name}'
+                        )
+                    dataset_config['rgba_control_background_path'] = background_inspection['targetPath']
+                    dynamic_rgba_backgrounds = True
             dataset_configs.append(dataset_config)
             normalized_datasets.append({
                 **submitted,
                 'name': inspection['name'],
                 'resolutions': resolutions,
                 **({'rgbaControlMode': str(submitted.get('rgbaControlMode', 'edit')).lower()} if transparent else {}),
+                **({'rgbaBackgroundDataset': background_dataset_name} if transparent else {}),
             })
 
         rank = clamp_number(payload.get('rank'), 1, 1024, 32, integer=True)
@@ -1023,7 +1088,7 @@ class TrainerService:
         validation_config = self._build_validation_config(payload, inspections)
         model_kwargs = {'match_target_res': bool(payload.get('matchTargetResolution', False))}
         unload_text_encoder = bool(payload.get('unloadTextEncoder', False)) and model['allowUnloadTextEncoder']
-        cache_text_embeddings = bool(payload.get('cacheTextEmbeddings', False))
+        cache_text_embeddings = bool(payload.get('cacheTextEmbeddings', False)) and not dynamic_rgba_backgrounds
         if cache_text_embeddings:
             unload_text_encoder = False
         dop_enabled = bool(payload.get('diffOutputPreservation', False))
@@ -1078,6 +1143,10 @@ class TrainerService:
             train_config['validation_config'] = validation_config
 
         compile_model = bool(payload.get('compileModel', False))
+        normalized_form = copy.deepcopy(payload)
+        normalized_form['datasets'] = copy.deepcopy(normalized_datasets)
+        normalized_form['cacheTextEmbeddings'] = cache_text_embeddings
+        normalized_form['qtype'] = qtype
         config = {
             'job': 'extension',
             'config': {
@@ -1147,7 +1216,7 @@ class TrainerService:
                     'trainingPreset': preset,
                     'gpuIds': gpu_ids,
                     'datasets': normalized_datasets,
-                    'form': copy.deepcopy(payload),
+                    'form': normalized_form,
                     'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
                 },
             },
@@ -1182,6 +1251,8 @@ class TrainerService:
             if not isinstance(advanced_train, dict):
                 raise TrainerValidationError('Advanced process config is missing training settings')
             advanced_train['noise_scheduler'] = model['noiseScheduler']
+            if dynamic_rgba_backgrounds:
+                advanced_train['cache_text_embeddings'] = False
             advanced_sample = advanced_process.get('sample')
             if not isinstance(advanced_sample, dict) or advanced_sample.get('sampler', 'flowmatch') not in SAMPLER_OPTIONS:
                 raise TrainerValidationError('Unsupported sampler in advanced config')
@@ -1252,10 +1323,34 @@ class TrainerService:
             raise FileNotFoundError('Training job not found')
         return row
 
-    @staticmethod
-    def _serialize_job(row):
+    def _apply_job_asset_defaults(self, config):
+        """Hydrate assets omitted by jobs saved before model defaults existed."""
+        qdm = config.get('meta', {}).get('qdm', {})
+        if qdm.get('trainingPreset') in VAE_TRAINING_PRESETS:
+            return False
+        model_key = qdm.get('modelKey')
+        default_sample_lora = self.default_turbo_lora(model_key)
+        if not default_sample_lora:
+            return False
+
+        process = config.get('config', {}).get('process', [{}])[0]
+        model = process.get('model')
+        if not isinstance(model, dict):
+            return False
+        changed = False
+        if not model.get('sample_lora_path'):
+            model['sample_lora_path'] = default_sample_lora
+            changed = True
+        form = qdm.get('form')
+        if isinstance(form, dict) and not form.get('sampleLoraPath'):
+            form['sampleLoraPath'] = default_sample_lora
+            changed = True
+        return changed
+
+    def _serialize_job(self, row):
         data = dict(row)
         config = json.loads(data.pop('job_config'))
+        self._apply_job_asset_defaults(config)
         qdm = config.get('meta', {}).get('qdm', {})
         data['config'] = config
         form = copy.deepcopy(qdm.get('form', {}))
@@ -1278,6 +1373,48 @@ class TrainerService:
             rows = connection.execute('SELECT * FROM "Job" ORDER BY created_at DESC').fetchall()
         return [self._serialize_job(row) for row in rows]
 
+    def bootstrap_state(self):
+        """Return independent, lightweight resources used by the first trainer render."""
+        return {
+            'models': self.model_options(),
+            'trainingPresets': [
+                {'key': key, 'label': label}
+                for key, label in TRAINING_PRESETS.items()
+            ],
+            'qtypes': list(QTYPE_OPTIONS),
+            'datasets': [
+                {
+                    'name': name,
+                    'inspected': False,
+                    'targetPath': str(self.datasets_dir / name / 'img'),
+                    'targetCount': None,
+                    'alphaCount': None,
+                    'captionCount': None,
+                    'controls': [],
+                    'warnings': [],
+                }
+                for name in self.list_dataset_names()
+            ],
+            'jobs': self.list_jobs(),
+            'gpus': self.detect_gpus(),
+            'trainerInstalled': self.venv_python.is_file() and (self.vendor_root / 'run.py').is_file(),
+            'hfTokenConfigured': bool(self.get_setting('HF_TOKEN') or os.environ.get('HF_TOKEN')),
+            'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
+        }
+
+    def model_options(self):
+        models = []
+        for key, value in EDIT_MODELS.items():
+            item = {**value, 'key': key}
+            item['defaultSampleLoraPath'] = self.default_turbo_lora(key)
+            item['defaultRgbaVaePath'] = (
+                self.default_qwen_rgba_vae()
+                if key == 'qwen_image_edit_2511'
+                else self.default_flux2_klein_rgba_vae()
+            )
+            models.append(item)
+        return models
+
     def active_dataset_names(self):
         names = set()
         with self._db_lock, self.connect() as connection:
@@ -1290,6 +1427,8 @@ class TrainerService:
                 for item in config.get('meta', {}).get('qdm', {}).get('datasets', []):
                     if isinstance(item.get('name'), str):
                         names.add(item['name'])
+                    if isinstance(item.get('rgbaBackgroundDataset'), str) and item['rgbaBackgroundDataset']:
+                        names.add(item['rgbaBackgroundDataset'])
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return names
@@ -1299,6 +1438,7 @@ class TrainerService:
         if row['status'] in {'running', 'stopping'}:
             raise TrainerValidationError('Job is already active')
         config = json.loads(row['job_config'])
+        self._apply_job_asset_defaults(config)
         qdm_meta = config.get('meta', {}).get('qdm', {})
         preset = qdm_meta.get('trainingPreset', 'standard_lora')
         for item in qdm_meta.get('datasets', []):
@@ -1310,12 +1450,23 @@ class TrainerService:
                 ready = inspection['vaeValid']
             if not ready:
                 raise TrainerValidationError(f"Dataset is not ready: {item['name']}")
+            if preset == 'transparent_lora' and item.get('rgbaControlMode', 'edit') == 'edit':
+                background_name = item.get('rgbaBackgroundDataset')
+                if not background_name:
+                    raise TrainerValidationError(
+                        f"Background dataset is not selected: {item['name']}"
+                    )
+                background = self.inspect_dataset(background_name)
+                if not background['backgroundValid']:
+                    raise TrainerValidationError(
+                        f"Background dataset is not ready: {background_name}"
+                    )
         with self._db_lock, self.connect() as connection:
             highest = connection.execute('SELECT MAX(queue_position) AS value FROM "Job"').fetchone()['value'] or 0
             connection.execute(
                 '''UPDATE "Job" SET status = 'queued', stop = 0, return_to_queue = 0,
-                   queue_position = ?, info = 'Queued', updated_at = ? WHERE id = ?''',
-                (highest + 1000, utc_now(), job_id)
+                   queue_position = ?, info = 'Queued', job_config = ?, updated_at = ? WHERE id = ?''',
+                (highest + 1000, json.dumps(config), utc_now(), job_id)
             )
         return self.get_job(job_id)
 
@@ -1379,19 +1530,160 @@ class TrainerService:
                 handle.seek(size - max_bytes)
             return handle.read().decode('utf-8', errors='replace')
 
-    def state(self):
-        models = []
-        for key, value in EDIT_MODELS.items():
-            item = {**value, 'key': key}
-            item['defaultSampleLoraPath'] = (
-                self.default_qwen_turbo_lora() if key == 'qwen_image_edit_2511' else ''
-            )
-            item['defaultRgbaVaePath'] = (
-                self.default_qwen_rgba_vae() if key == 'qwen_image_edit_2511' else ''
-            )
-            models.append(item)
+    def _job_samples_dir(self, job_id):
+        row = self._get_job_row(job_id)
+        output_root = self.output_dir.resolve()
+        samples_dir = (self.output_dir / row['name'] / 'samples').resolve()
+        if samples_dir == output_root or output_root not in samples_dir.parents:
+            raise TrainerValidationError('Invalid trainer samples directory')
+        return row, samples_dir
+
+    @staticmethod
+    def _sample_file_info(path):
+        match = re.search(r'_(\d+)_([0-9]+)$', path.stem)
         return {
-            'models': models,
+            'name': path.name,
+            'step': int(match.group(1)) if match else 0,
+            'sampleIndex': int(match.group(2)) if match else 0,
+            'size': path.stat().st_size,
+            'modifiedAt': datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _sample_items(process):
+        sample_config = process.get('sample', {}) if isinstance(process, dict) else {}
+        items = sample_config.get('samples') or []
+        if not items and sample_config.get('prompts'):
+            items = [{'prompt': prompt} for prompt in sample_config['prompts']]
+        return sample_config, [item for item in items if isinstance(item, dict)]
+
+    @staticmethod
+    def _sample_controls(item):
+        controls = item.get('ctrl_img')
+        if isinstance(controls, str):
+            result = [controls]
+        elif isinstance(controls, list):
+            result = list(controls)
+        else:
+            result = []
+        for index in range(1, 4):
+            value = item.get(f'ctrl_img_{index}')
+            if value and value not in result:
+                result.append(value)
+        return [str(value) for value in result if value]
+
+    def list_job_samples(self, job_id):
+        row, samples_dir = self._job_samples_dir(job_id)
+        config = json.loads(row['job_config'])
+        process = config.get('config', {}).get('process', [{}])[0]
+        sample_config, sample_items = self._sample_items(process)
+        sample_count = max(len(sample_items), 1)
+        files = []
+        if samples_dir.is_dir():
+            files = sorted(
+                (
+                    path for path in samples_dir.iterdir()
+                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+                ),
+                key=lambda path: path.name.lower(),
+            )
+        samples = []
+        for path in files:
+            info = self._sample_file_info(path)
+            sample_index = info['sampleIndex']
+            item = sample_items[sample_index] if sample_index < len(sample_items) else {}
+            explicit_seed = item.get('seed')
+            if explicit_seed is not None:
+                seed = explicit_seed
+            elif sample_config.get('walk_seed'):
+                seed = int(sample_config.get('seed', 0)) + sample_index
+            else:
+                seed = sample_config.get('seed')
+            info.update({
+                'prompt': str(item.get('prompt', '')),
+                'seed': seed,
+                'controlCount': len(self._sample_controls(item)),
+            })
+            samples.append(info)
+        return {
+            'samples': samples,
+            'sampleCount': sample_count,
+            'isVae': process.get('type') in {'qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'},
+        }
+
+    def resolve_job_sample(self, job_id, filename, thumbnail=False):
+        _row, samples_dir = self._job_samples_dir(job_id)
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise TrainerValidationError('Invalid sample filename')
+        candidate = (samples_dir / filename).resolve()
+        if samples_dir not in candidate.parents or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise TrainerValidationError('Unsupported sample image')
+        if not candidate.is_file():
+            raise FileNotFoundError('Validation image not found')
+        if thumbnail:
+            thumb_base = samples_dir / '.thumbs' / candidate.name
+            for suffix in ('.png', '.jpg'):
+                thumb = Path(f'{thumb_base}{suffix}')
+                if thumb.is_file():
+                    return thumb
+        return candidate
+
+    def resolve_job_sample_control(self, job_id, sample_index, control_index):
+        row = self._get_job_row(job_id)
+        config = json.loads(row['job_config'])
+        process = config.get('config', {}).get('process', [{}])[0]
+        _sample_config, sample_items = self._sample_items(process)
+        if sample_index < 0 or sample_index >= len(sample_items):
+            raise FileNotFoundError('Sample configuration not found')
+        controls = self._sample_controls(sample_items[sample_index])
+        if control_index < 0 or control_index >= len(controls):
+            raise FileNotFoundError('Control image not found')
+        candidate = Path(controls[control_index]).resolve()
+        allowed_roots = (self.sample_images_dir.resolve(), self.datasets_dir.resolve())
+        if not any(candidate != root and root in candidate.parents for root in allowed_roots):
+            raise TrainerValidationError('Control image is outside managed trainer directories')
+        if not candidate.is_file() or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise FileNotFoundError('Control image not found')
+        return candidate
+
+    def delete_job_sample(self, job_id, filename):
+        path = self.resolve_job_sample(job_id, filename)
+        samples_dir = path.parent
+        path.unlink()
+        caption = path.with_suffix('.txt')
+        if caption.is_file():
+            caption.unlink()
+        thumb_base = samples_dir / '.thumbs' / path.name
+        for suffix in ('.png', '.jpg'):
+            thumb = Path(f'{thumb_base}{suffix}')
+            if thumb.is_file():
+                thumb.unlink()
+
+    def build_samples_archive(self, job_id):
+        row, samples_dir = self._job_samples_dir(job_id)
+        if not samples_dir.is_dir():
+            raise FileNotFoundError('No validation images have been generated')
+        files = sorted(
+            path for path in samples_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not files:
+            raise FileNotFoundError('No validation images have been generated')
+        archive_path = samples_dir.parent / 'samples.zip'
+        temporary_path = samples_dir.parent / f'.samples-{uuid.uuid4().hex}.zip.tmp'
+        try:
+            with zipfile.ZipFile(temporary_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in files:
+                    archive.write(path, arcname=f'samples/{path.name}')
+            os.replace(temporary_path, archive_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        return archive_path, f'{row["name"]}-samples.zip'
+
+    def state(self):
+        return {
+            'models': self.model_options(),
             'trainingPresets': [
                 {'key': key, 'label': label} for key, label in TRAINING_PRESETS.items()
             ],
@@ -1423,6 +1715,20 @@ def create_trainer_blueprint(service: TrainerService):
     def trainer_state():
         try:
             return jsonify(service.state())
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/datasets')
+    def list_trainer_datasets():
+        try:
+            return jsonify({'datasets': service.list_dataset_names()})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/datasets/<name>')
+    def inspect_trainer_dataset(name):
+        try:
+            return jsonify(service.inspect_dataset(name))
         except Exception as exc:
             return handle_error(exc)
 
@@ -1525,6 +1831,51 @@ def create_trainer_blueprint(service: TrainerService):
     def sample_trainer_job_now(job_id):
         try:
             return jsonify({'job': service.request_runtime_action(job_id, 'sample')})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/samples')
+    def list_trainer_job_samples(job_id):
+        try:
+            return jsonify(service.list_job_samples(job_id))
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/samples/archive')
+    def download_trainer_job_samples(job_id):
+        try:
+            path, download_name = service.build_samples_archive(job_id)
+            return send_file(path, as_attachment=True, download_name=download_name, conditional=True)
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/samples/<filename>')
+    def serve_trainer_job_sample(job_id, filename):
+        try:
+            path = service.resolve_job_sample(job_id, filename, thumbnail='thumb' in request.args)
+            return send_file(
+                path,
+                conditional=True,
+                as_attachment='download' in request.args,
+                download_name=filename,
+                max_age=0,
+            )
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.delete('/api/trainer/jobs/<job_id>/samples/<filename>')
+    def delete_trainer_job_sample(job_id, filename):
+        try:
+            service.delete_job_sample(job_id, filename)
+            return jsonify({'success': True})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/sample-controls/<int:sample_index>/<int:control_index>')
+    def serve_trainer_job_sample_control(job_id, sample_index, control_index):
+        try:
+            path = service.resolve_job_sample_control(job_id, sample_index, control_index)
+            return send_file(path, conditional=True, max_age=0)
         except Exception as exc:
             return handle_error(exc)
 

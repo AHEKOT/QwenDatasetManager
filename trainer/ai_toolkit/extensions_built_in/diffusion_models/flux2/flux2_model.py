@@ -108,6 +108,17 @@ class Flux2Model(SamplingLoRAMixin, BaseModel):
         vae.load_state_dict(vae_state_dict, assign=True)
         return vae
 
+    def get_flux2_vae_source(self, model_path):
+        """Resolve the VAE source without overriding an explicitly selected VAE."""
+        configured_vae_path = self.model_config.vae_path
+        if configured_vae_path:
+            return configured_vae_path
+
+        bundled_vae_path = os.path.join(model_path, FLUX2_VAE_FILENAME)
+        if os.path.exists(bundled_vae_path):
+            return bundled_vae_path
+        return self.flux2_vae_path
+
     def prepare_vae_image(self, image: torch.Tensor) -> torch.Tensor:
         """Allow opt-in VAE variants to normalize their channel layout."""
         return image
@@ -205,13 +216,7 @@ class Flux2Model(SamplingLoRAMixin, BaseModel):
         text_encoder, tokenizer = self.load_te()
 
         self.print_and_status_update("Loading VAE")
-        vae_path = self.model_config.vae_path
-
-        if os.path.exists(os.path.join(model_path, FLUX2_VAE_FILENAME)):
-            vae_path = os.path.join(model_path, FLUX2_VAE_FILENAME)
-
-        if vae_path is None:
-            vae_path = self.flux2_vae_path
+        vae_path = self.get_flux2_vae_source(model_path)
 
         if vae_path is None or not os.path.exists(vae_path):
             vae_filename = FLUX2_VAE_FILENAME
@@ -227,7 +232,8 @@ class Flux2Model(SamplingLoRAMixin, BaseModel):
                 filename=vae_filename,
                 token=HF_TOKEN,
             )
-        
+
+        self.print_and_status_update(f"Using VAE: {vae_path}")
         vae = self.load_flux2_vae(vae_path, dtype)
 
         self.noise_scheduler = Flux2Model.get_train_scheduler()

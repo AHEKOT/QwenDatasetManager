@@ -1,21 +1,57 @@
 (() => {
     'use strict';
 
+    const bootstrapState = (() => {
+        const element = document.getElementById('trainer-bootstrap');
+        if (!element) return null;
+        try {
+            const value = JSON.parse(element.textContent);
+            return value && Array.isArray(value.jobs) ? value : null;
+        } catch (_) {
+            return null;
+        }
+    })();
+
+    // During local updates Flask can still be running with an older Python
+    // process while serving the newest trainer.js from disk. Treat an older,
+    // partial bootstrap as a fast list-only snapshot and fetch the full state
+    // before restoring an editor form. Otherwise selects such as qtype have no
+    // options yet and assigning the saved value silently clears it.
+    const bootstrapCanRestoreEditor = Boolean(
+        bootstrapState
+        && Array.isArray(bootstrapState.models)
+        && Array.isArray(bootstrapState.trainingPresets)
+        && Array.isArray(bootstrapState.qtypes)
+        && bootstrapState.qtypes.length
+        && Array.isArray(bootstrapState.datasets)
+        && Array.isArray(bootstrapState.gpus)
+    );
+
     const state = {
-        models: [],
-        trainingPresets: [],
-        qtypes: [],
-        datasets: [],
-        jobs: [],
-        gpus: [],
+        models: bootstrapState?.models || [],
+        trainingPresets: bootstrapState?.trainingPresets || [],
+        qtypes: bootstrapState?.qtypes || [],
+        datasets: bootstrapState?.datasets || [],
+        datasetsLoaded: Boolean(bootstrapState && Array.isArray(bootstrapState.datasets)),
+        jobs: bootstrapState?.jobs || [],
+        gpus: bootstrapState?.gpus || [],
         selectedDatasets: [],
         samples: [],
         validationItems: [],
         selectedJobId: null,
         editingJobId: null,
+        initialViewChosen: false,
         filter: 'all',
-        trainerInstalled: false,
+        trainerInstalled: Boolean(bootstrapState?.trainerInstalled),
         pollTimer: null,
+        samplePollTimer: null,
+        detailTab: 'overview',
+        generatedSamples: [],
+        generatedSampleCount: 1,
+        generatedSamplesStatus: 'idle',
+        selectedGeneratedSample: null,
+        selectedSampleControl: null,
+        sampleZoom: 1,
     };
 
     const $ = id => document.getElementById(id);
@@ -24,6 +60,19 @@
     const form = $('trainer-job-form');
     const jobsList = $('trainer-jobs-list');
     const formError = $('trainer-form-error');
+    const datasetInspectionRequests = new Map();
+
+    function replaceTrainerLocation({ jobId = null, edit = false, newJob = false, tab = 'overview' } = {}) {
+        const url = new URL(window.location.href);
+        url.search = '';
+        if (newJob) url.searchParams.set('new', '1');
+        else if (jobId) {
+            url.searchParams.set('job', jobId);
+            if (edit) url.searchParams.set('edit', '1');
+            else if (tab === 'samples') url.searchParams.set('tab', 'samples');
+        }
+        window.history.replaceState(null, '', url);
+    }
 
     const escapeHtml = value => String(value ?? '')
         .replaceAll('&', '&amp;')
@@ -190,6 +239,11 @@
         $('trainer-editor-title').textContent = isVae
             ? (preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
             : (isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
+        $('trainer-editor-description').textContent = isVae
+            ? 'RGBA targets are mapped from each selected dataset; captions and Control folders are not used.'
+            : (isTransparent
+                ? 'Each dataset independently uses Edit with random real backgrounds or Generation with a black Control1.'
+                : 'Target images and Control1–3 are mapped directly from the selected datasets.');
         renderDatasetPicker();
         renderSelectedDatasets();
     }
@@ -294,10 +348,41 @@
         const preset = selectedPreset();
         const validityKey = preset === 'transparent_lora' ? 'transparentValid' : (isVaePreset(preset) ? 'vaeValid' : 'valid');
         select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
-            const ready = Boolean(dataset[validityKey]);
-            return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)} · ${dataset.targetCount} targets · ${dataset.alphaCount || 0} alpha · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}</option>`;
+            const ready = !dataset.inspected || Boolean(dataset[validityKey]);
+            const details = dataset.inspected
+                ? ` · ${dataset.targetCount} targets · ${dataset.alphaCount || 0} alpha · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`
+                : '';
+            return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)}${details}</option>`;
         }).join('');
         if (state.datasets.some(dataset => dataset.name === previous && !selectedNames.has(previous))) select.value = previous;
+    }
+
+    async function ensureDatasetInspection(name) {
+        if (!name) return;
+        const existing = state.datasets.find(dataset => dataset.name === name);
+        if (existing?.inspected || datasetInspectionRequests.has(name)) return;
+        const requestValue = api(`/api/trainer/datasets/${encodeURIComponent(name)}`)
+            .then(result => {
+                const inspected = { ...result, inspected: true };
+                const index = state.datasets.findIndex(dataset => dataset.name === name);
+                if (index >= 0) state.datasets[index] = inspected;
+                else state.datasets.push(inspected);
+                renderDatasetPicker();
+                if (state.selectedDatasets.some(dataset => dataset.name === name)) renderSelectedDatasets();
+            })
+            .catch(() => { /* retain the lightweight entry; save validation remains authoritative */ })
+            .finally(() => datasetInspectionRequests.delete(name));
+        datasetInspectionRequests.set(name, requestValue);
+        await requestValue;
+    }
+
+    function inspectSelectedDatasets() {
+        const names = new Set();
+        state.selectedDatasets.forEach(dataset => {
+            names.add(dataset.name);
+            if (dataset.rgbaBackgroundDataset) names.add(dataset.rgbaBackgroundDataset);
+        });
+        names.forEach(name => ensureDatasetInspection(name));
     }
 
     function addDataset(name, settings = {}, allowDuplicate = false) {
@@ -317,12 +402,37 @@
             flipX: Boolean(settings.flipX),
             flipY: Boolean(settings.flipY),
             rgbaControlMode: settings.rgbaControlMode || 'edit',
+            rgbaBackgroundDataset: settings.rgbaBackgroundDataset || '',
         });
         renderSelectedDatasets();
     }
 
     function resolutionChip(datasetIndex, value, checked) {
         return `<label class="trainer-resolution-chip"><input type="checkbox" data-dataset-field="resolution" data-dataset-index="${datasetIndex}" value="${value}"${checked ? ' checked' : ''}><span>${value}</span></label>`;
+    }
+
+    function backgroundDatasetOptions(value) {
+        const eligible = state.datasets.filter(dataset => !dataset.inspected || dataset.backgroundValid);
+        const missing = value && !eligible.some(dataset => dataset.name === value)
+            ? `<option value="${escapeHtml(value)}" selected${state.datasetsLoaded ? ' disabled' : ''}>${escapeHtml(value)}${state.datasetsLoaded ? ' · unavailable' : ''}</option>`
+            : '';
+        const empty = eligible.length || !state.datasetsLoaded ? '' : '<option value="" disabled>No opaque background datasets available</option>';
+        return `<option value="">Select background dataset…</option>${empty}${missing}${eligible.map(dataset =>
+            `<option value="${escapeHtml(dataset.name)}"${dataset.name === value ? ' selected' : ''}>${escapeHtml(dataset.name)}${dataset.inspected ? ` · ${dataset.opaqueBackgroundCount || dataset.targetCount} backgrounds` : ''}</option>`
+        ).join('')}`;
+    }
+
+    function syncRgbaCacheState() {
+        const dynamicBackgrounds = selectedPreset() === 'transparent_lora'
+            && state.selectedDatasets.some(dataset => dataset.rgbaControlMode === 'edit');
+        const input = $('trainer-cache-text');
+        const wrap = $('trainer-cache-text-wrap');
+        input.disabled = dynamicBackgrounds;
+        if (dynamicBackgrounds) input.checked = false;
+        wrap.classList.toggle('is-disabled', dynamicBackgrounds);
+        wrap.title = dynamicBackgrounds
+            ? 'Random background controls are generated on every training sample and cannot use cached text embeddings.'
+            : '';
     }
 
     function renderSelectedDatasets() {
@@ -333,25 +443,44 @@
             if (!selectedNames.has(item.dataset)) item.dataset = fallbackName;
         });
         if (!state.selectedDatasets.length) {
-            container.innerHTML = `<div class="trainer-empty-datasets"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg><strong>No datasets selected</strong><span>Choose a dataset above. Target and control folders will be mapped automatically.</span></div>`;
+            container.innerHTML = `<div class="trainer-empty-datasets"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg><strong>No datasets selected</strong><span>${selectedPreset() === 'transparent_lora' ? 'Choose an RGBA target dataset, then configure its mode and background source.' : 'Choose a dataset above. Target and control folders will be mapped automatically.'}</span></div>`;
             $('trainer-dataset-summary').textContent = 'Select one or more managed datasets';
             renderDatasetPicker();
             renderSamples();
             renderValidationItems();
+            syncRgbaCacheState();
             return;
         }
 
         container.innerHTML = state.selectedDatasets.map((settings, index) => {
-            const dataset = state.datasets.find(item => item.name === settings.name);
-            if (!dataset) return '';
-            const controls = dataset.controls.map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
+            const dataset = state.datasets.find(item => item.name === settings.name) || {
+                name: settings.name,
+                targetPath: '',
+                targetCount: null,
+                captionCount: null,
+                alphaCount: null,
+                controls: [],
+                warnings: [],
+            };
+            const metric = value => value === null ? '—' : value;
             const preset = selectedPreset();
+            const controls = preset === 'transparent_lora'
+                ? '<span>Paired controls ignored</span>'
+                : dataset.controls.map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
             const relevantWarnings = dataset.warnings.filter(warning =>
                 preset === 'standard_lora' || !warning.includes('no control images')
             );
             const warnings = relevantWarnings.length ? `<div class="trainer-dataset-warning">${escapeHtml(relevantWarnings.join(' · '))}</div>` : '';
             const rgbaMode = preset === 'transparent_lora'
-                ? `<label class="trainer-field"><span>RGBA control mode</span><select data-dataset-field="rgbaControlMode" data-dataset-index="${index}"><option value="edit"${settings.rgbaControlMode === 'edit' ? ' selected' : ''}>Edit / paired control</option><option value="generation"${settings.rgbaControlMode === 'generation' ? ' selected' : ''}>Generation / black Control1</option></select></label>`
+                ? `<section class="trainer-rgba-settings">
+                    <div class="trainer-field"><span>RGBA training mode</span><div class="trainer-mode-toggle" role="radiogroup" aria-label="RGBA training mode for ${escapeHtml(dataset.name)}">
+                        <label><input type="radio" name="rgba-mode-${index}" value="edit" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'edit' ? ' checked' : ''}><span>Edit</span></label>
+                        <label><input type="radio" name="rgba-mode-${index}" value="generation" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'generation' ? ' checked' : ''}><span>Generation</span></label>
+                    </div></div>
+                    ${settings.rgbaControlMode === 'edit'
+                        ? `<label class="trainer-field trainer-background-dataset-field"><span>Background dataset <small>required</small></span><select data-dataset-field="rgbaBackgroundDataset" data-dataset-index="${index}">${backgroundDatasetOptions(settings.rgbaBackgroundDataset)}</select><small>A random opaque image from its img folder is placed behind the RGBA target on every training sample.</small></label>`
+                        : `<div class="trainer-rgba-mode-note"><strong>Generation mode</strong><span>Control1 is generated as a solid black image. Background datasets and paired Control folders are ignored.</span></div>`}
+                </section>`
                 : '';
             const datasetSettings = isVaePreset(preset)
                 ? `<div class="trainer-dataset-settings">
@@ -380,12 +509,12 @@
                 <div class="trainer-dataset-title">
                     <strong title="${escapeHtml(dataset.name)}">${escapeHtml(dataset.name)}</strong>
                     <span title="${escapeHtml(dataset.targetPath)}">…/Datasets/${escapeHtml(dataset.name)}/img</span>
-                    <div class="trainer-dataset-paths"><span>Target · ${dataset.targetCount}</span>${controls}</div>
+                    <div class="trainer-dataset-paths"><span>Target · ${metric(dataset.targetCount)}</span>${controls}</div>
                 </div>
                 <div class="trainer-dataset-metrics">
-                    <div class="trainer-dataset-metric"><strong>${dataset.targetCount}</strong><span>targets</span></div>
-                    <div class="trainer-dataset-metric"><strong>${dataset.captionCount}</strong><span>captions</span></div>
-                    <div class="trainer-dataset-metric"><strong>${dataset.alphaCount || 0}</strong><span>alpha</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.targetCount)}</strong><span>targets</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.captionCount)}</strong><span>captions</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.alphaCount)}</strong><span>alpha</span></div>
                 </div>
                 ${datasetSettings}
                 <div class="trainer-dataset-actions">
@@ -395,11 +524,15 @@
                 ${warnings}
             </article>`;
         }).join('');
+        const selectedInspected = state.selectedDatasets.every(item => state.datasets.find(dataset => dataset.name === item.name)?.inspected);
         const totalTargets = state.selectedDatasets.reduce((sum, item) => sum + (state.datasets.find(dataset => dataset.name === item.name)?.targetCount || 0), 0);
-        $('trainer-dataset-summary').textContent = `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'} · ${totalTargets} target images`;
+        $('trainer-dataset-summary').textContent = state.datasetsLoaded && selectedInspected
+            ? `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'} · ${totalTargets} target images`
+            : `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'}`;
         renderDatasetPicker();
         renderSamples();
         renderValidationItems();
+        syncRgbaCacheState();
     }
 
     function updateDatasetSetting(input) {
@@ -557,7 +690,14 @@
         $('trainer-guidance-loss-options').classList.toggle('hidden', !$('trainer-guidance-loss').checked);
         $('trainer-differential-guidance-options').classList.toggle('hidden', !$('trainer-differential-guidance').checked);
         $('trainer-validation-options').classList.toggle('hidden', !$('trainer-validation-enabled').checked);
-        $('trainer-offload-sliders').classList.toggle('hidden', !$('trainer-layer-offloading').checked);
+        syncOffloadingControls();
+    }
+
+    function syncOffloadingControls() {
+        const offloadingEnabled = $('trainer-layer-offloading').checked;
+        $('trainer-offload-sliders').classList.toggle('hidden', !offloadingEnabled);
+        $('trainer-transformer-offload').disabled = !offloadingEnabled;
+        $('trainer-text-offload').disabled = !offloadingEnabled;
     }
 
     function syncSlider(id) {
@@ -671,6 +811,12 @@
         if (!isVaePreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
         if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
+        if (payload.trainingPreset === 'transparent_lora') {
+            const missingBackground = payload.datasets.find(dataset =>
+                dataset.rgbaControlMode === 'edit' && !dataset.rgbaBackgroundDataset
+            );
+            if (missingBackground) return `Select a background dataset for ${missingBackground.name}.`;
+        }
         const noResolutions = isVaePreset(payload.trainingPreset) ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
         if (!payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
@@ -846,18 +992,213 @@
         renderPresetFields();
     }
 
-    function showEditor(job = null) {
+    function showEditor(job = null, { updateLocation = true } = {}) {
+        closeSampleViewer();
+        state.initialViewChosen = true;
         state.selectedJobId = job?.id || null;
         state.editingJobId = job?.id || null;
+        if (updateLocation) replaceTrainerLocation(job
+            ? { jobId: job.id, edit: true }
+            : { newJob: true });
         editorView.classList.remove('hidden');
         detailView.classList.add('hidden');
         $('trainer-editor-kicker').textContent = job ? 'Edit training job' : 'New training job';
         $('trainer-editor-title').textContent = job ? job.name : 'Configure LoRA training';
         $('trainer-cancel-edit-btn').classList.toggle('hidden', !job);
         populateForm(job?.form || {});
+        inspectSelectedDatasets();
         showFormError('');
         renderJobs();
         document.querySelector('.trainer-workspace').scrollTop = 0;
+    }
+
+    const generatedSampleUrl = (jobId, filename, options = '') =>
+        `/api/trainer/jobs/${encodeURIComponent(jobId)}/samples/${encodeURIComponent(filename)}${options}`;
+
+    function setDetailTab(tab, { refresh = true, updateLocation = true } = {}) {
+        state.detailTab = tab === 'samples' ? 'samples' : 'overview';
+        if (updateLocation && state.selectedJobId && !state.editingJobId) {
+            replaceTrainerLocation({ jobId: state.selectedJobId, tab: state.detailTab });
+        }
+        document.querySelectorAll('[data-detail-tab]').forEach(button =>
+            button.classList.toggle('is-active', button.dataset.detailTab === state.detailTab)
+        );
+        $('trainer-detail-overview-panel').classList.toggle('hidden', state.detailTab !== 'overview');
+        $('trainer-detail-samples-panel').classList.toggle('hidden', state.detailTab !== 'samples');
+        if (state.detailTab === 'samples' && refresh) refreshGeneratedSamples();
+    }
+
+    function renderGeneratedSamples() {
+        const gallery = $('trainer-samples-gallery');
+        const status = $('trainer-samples-state');
+        const summary = $('trainer-samples-summary');
+        const samples = state.generatedSamples;
+        const job = currentJob();
+        const label = samples.length === 1 ? 'image' : 'images';
+        summary.textContent = samples.length
+            ? `${samples.length} generated ${label} · ${state.generatedSampleCount} per validation step`
+            : 'Generated files from the job samples folder appear here automatically.';
+        $('trainer-download-samples').classList.toggle('hidden', !samples.length || !job);
+
+        if (state.generatedSamplesStatus === 'loading' && !samples.length) {
+            status.innerHTML = '<strong>Loading validation images</strong><span>Please wait while the samples folder is scanned.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+        if (state.generatedSamplesStatus === 'error' && !samples.length) {
+            status.innerHTML = '<strong>Could not load validation images</strong><span>The samples endpoint returned an error. Use Refresh to try again.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+        if (!samples.length) {
+            status.innerHTML = '<strong>No validation images yet</strong><span>Images will appear after the first scheduled or manual sample/validation pass.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+
+        const rows = [];
+        for (let index = 0; index < samples.length; index += state.generatedSampleCount) {
+            rows.push(samples.slice(index, index + state.generatedSampleCount));
+        }
+        const columns = Math.max(state.generatedSampleCount, 3);
+        gallery.innerHTML = rows.map(row => `
+            <div class="trainer-sample-row" style="--sample-columns:${columns}">
+                ${row.map(sample => `
+                    <figure class="trainer-generated-sample">
+                        <button type="button" data-generated-sample="${escapeHtml(sample.name)}" aria-label="Open ${escapeHtml(sample.name)}">
+                            <img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Validation step ${sample.step}, sample ${sample.sampleIndex + 1}" loading="lazy">
+                        </button>
+                        <figcaption><span>Step ${sample.step.toLocaleString()}</span><span>Sample ${sample.sampleIndex + 1}</span></figcaption>
+                    </figure>
+                `).join('')}
+            </div>
+        `).join('');
+        status.classList.add('hidden');
+        gallery.classList.remove('hidden');
+    }
+
+    async function refreshGeneratedSamples(notify = false) {
+        const job = currentJob();
+        if (!job) return;
+        const requestedJobId = job.id;
+        if (!state.generatedSamples.length) state.generatedSamplesStatus = 'loading';
+        renderGeneratedSamples();
+        try {
+            const result = await api(`/api/trainer/jobs/${encodeURIComponent(job.id)}/samples`);
+            if (currentJob()?.id !== requestedJobId) return;
+            state.generatedSamples = result.samples || [];
+            state.generatedSampleCount = Math.max(Number(result.sampleCount) || 1, 1);
+            state.generatedSamplesStatus = 'success';
+            renderGeneratedSamples();
+            if (notify) showToast('Validation images refreshed.');
+        } catch (error) {
+            if (currentJob()?.id !== requestedJobId) return;
+            state.generatedSamplesStatus = 'error';
+            renderGeneratedSamples();
+            if (notify) showToast(error.message, true);
+        }
+    }
+
+    function selectedGeneratedSampleIndex() {
+        return state.generatedSamples.findIndex(sample => sample.name === state.selectedGeneratedSample);
+    }
+
+    function setSampleZoom(value) {
+        state.sampleZoom = Math.max(.5, Math.min(6, Number(value) || 1));
+        $('trainer-sample-viewport').style.setProperty('--sample-zoom', state.sampleZoom);
+        $('trainer-sample-zoom-reset').textContent = `${Math.round(state.sampleZoom * 100)}%`;
+    }
+
+    function renderSampleViewer() {
+        const job = currentJob();
+        const index = selectedGeneratedSampleIndex();
+        const sample = state.generatedSamples[index];
+        if (!job || !sample) {
+            closeSampleViewer();
+            return;
+        }
+        const controlIndex = state.selectedSampleControl;
+        const imageUrl = controlIndex === null
+            ? generatedSampleUrl(job.id, sample.name)
+            : `/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${controlIndex}`;
+        $('trainer-sample-viewer-title').textContent = sample.name;
+        $('trainer-sample-viewer-image').src = imageUrl;
+        $('trainer-sample-viewer-image').alt = controlIndex === null
+            ? `Generated validation sample ${sample.name}`
+            : `Control image ${controlIndex + 1} for ${sample.name}`;
+        $('trainer-sample-viewer-prompt').textContent = sample.prompt || '—';
+        $('trainer-sample-viewer-step').textContent = Number(sample.step || 0).toLocaleString();
+        $('trainer-sample-viewer-index').textContent = String(Number(sample.sampleIndex || 0) + 1);
+        $('trainer-sample-viewer-seed').textContent = sample.seed ?? '—';
+        $('trainer-sample-download').href = generatedSampleUrl(job.id, sample.name, '?download=1');
+
+        const controls = $('trainer-sample-controls');
+        if (sample.controlCount > 0) {
+            controls.innerHTML = `
+                <button class="trainer-sample-control ${controlIndex === null ? 'is-active' : ''}" type="button" data-viewer-control="main" title="Generated image">
+                    <img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Generated image">
+                </button>
+                ${Array.from({ length: sample.controlCount }, (_, control) => `
+                    <button class="trainer-sample-control ${controlIndex === control ? 'is-active' : ''}" type="button" data-viewer-control="${control}" title="Control image ${control + 1}">
+                        <img src="/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${control}" alt="Control ${control + 1}">
+                    </button>
+                `).join('')}
+            `;
+            controls.classList.remove('hidden');
+        } else {
+            controls.innerHTML = '';
+            controls.classList.add('hidden');
+        }
+
+        const rowStart = index - Number(sample.sampleIndex || 0);
+        const rowEnd = Math.min(rowStart + state.generatedSampleCount - 1, state.generatedSamples.length - 1);
+        $('trainer-sample-prev').disabled = index <= rowStart;
+        $('trainer-sample-next').disabled = index >= rowEnd;
+        $('trainer-sample-prev-step').disabled = index - state.generatedSampleCount < 0;
+        $('trainer-sample-next-step').disabled = index + state.generatedSampleCount >= state.generatedSamples.length;
+    }
+
+    function openSampleViewer(filename) {
+        state.selectedGeneratedSample = filename;
+        state.selectedSampleControl = null;
+        setSampleZoom(1);
+        $('trainer-sample-viewer').classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+        renderSampleViewer();
+    }
+
+    function closeSampleViewer() {
+        const viewer = $('trainer-sample-viewer');
+        if (!viewer) return;
+        viewer.classList.add('hidden');
+        state.selectedGeneratedSample = null;
+        state.selectedSampleControl = null;
+        document.body.style.overflow = '';
+    }
+
+    function moveSampleViewer(offset) {
+        const index = selectedGeneratedSampleIndex();
+        const next = index + offset;
+        if (index < 0 || next < 0 || next >= state.generatedSamples.length) return;
+        state.selectedGeneratedSample = state.generatedSamples[next].name;
+        state.selectedSampleControl = null;
+        setSampleZoom(1);
+        renderSampleViewer();
+    }
+
+    async function deleteGeneratedSample() {
+        const job = currentJob();
+        const sample = state.generatedSamples[selectedGeneratedSampleIndex()];
+        if (!job || !sample || !window.confirm(`Delete validation image “${sample.name}”? This cannot be undone.`)) return;
+        try {
+            await api(generatedSampleUrl(job.id, sample.name), { method: 'DELETE' });
+            closeSampleViewer();
+            await refreshGeneratedSamples();
+            showToast('Validation image deleted.');
+        } catch (error) { showToast(error.message, true); }
     }
 
     function renderDetail(job) {
@@ -872,6 +1213,8 @@
             : (model?.label || process.model?.arch || 'Edit model');
         $('trainer-detail-name').textContent = job.name;
         $('trainer-detail-model').textContent = presetLabel || modelLabel;
+        $('trainer-samples-tab').textContent = isVae ? 'VAE Validation' : 'Samples';
+        $('trainer-samples-heading').textContent = isVae ? 'VAE validation images' : 'Training samples';
         $('trainer-detail-kicker').textContent = job.status === 'running' ? 'Active training job' : 'Training job';
         $('trainer-detail-status').textContent = job.status;
         $('trainer-detail-status').dataset.status = job.status;
@@ -911,17 +1254,81 @@
         $('trainer-edit-job-btn').disabled = active;
         $('trainer-delete-job-btn').disabled = active;
         $('trainer-download-log').href = `/api/trainer/jobs/${job.id}/log/download`;
+        $('trainer-download-samples').href = `/api/trainer/jobs/${encodeURIComponent(job.id)}/samples/archive`;
     }
 
-    async function showDetail(jobId) {
+    async function showDetail(jobId, { updateLocation = true, tab = 'overview' } = {}) {
+        closeSampleViewer();
+        state.initialViewChosen = true;
         state.selectedJobId = jobId;
         state.editingJobId = null;
+        if (updateLocation) replaceTrainerLocation({ jobId, tab });
+        state.generatedSamples = [];
+        state.generatedSampleCount = 1;
+        state.generatedSamplesStatus = 'idle';
         editorView.classList.add('hidden');
         detailView.classList.remove('hidden');
         renderJobs();
         renderDetail(currentJob());
+        setDetailTab(tab, { refresh: false, updateLocation: false });
+        renderGeneratedSamples();
         await refreshLog(false);
         document.querySelector('.trainer-workspace').scrollTop = 0;
+    }
+
+    function formatTrainerLog(value) {
+        const source = String(value || '').replace(/\r\n/g, '\n');
+        const lines = [[]];
+        let row = 0;
+        let column = 0;
+
+        const ensureRow = () => {
+            while (lines.length <= row) lines.push([]);
+        };
+
+        for (let index = 0; index < source.length; index += 1) {
+            const character = source[index];
+            if (character === '\u001b' && source[index + 1] === '[') {
+                const sequence = source.slice(index).match(/^\u001b\[([0-?]*)([ -/]*)([@-~])/);
+                if (sequence) {
+                    const parameters = sequence[1].split(';');
+                    const amount = Number.parseInt(parameters[0], 10) || 1;
+                    const command = sequence[3];
+                    if (command === 'A') row = Math.max(0, row - amount);
+                    else if (command === 'B') row += amount;
+                    else if (command === 'C') column += amount;
+                    else if (command === 'D') column = Math.max(0, column - amount);
+                    else if (command === 'G') column = Math.max(0, amount - 1);
+                    else if (command === 'K') {
+                        ensureRow();
+                        if (parameters[0] === '2') lines[row] = [];
+                        else lines[row].splice(column);
+                    }
+                    ensureRow();
+                    index += sequence[0].length - 1;
+                    continue;
+                }
+            }
+            if (character === '\r') {
+                column = 0;
+                continue;
+            }
+            if (character === '\n') {
+                row += 1;
+                column = 0;
+                ensureRow();
+                continue;
+            }
+            if (character === '\b') {
+                column = Math.max(0, column - 1);
+                continue;
+            }
+            ensureRow();
+            lines[row][column] = character;
+            column += 1;
+        }
+
+        return lines.map(line => line.join('').trimEnd()).join('\n').trimEnd();
     }
 
     async function refreshLog(notify = false) {
@@ -931,7 +1338,7 @@
             const result = await api(`/api/trainer/jobs/${job.id}/log`);
             const output = $('trainer-log-output');
             const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 20;
-            output.textContent = result.log || 'No log output yet.';
+            output.textContent = formatTrainerLog(result.log) || 'No log output yet.';
             if (atBottom) output.scrollTop = output.scrollHeight;
             if (notify) showToast('Trainer log refreshed.');
         } catch (error) {
@@ -945,19 +1352,49 @@
         state.trainingPresets = result.trainingPresets || [];
         state.qtypes = result.qtypes || [];
         state.datasets = result.datasets || [];
+        state.datasetsLoaded = true;
         state.jobs = result.jobs || [];
         state.gpus = result.gpus || [];
         state.trainerInstalled = Boolean(result.trainerInstalled);
         renderRuntime();
-        renderModelOptions();
-        renderPresetOptions();
+        if (!initial || !bootstrapCanRestoreEditor) {
+            renderModelOptions();
+            renderPresetOptions();
+        }
         renderGpuOptions();
         renderDatasetPicker();
+        if (!editorView.classList.contains('hidden') && state.selectedDatasets.length) {
+            renderSelectedDatasets();
+        }
         renderJobs();
         $('trainer-upstream-commit').textContent = result.upstreamCommit || '—';
-        if (state.selectedJobId && !currentJob()) showEditor();
+        if (state.selectedJobId && !currentJob()) {
+            if (state.jobs.length) showDetail(state.jobs[0].id);
+            else showEditor();
+        }
         else if (state.selectedJobId && !state.editingJobId && !detailView.classList.contains('hidden')) renderDetail(currentJob());
-        if (initial) showEditor();
+        if (initial && !state.initialViewChosen) {
+            restoreInitialView();
+        }
+    }
+
+    function restoreInitialView() {
+        const params = new URLSearchParams(window.location.search);
+        const requestedJob = state.jobs.find(job => job.id === params.get('job'));
+        if (params.get('new') === '1') {
+            showEditor(null, { updateLocation: false });
+        } else if (requestedJob && params.get('edit') === '1') {
+            showEditor(requestedJob, { updateLocation: false });
+        } else if (requestedJob) {
+            showDetail(requestedJob.id, {
+                updateLocation: false,
+                tab: params.get('tab') === 'samples' ? 'samples' : 'overview',
+            });
+        } else if (state.jobs.length) {
+            showDetail(state.jobs[0].id);
+        } else {
+            showEditor();
+        }
     }
 
     async function refreshJobsOnly() {
@@ -1052,7 +1489,7 @@
             renderPresetFields();
         });
         $('trainer-network-type').addEventListener('change', renderConditionalOptions);
-        $('trainer-layer-offloading').addEventListener('change', renderConditionalOptions);
+        $('trainer-layer-offloading').addEventListener('change', syncOffloadingControls);
         ['trainer-transformer-offload', 'trainer-text-offload'].forEach(id =>
             $(id).addEventListener('input', () => syncSlider(id))
         );
@@ -1089,6 +1526,7 @@
             const name = $('trainer-dataset-select').value;
             if (!name) return;
             addDataset(name);
+            ensureDatasetInspection(name);
             $('trainer-dataset-select').value = '';
         });
         $('trainer-selected-datasets').addEventListener('click', event => {
@@ -1103,7 +1541,10 @@
         });
         $('trainer-selected-datasets').addEventListener('input', event => {
             const input = event.target.closest('[data-dataset-field]');
-            if (input) updateDatasetSetting(input);
+            if (input) {
+                updateDatasetSetting(input);
+                if (input.dataset.datasetField === 'rgbaControlMode') renderSelectedDatasets();
+            }
         });
         $('trainer-add-sample-btn').addEventListener('click', () => {
             state.samples.push({ prompt: '', width: '', height: '', seed: '', networkMultiplier: '', ctrlImg1: '', ctrlImg2: '', ctrlImg3: '' });
@@ -1193,6 +1634,47 @@
         $('trainer-sample-now-btn').addEventListener('click', () => requestRuntimeAction('sample'));
         $('trainer-delete-job-btn').addEventListener('click', deleteJob);
         $('trainer-refresh-log-btn').addEventListener('click', () => refreshLog(true));
+        document.querySelectorAll('[data-detail-tab]').forEach(button => button.addEventListener('click', () =>
+            setDetailTab(button.dataset.detailTab)
+        ));
+        $('trainer-refresh-samples-btn').addEventListener('click', () => refreshGeneratedSamples(true));
+        $('trainer-samples-gallery').addEventListener('click', event => {
+            const button = event.target.closest('[data-generated-sample]');
+            if (button) openSampleViewer(button.dataset.generatedSample);
+        });
+        document.querySelectorAll('[data-sample-viewer-close]').forEach(button =>
+            button.addEventListener('click', closeSampleViewer)
+        );
+        $('trainer-sample-controls').addEventListener('click', event => {
+            const button = event.target.closest('[data-viewer-control]');
+            if (!button) return;
+            state.selectedSampleControl = button.dataset.viewerControl === 'main'
+                ? null
+                : Number(button.dataset.viewerControl);
+            setSampleZoom(1);
+            renderSampleViewer();
+        });
+        $('trainer-sample-prev').addEventListener('click', () => {
+            if (!$('trainer-sample-prev').disabled) moveSampleViewer(-1);
+        });
+        $('trainer-sample-next').addEventListener('click', () => {
+            if (!$('trainer-sample-next').disabled) moveSampleViewer(1);
+        });
+        $('trainer-sample-prev-step').addEventListener('click', () => {
+            if (!$('trainer-sample-prev-step').disabled) moveSampleViewer(-state.generatedSampleCount);
+        });
+        $('trainer-sample-next-step').addEventListener('click', () => {
+            if (!$('trainer-sample-next-step').disabled) moveSampleViewer(state.generatedSampleCount);
+        });
+        $('trainer-sample-zoom-out').addEventListener('click', () => setSampleZoom(state.sampleZoom - .25));
+        $('trainer-sample-zoom-reset').addEventListener('click', () => setSampleZoom(1));
+        $('trainer-sample-zoom-in').addEventListener('click', () => setSampleZoom(state.sampleZoom + .25));
+        $('trainer-sample-delete').addEventListener('click', deleteGeneratedSample);
+        $('trainer-sample-viewport').addEventListener('wheel', event => {
+            if ($('trainer-sample-viewer').classList.contains('hidden')) return;
+            event.preventDefault();
+            setSampleZoom(state.sampleZoom + (event.deltaY < 0 ? .2 : -.2));
+        }, { passive: false });
         $('trainer-settings-btn').addEventListener('click', openSettings);
         $('trainer-settings-close').addEventListener('click', closeSettings);
         $('trainer-settings-cancel').addEventListener('click', closeSettings);
@@ -1205,26 +1687,66 @@
         });
         $('trainer-settings-modal').addEventListener('click', event => { if (event.target === $('trainer-settings-modal')) closeSettings(); });
         document.addEventListener('keydown', event => {
+            const viewerOpen = !$('trainer-sample-viewer').classList.contains('hidden');
+            if (viewerOpen) {
+                if (event.key === 'Escape') closeSampleViewer();
+                else if (event.key === 'ArrowLeft') $('trainer-sample-prev').click();
+                else if (event.key === 'ArrowRight') $('trainer-sample-next').click();
+                else if (event.key === 'ArrowUp') $('trainer-sample-prev-step').click();
+                else if (event.key === 'ArrowDown') $('trainer-sample-next-step').click();
+                else if (event.key === 'Delete' || event.key === 'Backspace') deleteGeneratedSample();
+                if (['Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(event.key)) event.preventDefault();
+                return;
+            }
             if (event.key === 'Escape' && !$('trainer-settings-modal').classList.contains('hidden')) closeSettings();
         });
     }
 
-    async function initialize() {
-        bindEvents();
-        try {
-            await refreshState({ initial: true });
-            state.pollTimer = window.setInterval(async () => {
-                try {
-                    await refreshJobsOnly();
-                    if (!detailView.classList.contains('hidden') && ['queued', 'running', 'stopping'].includes(currentJob()?.status)) await refreshLog(false);
-                } catch (_) { /* keep the last rendered state */ }
-            }, 3000);
-        } catch (error) {
-            showFormError(`Could not load trainer: ${error.message}`);
-            $('trainer-runtime-status').textContent = 'Trainer API unavailable';
-            $('trainer-runtime-status').classList.add('is-missing');
-        }
+    function scheduleJobPoll() {
+        window.clearTimeout(state.pollTimer);
+        state.pollTimer = window.setTimeout(async () => {
+            try {
+                await refreshJobsOnly();
+                if (!detailView.classList.contains('hidden') && ['queued', 'running', 'stopping'].includes(currentJob()?.status)) await refreshLog(false);
+            } catch (_) { /* keep the last rendered state */ }
+            scheduleJobPoll();
+        }, 3000);
     }
 
+    function scheduleSamplePoll() {
+        window.clearTimeout(state.samplePollTimer);
+        state.samplePollTimer = window.setTimeout(async () => {
+            if (!detailView.classList.contains('hidden') && state.detailTab === 'samples' && currentJob()) {
+                await refreshGeneratedSamples(false);
+            }
+            scheduleSamplePoll();
+        }, 5000);
+    }
+
+    async function initialize() {
+        bindEvents();
+        if (!bootstrapCanRestoreEditor) {
+            try {
+                await refreshState({ initial: true });
+            } catch (error) {
+                showFormError(`Could not load trainer: ${error.message}`);
+                $('trainer-runtime-status').textContent = 'Trainer API unavailable';
+                $('trainer-runtime-status').classList.add('is-missing');
+            }
+        }
+        scheduleJobPoll();
+        scheduleSamplePoll();
+    }
+
+    if (bootstrapState) {
+        renderRuntime();
+        renderModelOptions();
+        renderPresetOptions();
+        renderGpuOptions();
+        renderDatasetPicker();
+        renderJobs();
+        $('trainer-upstream-commit').textContent = bootstrapState.upstreamCommit || '—';
+        if (bootstrapCanRestoreEditor) restoreInitialView();
+    }
     initialize();
 })();

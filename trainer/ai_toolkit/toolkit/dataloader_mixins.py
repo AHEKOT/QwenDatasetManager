@@ -32,10 +32,10 @@ from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
 from toolkit.rgba_utils import (
-    choose_deterministic_background,
+    fit_rgb_background,
     prepare_rgba_image,
     resize_rgba_alpha_safe,
-    rgba_tensor_to_rgb_control,
+    rgba_tensor_to_rgb_control_image,
 )
 from toolkit.accelerator import get_accelerator
 from toolkit.prompt_utils import PromptEmbeds
@@ -1193,11 +1193,28 @@ class ControlFileItemDTOMixin:
                 # the target must be generated rather than copied/edited.
                 self.control_tensor = torch.zeros_like(self.tensor[:3])
             else:
-                background = choose_deterministic_background(
-                    self.path,
-                    self.dataset_config.rgba_control_backgrounds,
+                background_path = random.choice(
+                    self.dataset_config.rgba_control_background_files
                 )
-                self.control_tensor = rgba_tensor_to_rgb_control(self.tensor, background)
+                with Image.open(background_path) as background_image:
+                    background_image = exif_transpose(background_image)
+                    if 'A' in background_image.getbands() or 'transparency' in background_image.info:
+                        alpha = background_image.convert('RGBA').getchannel('A')
+                        if alpha.getextrema() != (255, 255):
+                            raise ValueError(
+                                f"RGBA control background must be opaque: {background_path}"
+                            )
+                    height, width = self.tensor.shape[-2:]
+                    background_image = fit_rgb_background(
+                        background_image,
+                        (width, height),
+                    )
+                    background_tensor = TF.to_tensor(background_image)
+                self.rgba_control_background_file = background_path
+                self.control_tensor = rgba_tensor_to_rgb_control_image(
+                    self.tensor,
+                    background_tensor,
+                )
             self.control_tensor_list = None
             return
 
@@ -2208,7 +2225,8 @@ class TextEmbeddingFileItemDTOMixin:
                 # keys unchanged so existing valid caches remain reusable.
                 item["rgba_control_mode"] = 'generation'
             else:
-                item["rgba_control_backgrounds"] = self.dataset_config.rgba_control_backgrounds
+                item["rgba_control_background_path"] = self.dataset_config.rgba_control_background_path
+                item["rgba_random_backgrounds"] = True
             item["rgba_alpha_threshold"] = self.dataset_config.rgba_alpha_threshold
             item["rgba_hidden_rgb_color"] = self.dataset_config.rgba_hidden_rgb_color
             item["rgba_unblend_background"] = self.dataset_config.rgba_unblend_background

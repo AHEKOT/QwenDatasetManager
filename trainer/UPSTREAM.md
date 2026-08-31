@@ -22,9 +22,14 @@ upstream folder pickers with managed dataset selection; the applicable trainer
 settings continue to produce the same process keys consumed by this vendored
 backend.
 
-The upstream Next.js UI, manager, dataset editor, captioning extensions and
-unrelated image/video/audio model adapters are intentionally not included.
-Qwen Dataset Manager supplies the UI, job queue, dataset mapping and settings.
+Qwen Dataset Manager does not run the upstream Next.js application as a second
+web server. Applicable trainer UI behavior is ported into QDM's Flask/vanilla
+UI instead. This includes the modified Samples / VAE Validation subsystem from
+`D:\AiToolkitNew\AI-Toolkit` (live polling, grouped gallery, metadata,
+full-screen navigation, control images, deletion, ZIP download, and
+alpha-preserving checkerboard previews). The unrelated upstream manager,
+dataset editor, captioning extensions and unrelated image/video/audio model
+adapters are not part of this trainer integration.
 
 ## Local integration changes
 

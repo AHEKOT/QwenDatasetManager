@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import hashlib
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 def image_has_alpha(image: Image.Image) -> bool:
@@ -169,15 +168,36 @@ def rgba_tensor_to_rgb_control(
     bg = torch.tensor(background, device=image.device, dtype=torch.float32).view(3, 1, 1) / 255.0
     return (rgba[:3] * alpha + bg * (1.0 - alpha)).to(dtype=image.dtype)
 
+def rgba_tensor_to_rgb_control_image(
+    image: torch.Tensor,
+    background: torch.Tensor,
+) -> torch.Tensor:
+    """Composite a normalized CHW RGBA target over an RGB [0, 1] image tensor."""
+    if image.ndim != 3 or image.shape[0] != 4:
+        raise ValueError(f"expected normalized CHW RGBA tensor, received shape={tuple(image.shape)}")
+    if background.ndim != 3 or background.shape[0] != 3:
+        raise ValueError(
+            f"expected CHW RGB background tensor, received shape={tuple(background.shape)}"
+        )
+    if tuple(background.shape[1:]) != tuple(image.shape[1:]):
+        raise ValueError("RGBA target and RGB background must have matching spatial dimensions")
 
-def choose_deterministic_background(
-    path: str,
-    backgrounds: Iterable[Sequence[int]],
-) -> tuple[int, int, int]:
-    palette = [tuple(int(x) for x in color) for color in backgrounds]
-    if not palette:
-        raise ValueError("at least one RGBA control background is required")
-    if any(len(color) != 3 or any(not 0 <= x <= 255 for x in color) for color in palette):
-        raise ValueError("each RGBA control background must be an RGB triplet")
-    digest = hashlib.sha256(path.encode("utf-8")).digest()
-    return palette[int.from_bytes(digest[:4], "big") % len(palette)]
+    rgba = ((image.to(torch.float32) + 1.0) * 0.5).clamp(0.0, 1.0)
+    alpha = rgba[3:4]
+    bg = background.to(device=image.device, dtype=torch.float32).clamp(0.0, 1.0)
+    return (rgba[:3] * alpha + bg * (1.0 - alpha)).to(dtype=image.dtype)
+
+
+def fit_rgb_background(image: Image.Image, size: Sequence[int]) -> Image.Image:
+    """Convert any PIL color mode to RGB and resize-to-cover with a centered crop."""
+    if len(size) != 2:
+        raise ValueError("background target size must contain width and height")
+    width, height = (int(size[0]), int(size[1]))
+    if width <= 0 or height <= 0:
+        raise ValueError("background target width and height must be positive")
+    return ImageOps.fit(
+        image.convert("RGB"),
+        (width, height),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )

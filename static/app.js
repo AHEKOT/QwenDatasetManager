@@ -3313,8 +3313,36 @@ const ptPreviewBtn  = document.getElementById('pt-preview-btn');
 const ptApplyBtn    = document.getElementById('pt-apply-btn');
 const ptSaveBtn     = document.getElementById('pt-save-config-btn');
 const ptLoadBtn     = document.getElementById('pt-load-config-btn');
+const ptTabButtons  = Array.from(ptModal.querySelectorAll('[data-pt-tab]'));
+const ptTabPanels   = Array.from(ptModal.querySelectorAll('[data-pt-panel]'));
+const ptFooterGroups = Array.from(ptModal.querySelectorAll('[data-pt-footer]'));
+
+const acSystemPrompt = document.getElementById('ac-system-prompt');
+const acModelSelect = document.getElementById('ac-model-select');
+const acQuantSelect = document.getElementById('ac-quant-select');
+const acPrefix = document.getElementById('ac-prefix');
+const acSuffix = document.getElementById('ac-suffix');
+const acModelStatus = document.getElementById('ac-model-status');
+const acPreviewImage = document.getElementById('ac-preview-image');
+const acPreviewEmpty = document.getElementById('ac-preview-empty');
+const acPreviewFilename = document.getElementById('ac-preview-filename');
+const acPreviewCaption = document.getElementById('ac-preview-caption');
+const acProgress = document.getElementById('ac-progress');
+const acProgressLabel = document.getElementById('ac-progress-label');
+const acProgressPercent = document.getElementById('ac-progress-percent');
+const acProgressFill = document.getElementById('ac-progress-fill');
+const acProgressItems = document.getElementById('ac-progress-items');
+const acRescanBtn = document.getElementById('ac-rescan-btn');
+const acLoadBtn = document.getElementById('ac-load-config-btn');
+const acSaveBtn = document.getElementById('ac-save-config-btn');
+const acPreviewBtn = document.getElementById('ac-preview-btn');
+const acRerollBtn = document.getElementById('ac-reroll-btn');
+const acApplyBtn = document.getElementById('ac-apply-btn');
 
 let ptPreviewDebounce = null;
+let acCatalog = { models: [], warnings: [], directory: 'models/llm' };
+let acInitializedFolder = '';
+let acBusy = false;
 
 // ── Open / Close ─────────────────────────────────────────────────────────────
 
@@ -3324,7 +3352,7 @@ async function openProcessTextModal() {
         return;
     }
     ptModal.classList.add('active');
-    await ptLoadConfig();
+    await Promise.all([ptLoadConfig(), acInitialize()]);
     ptCloseBtn.focus();
 }
 
@@ -3333,6 +3361,18 @@ function closeProcessTextModal() {
 }
 
 ptCloseBtn.addEventListener('click', closeProcessTextModal);
+
+function ptSelectTab(tabName) {
+    ptTabButtons.forEach(button => {
+        const active = button.dataset.ptTab === tabName;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    ptTabPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.ptPanel === tabName));
+    ptFooterGroups.forEach(group => group.classList.toggle('hidden', group.dataset.ptFooter !== tabName));
+}
+
+ptTabButtons.forEach(button => button.addEventListener('click', () => ptSelectTab(button.dataset.ptTab)));
 
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && ptModal.classList.contains('active')) {
@@ -3539,6 +3579,250 @@ function ptShowStatus(msg, type = 'info') {
     bar.classList.add('visible');
     setTimeout(() => bar.classList.remove('visible'), 4000);
 }
+
+// ── Auto Caption ─────────────────────────────────────────────────────────────
+
+function acGetConfig() {
+    return {
+        systemPrompt: acSystemPrompt.value,
+        modelId: acModelSelect.value,
+        variantId: acQuantSelect.value,
+        prefix: acPrefix.value,
+        suffix: acSuffix.value
+    };
+}
+
+function acSetBusy(busy) {
+    acBusy = busy;
+    [acPreviewBtn, acRerollBtn, acApplyBtn, acRescanBtn, acLoadBtn, acSaveBtn].forEach(button => {
+        button.disabled = busy;
+    });
+    if (!busy) {
+        const hasModel = Boolean(acModelSelect.value && acQuantSelect.value);
+        acPreviewBtn.disabled = !hasModel;
+        acRerollBtn.disabled = !hasModel;
+        acApplyBtn.disabled = !hasModel;
+    }
+}
+
+function acSelectedModel() {
+    return acCatalog.models.find(model => model.id === acModelSelect.value) || null;
+}
+
+function acPopulateQuantizations(preferredVariantId = '') {
+    const model = acSelectedModel();
+    const variants = model?.variants || [];
+    acQuantSelect.innerHTML = variants.length
+        ? variants.map(variant => `<option value="${escHtml(variant.id)}">${escHtml(variant.quantization)} — ${escHtml(variant.filename)}</option>`).join('')
+        : '<option value="">No quantizations found</option>';
+    if (preferredVariantId && variants.some(variant => variant.id === preferredVariantId)) {
+        acQuantSelect.value = preferredVariantId;
+    }
+    acQuantSelect.disabled = !variants.length;
+    acSetBusy(acBusy);
+}
+
+function acPopulateModels(preferredModelId = '', preferredVariantId = '') {
+    const models = acCatalog.models || [];
+    acModelSelect.innerHTML = models.length
+        ? models.map(model => `<option value="${escHtml(model.id)}">${escHtml(model.label)}</option>`).join('')
+        : '<option value="">No paired GGUF models found</option>';
+    if (preferredModelId && models.some(model => model.id === preferredModelId)) {
+        acModelSelect.value = preferredModelId;
+    }
+    acModelSelect.disabled = !models.length;
+    acPopulateQuantizations(preferredVariantId);
+
+    const warnings = acCatalog.warnings || [];
+    if (!models.length) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = `No selectable models in ${acCatalog.directory || 'models/llm'}. Add a language-model .gguf and its matching mmproj .gguf, then click Rescan Models.${warnings.length ? `\n\n${warnings.join('\n')}` : ''}`;
+    } else if (warnings.length) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = `${models.length} model famil${models.length === 1 ? 'y' : 'ies'} ready.\n${warnings.join('\n')}`;
+    } else {
+        acModelStatus.dataset.state = 'ready';
+        acModelStatus.textContent = `${models.length} local model famil${models.length === 1 ? 'y' : 'ies'} ready. GGUF quantization is selected from the files on disk.`;
+    }
+}
+
+async function acLoadModels({ modelId = acModelSelect.value, variantId = acQuantSelect.value } = {}) {
+    const response = await fetch('/api/auto-caption/models');
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to scan local models.');
+    acCatalog = data;
+    acPopulateModels(modelId, variantId);
+}
+
+function acSetConfig(config) {
+    acSystemPrompt.value = config.systemPrompt || '';
+    acPrefix.value = config.prefix || '';
+    acSuffix.value = config.suffix || '';
+    acPopulateModels(config.modelId || '', config.variantId || '');
+}
+
+async function acLoadConfig() {
+    if (!currentFolder) return;
+    const response = await fetch(`/api/auto-caption/config?folder=${encodeURIComponent(currentFolder)}`);
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to load Auto Caption config.');
+    acSetConfig(data);
+}
+
+async function acInitialize() {
+    if (!currentFolder) return;
+    try {
+        await acLoadModels({ modelId: '', variantId: '' });
+        await acLoadConfig();
+        acInitializedFolder = currentFolder;
+    } catch (error) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = error.message;
+    }
+}
+
+async function acSaveConfig() {
+    if (!currentFolder) return;
+    const response = await fetch(`/api/auto-caption/config?folder=${encodeURIComponent(currentFolder)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(acGetConfig())
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to save Auto Caption config.');
+    ptShowStatus('Auto Caption config saved.', 'success');
+}
+
+function acRenderProgress(job) {
+    acProgress.classList.remove('hidden');
+    const percent = Math.max(0, Math.min(100, Number(job.progressPercent || 0)));
+    acProgressPercent.textContent = `${percent.toFixed(0)}%`;
+    acProgressFill.style.width = `${percent}%`;
+
+    const stateLabels = {
+        queued: 'Queued',
+        waiting: 'Waiting for the caption engine',
+        loading: `Loading ${job.currentItem || 'GGUF model'}`,
+        running: job.currentItem ? `Generating ${job.currentItem}` : 'Generating captions',
+        committing: 'Saving generated captions',
+        completed: 'Complete',
+        error: 'Failed'
+    };
+    const count = job.totalItems ? ` — ${job.processedItems}/${job.totalItems}` : '';
+    acProgressLabel.textContent = `${stateLabels[job.status] || job.status}${count}`;
+
+    const symbols = { queued: '·', generating: '◌', completed: '✓', error: '!' };
+    acProgressItems.innerHTML = (job.items || []).map(item => `
+        <div class="ac-progress-item" data-status="${escHtml(item.status)}" title="${escHtml(item.error || item.caption || '')}">
+            <span>${symbols[item.status] || '·'}</span><span>${escHtml(item.filename)}</span>
+        </div>
+    `).join('');
+    const current = acProgressItems.querySelector('[data-status="generating"]');
+    current?.scrollIntoView({ block: 'nearest' });
+}
+
+function acRenderCompleted(job) {
+    const result = job.result || {};
+    if (job.mode === 'preview') {
+        if (!result.filename || !result.caption) {
+            const message = result.errors?.[0]?.error || 'The model did not produce a caption.';
+            throw new Error(message);
+        }
+        const imageUrl = `/api/image/img/${encodeURIComponent(result.filename)}?folder=${encodeURIComponent(currentFolder)}&t=${Date.now()}`;
+        acPreviewImage.src = imageUrl;
+        acPreviewImage.closest('.ac-preview-frame').classList.add('has-image');
+        acPreviewFilename.textContent = result.filename;
+        acPreviewCaption.textContent = result.caption;
+        ptShowStatus(`Preview generated with ${result.model} (${result.quantization}).`, 'success');
+        return;
+    }
+
+    const backup = result.backup ? ` Backup: ${result.backup}.` : '';
+    const failures = result.failed ? ` ${result.failed} image(s) failed.` : '';
+    ptShowStatus(
+        `Generated ${result.generated} caption(s).${failures}${backup}`,
+        result.failed ? 'warning' : 'success'
+    );
+    if (images[currentIndex]) loadCaption(images[currentIndex]);
+}
+
+async function acPollJob(jobId) {
+    while (true) {
+        const response = await fetch(`/api/auto-caption/jobs/${encodeURIComponent(jobId)}`);
+        const job = await response.json();
+        if (!response.ok || job.error && !job.finished) {
+            throw new Error(job.error || 'Failed to read Auto Caption progress.');
+        }
+        acRenderProgress(job);
+        if (job.status === 'error') throw new Error(job.error || 'Auto Caption failed.');
+        if (job.status === 'completed') {
+            acRenderCompleted(job);
+            return job;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+}
+
+async function acStartJob(mode) {
+    if (!currentFolder || acBusy) return;
+    if (!acModelSelect.value || !acQuantSelect.value) {
+        ptShowStatus('Add a paired GGUF + mmproj model and select it first.', 'warning');
+        return;
+    }
+    if (mode === 'apply') {
+        const ok = confirm(
+            `Generate and replace captions for ALL ${images.length} images in "${currentFolder}"?\n\nExisting captions will be backed up before generated text is saved.`
+        );
+        if (!ok) return;
+    }
+
+    acSetBusy(true);
+    acProgress.classList.remove('hidden');
+    acProgressLabel.textContent = 'Starting…';
+    acProgressPercent.textContent = '0%';
+    acProgressFill.style.width = '0%';
+    acProgressItems.innerHTML = '';
+    try {
+        const response = await fetch(`/api/auto-caption/${mode === 'apply' ? 'apply' : 'preview'}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder: currentFolder, config: acGetConfig() })
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'Failed to start Auto Caption.');
+        await acPollJob(data.jobId);
+    } catch (error) {
+        acProgressLabel.textContent = error.message;
+        acProgressPercent.textContent = 'Error';
+        ptShowStatus(`Auto Caption failed: ${error.message}`, 'error');
+    } finally {
+        acSetBusy(false);
+    }
+}
+
+acModelSelect.addEventListener('change', () => acPopulateQuantizations());
+acRescanBtn.addEventListener('click', async () => {
+    try {
+        await acLoadModels();
+        ptShowStatus('Local GGUF models rescanned.', 'success');
+    } catch (error) {
+        ptShowStatus(`Model scan failed: ${error.message}`, 'error');
+    }
+});
+acLoadBtn.addEventListener('click', async () => {
+    try {
+        await acLoadConfig();
+        ptShowStatus('Auto Caption config loaded.', 'success');
+    } catch (error) {
+        ptShowStatus(`Load failed: ${error.message}`, 'error');
+    }
+});
+acSaveBtn.addEventListener('click', async () => {
+    try { await acSaveConfig(); } catch (error) { ptShowStatus(`Save failed: ${error.message}`, 'error'); }
+});
+acPreviewBtn.addEventListener('click', () => acStartJob('preview'));
+acRerollBtn.addEventListener('click', () => acStartJob('preview'));
+acApplyBtn.addEventListener('click', () => acStartJob('apply'));
 
 // ─── Stitch Mode ──────────────────────────────────────────────────────────────
 

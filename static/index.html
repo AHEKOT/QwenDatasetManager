@@ -982,7 +982,12 @@
                 <button id="pt-close-btn" class="pt-close-btn" aria-label="Close process text dialog">✕</button>
             </div>
 
-            <div class="pt-body">
+            <div class="pt-tabs" role="tablist" aria-label="Process Text mode">
+                <button class="pt-tab-btn active" type="button" role="tab" aria-selected="true" data-pt-tab="rules">Rules</button>
+                <button class="pt-tab-btn" type="button" role="tab" aria-selected="false" data-pt-tab="auto-caption">Auto Caption</button>
+            </div>
+
+            <div class="pt-body pt-tab-panel active" data-pt-panel="rules">
 
                 <!-- ── Left: Config ── -->
                 <div class="pt-config">
@@ -1041,15 +1046,89 @@
 
             </div>
 
+            <div class="ac-body pt-tab-panel" data-pt-panel="auto-caption">
+                <div class="ac-preview-panel">
+                    <div class="pt-preview-header">
+                        <h3>Generated Preview</h3>
+                        <button id="ac-reroll-btn" class="pt-icon-btn" title="Generate a caption for another random image">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M23 4v6h-6M1 20v-6h6"></path>
+                                <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="ac-preview-content">
+                        <div class="ac-preview-frame">
+                            <img id="ac-preview-image" alt="Random dataset preview">
+                            <div id="ac-preview-empty" class="pt-preview-empty">Choose a local GGUF model, then generate a preview.</div>
+                        </div>
+                        <div id="ac-preview-filename" class="pt-preview-filename"></div>
+                        <div id="ac-preview-caption" class="ac-preview-caption">The generated caption will appear here.</div>
+                        <div id="ac-progress" class="ac-progress hidden">
+                            <div class="ac-progress-head">
+                                <span id="ac-progress-label">Preparing…</span>
+                                <strong id="ac-progress-percent">0%</strong>
+                            </div>
+                            <div class="ac-progress-track"><div id="ac-progress-fill" class="ac-progress-fill"></div></div>
+                            <div id="ac-progress-items" class="ac-progress-items"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ac-config">
+                    <section class="pt-section">
+                        <h3>System Prompt</h3>
+                        <p class="pt-hint">Tell the vision-language model exactly how captions should be written. The image is supplied automatically.</p>
+                        <textarea id="ac-system-prompt" class="pt-textarea ac-system-prompt" spellcheck="true"></textarea>
+                    </section>
+
+                    <section class="pt-section">
+                        <h3>Local Model</h3>
+                        <p class="pt-hint">Models are scanned from <code>models/llm</code>. Each language-model GGUF must have a matching <code>mmproj*.gguf</code>.</p>
+                        <label class="ac-field" for="ac-model-select">
+                            <span>Model</span>
+                            <select id="ac-model-select" class="ac-select"></select>
+                        </label>
+                        <label class="ac-field" for="ac-quant-select">
+                            <span>Quantization</span>
+                            <select id="ac-quant-select" class="ac-select"></select>
+                        </label>
+                        <div id="ac-model-status" class="ac-model-status"></div>
+                    </section>
+
+                    <section class="pt-section">
+                        <h3>Caption Wrapper</h3>
+                        <p class="pt-hint">Prefix and suffix are added literally after generation. Include spaces or commas here when needed.</p>
+                        <label class="ac-field" for="ac-prefix">
+                            <span>Prefix</span>
+                            <textarea id="ac-prefix" class="pt-textarea ac-wrapper-area" spellcheck="false" placeholder="character_name, "></textarea>
+                        </label>
+                        <label class="ac-field" for="ac-suffix">
+                            <span>Suffix</span>
+                            <textarea id="ac-suffix" class="pt-textarea ac-wrapper-area" spellcheck="false" placeholder=", high quality"></textarea>
+                        </label>
+                    </section>
+                </div>
+            </div>
+
             <!-- Footer -->
             <div class="pt-footer">
-                <div class="pt-footer-left">
+                <div class="pt-footer-left pt-footer-group" data-pt-footer="rules">
                     <button id="pt-load-config-btn" class="pt-btn pt-btn-ghost">Load Config</button>
                     <button id="pt-save-config-btn" class="pt-btn pt-btn-ghost">Save Config</button>
                 </div>
-                <div class="pt-footer-right">
+                <div class="pt-footer-right pt-footer-group" data-pt-footer="rules">
                     <button id="pt-preview-btn" class="pt-btn pt-btn-secondary">Preview</button>
                     <button id="pt-apply-btn" class="pt-btn pt-btn-primary">Apply to All</button>
+                </div>
+                <div class="pt-footer-left pt-footer-group hidden" data-pt-footer="auto-caption">
+                    <button id="ac-rescan-btn" class="pt-btn pt-btn-ghost">Rescan Models</button>
+                    <button id="ac-load-config-btn" class="pt-btn pt-btn-ghost">Load Config</button>
+                    <button id="ac-save-config-btn" class="pt-btn pt-btn-ghost">Save Config</button>
+                </div>
+                <div class="pt-footer-right pt-footer-group hidden" data-pt-footer="auto-caption">
+                    <button id="ac-preview-btn" class="pt-btn pt-btn-secondary">Generate Preview</button>
+                    <button id="ac-apply-btn" class="pt-btn pt-btn-primary">Apply to All</button>
                 </div>
             </div>
 
@@ -1057,7 +1136,7 @@
     </div>
 
     <script src="/static/editor.js?v=1"></script>
-    <script src="/static/app.js?v=2"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 
 </html>

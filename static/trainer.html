@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qwen Dataset Manager — Trainer</title>
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="stylesheet" href="/static/trainer.css">
+    <link rel="stylesheet" href="/static/trainer.css?v=18">
 </head>
 
 <body class="trainer-page">
@@ -39,7 +39,7 @@
                 <div class="trainer-jobs-header">
                     <div>
                         <span class="trainer-section-label">Jobs</span>
-                        <strong id="trainer-job-count">0 training jobs</strong>
+                        <strong id="trainer-job-count"><!--TRAINER_JOB_COUNT--></strong>
                     </div>
                     <button id="trainer-new-job-btn" class="trainer-primary-icon-btn" type="button" aria-label="Create training job" title="New training job">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -52,12 +52,7 @@
                     <button class="trainer-filter" type="button" data-job-filter="active">Active</button>
                     <button class="trainer-filter" type="button" data-job-filter="finished">Finished</button>
                 </div>
-                <div id="trainer-jobs-list" class="trainer-jobs-list" data-preserve-scroll="jobs">
-                    <div class="trainer-empty-list">
-                        <strong>No jobs yet</strong>
-                        <span>Create a LoRA training job from your existing datasets.</span>
-                    </div>
-                </div>
+                <div id="trainer-jobs-list" class="trainer-jobs-list" data-preserve-scroll="jobs" aria-live="polite"><!--TRAINER_JOBS--></div>
             </aside>
 
             <main class="trainer-workspace">
@@ -77,7 +72,7 @@
                             <div>
                                 <span id="trainer-editor-kicker" class="trainer-kicker">New training job</span>
                                 <h2 id="trainer-editor-title">Configure LoRA training</h2>
-                                <p>Target images and Control1–3 are mapped directly from the selected datasets.</p>
+                                <p id="trainer-editor-description">Target images and Control1–3 are mapped directly from the selected datasets.</p>
                             </div>
                             <div class="trainer-header-actions">
                                 <button id="trainer-cancel-edit-btn" class="trainer-btn trainer-btn-ghost hidden" type="button">Cancel</button>
@@ -176,7 +171,7 @@
                             </div>
                             <div class="trainer-toggle-row trainer-training-toggles">
                                 <label id="trainer-unload-text-wrap" class="trainer-switch"><input id="trainer-unload-text" type="checkbox"><span></span>Unload TE</label>
-                                <label class="trainer-switch"><input id="trainer-cache-text" type="checkbox"><span></span>Cache text embeddings</label>
+                                <label id="trainer-cache-text-wrap" class="trainer-switch"><input id="trainer-cache-text" type="checkbox"><span></span>Cache text embeddings</label>
                                 <label class="trainer-switch"><input id="trainer-use-ema" type="checkbox"><span></span>Use EMA</label>
                                 <label id="trainer-ema-decay-field" class="trainer-inline-number hidden" for="trainer-ema-decay">EMA decay <input id="trainer-ema-decay" type="number" min="0" max="1" step="0.001" value="0.99"></label>
                             </div>
@@ -221,7 +216,7 @@
                                 <label class="trainer-field" for="trainer-rgba-edge-width"><span>Edge width</span><input id="trainer-rgba-edge-width" type="number" min="0.1" step="0.1" value="3"></label>
                                 <label class="trainer-field" for="trainer-rgba-alpha-threshold"><span>Hidden RGB alpha threshold</span><input id="trainer-rgba-alpha-threshold" type="number" min="0" max="1" step="0.0001" value="0.0039215686"></label>
                             </div>
-                            <p class="trainer-help">Targets stay RGBA. Fully transparent hidden RGB is cleared, resizing is performed in premultiplied-alpha space, and green spill can be corrected only at the alpha boundary. Klein requires its own z=32 four-channel VAE; the Qwen z=16 VAE is intentionally rejected.</p>
+                            <p class="trainer-help">Targets stay RGBA. Fully transparent hidden RGB is cleared, resizing is performed in premultiplied-alpha space, and green spill can be corrected only at the alpha boundary. Klein 4B and 9B default to models/vae/flux2-klein-rgba.safetensors; the Qwen z=16 VAE is intentionally rejected.</p>
                         </section>
 
                         <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
@@ -381,34 +376,60 @@
                         </div>
                     </div>
 
-                    <div class="trainer-detail-grid">
-                        <section class="trainer-card trainer-progress-card">
-                            <div class="trainer-progress-top">
-                                <div><span id="trainer-detail-status" class="trainer-status-pill">Stopped</span><strong id="trainer-detail-info">Ready</strong></div>
-                                <strong id="trainer-detail-percent">0%</strong>
+                    <nav class="trainer-detail-tabs" aria-label="Training job sections">
+                        <button class="trainer-detail-tab is-active" type="button" data-detail-tab="overview">Overview</button>
+                        <button id="trainer-samples-tab" class="trainer-detail-tab" type="button" data-detail-tab="samples">Samples</button>
+                    </nav>
+
+                    <div id="trainer-detail-overview-panel" class="trainer-detail-panel">
+                        <div class="trainer-detail-grid">
+                            <section class="trainer-card trainer-progress-card">
+                                <div class="trainer-progress-top">
+                                    <div><span id="trainer-detail-status" class="trainer-status-pill">Stopped</span><strong id="trainer-detail-info">Ready</strong></div>
+                                    <strong id="trainer-detail-percent">0%</strong>
+                                </div>
+                                <div class="trainer-progress-track"><div id="trainer-detail-progress" class="trainer-progress-fill"></div></div>
+                                <div class="trainer-progress-meta">
+                                    <span id="trainer-detail-step">0 / 0 steps</span>
+                                    <span id="trainer-detail-speed">Waiting</span>
+                                    <span id="trainer-detail-gpu">GPU 0</span>
+                                </div>
+                            </section>
+                            <section class="trainer-card trainer-summary-card">
+                                <div class="trainer-card-heading"><span>Configuration</span></div>
+                                <dl id="trainer-detail-config"></dl>
+                            </section>
+                        </div>
+
+                        <section class="trainer-card trainer-log-card">
+                            <div class="trainer-card-heading trainer-log-heading">
+                                <div><span>Trainer log</span><small>Last 200 KB</small></div>
+                                <div>
+                                    <a id="trainer-download-log" class="trainer-btn trainer-btn-ghost" href="#">Download</a>
+                                    <button id="trainer-refresh-log-btn" class="trainer-btn trainer-btn-secondary" type="button">Refresh</button>
+                                </div>
                             </div>
-                            <div class="trainer-progress-track"><div id="trainer-detail-progress" class="trainer-progress-fill"></div></div>
-                            <div class="trainer-progress-meta">
-                                <span id="trainer-detail-step">0 / 0 steps</span>
-                                <span id="trainer-detail-speed">Waiting</span>
-                                <span id="trainer-detail-gpu">GPU 0</span>
-                            </div>
-                        </section>
-                        <section class="trainer-card trainer-summary-card">
-                            <div class="trainer-card-heading"><span>Configuration</span></div>
-                            <dl id="trainer-detail-config"></dl>
+                            <pre id="trainer-log-output" tabindex="0">No log output yet.</pre>
                         </section>
                     </div>
 
-                    <section class="trainer-card trainer-log-card">
-                        <div class="trainer-card-heading trainer-log-heading">
-                            <div><span>Trainer log</span><small>Last 200 KB</small></div>
+                    <section id="trainer-detail-samples-panel" class="trainer-detail-panel hidden" aria-labelledby="trainer-samples-heading">
+                        <div class="trainer-samples-toolbar">
                             <div>
-                                <a id="trainer-download-log" class="trainer-btn trainer-btn-ghost" href="#">Download</a>
-                                <button id="trainer-refresh-log-btn" class="trainer-btn trainer-btn-secondary" type="button">Refresh</button>
+                                <span class="trainer-kicker">Generated during training</span>
+                                <h3 id="trainer-samples-heading">Validation images</h3>
+                                <p id="trainer-samples-summary">Loading generated images…</p>
+                            </div>
+                            <div class="trainer-header-actions">
+                                <button id="trainer-refresh-samples-btn" class="trainer-btn trainer-btn-secondary" type="button">Refresh</button>
+                                <a id="trainer-download-samples" class="trainer-btn trainer-btn-ghost" href="#">Download ZIP</a>
                             </div>
                         </div>
-                        <pre id="trainer-log-output" tabindex="0">No log output yet.</pre>
+                        <div id="trainer-samples-state" class="trainer-samples-state">
+                            <strong>Loading validation images</strong>
+                            <span>Please wait while the samples folder is scanned.</span>
+                        </div>
+                        <div id="trainer-samples-gallery" class="trainer-samples-gallery hidden" aria-live="polite"></div>
                     </section>
                 </section>
             </main>
@@ -434,8 +455,47 @@
         </div>
     </div>
 
+    <div id="trainer-sample-viewer" class="trainer-sample-viewer hidden" role="dialog" aria-modal="true" aria-labelledby="trainer-sample-viewer-title">
+        <div class="trainer-sample-viewer-backdrop" data-sample-viewer-close></div>
+        <div class="trainer-sample-viewer-dialog">
+            <header class="trainer-sample-viewer-header">
+                <div>
+                    <span class="trainer-kicker">Validation image</span>
+                    <h2 id="trainer-sample-viewer-title">Sample</h2>
+                </div>
+                <div class="trainer-sample-viewer-actions">
+                    <button id="trainer-sample-zoom-out" class="trainer-icon-btn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+                    <button id="trainer-sample-zoom-reset" class="trainer-icon-btn" type="button" title="Reset zoom" aria-label="Reset zoom">1:1</button>
+                    <button id="trainer-sample-zoom-in" class="trainer-icon-btn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+                    <a id="trainer-sample-download" class="trainer-btn trainer-btn-ghost" href="#">Download</a>
+                    <button id="trainer-sample-delete" class="trainer-btn trainer-btn-danger" type="button">Delete</button>
+                    <button class="trainer-icon-btn" type="button" data-sample-viewer-close aria-label="Close viewer">✕</button>
+                </div>
+            </header>
+            <div class="trainer-sample-viewer-stage">
+                <button id="trainer-sample-prev-step" class="trainer-sample-nav trainer-sample-nav-up" type="button" aria-label="Previous validation step">↑</button>
+                <button id="trainer-sample-prev" class="trainer-sample-nav trainer-sample-nav-left" type="button" aria-label="Previous sample">←</button>
+                <div id="trainer-sample-viewport" class="trainer-sample-viewport">
+                    <img id="trainer-sample-viewer-image" alt="Generated validation sample">
+                </div>
+                <button id="trainer-sample-next" class="trainer-sample-nav trainer-sample-nav-right" type="button" aria-label="Next sample">→</button>
+                <button id="trainer-sample-next-step" class="trainer-sample-nav trainer-sample-nav-down" type="button" aria-label="Next validation step">↓</button>
+            </div>
+            <footer class="trainer-sample-viewer-footer">
+                <div class="trainer-sample-prompt"><span>Prompt</span><p id="trainer-sample-viewer-prompt">—</p></div>
+                <div id="trainer-sample-controls" class="trainer-sample-controls hidden"></div>
+                <dl class="trainer-sample-meta">
+                    <div><dt>Step</dt><dd id="trainer-sample-viewer-step">0</dd></div>
+                    <div><dt>Sample</dt><dd id="trainer-sample-viewer-index">1</dd></div>
+                    <div><dt>Seed</dt><dd id="trainer-sample-viewer-seed">—</dd></div>
+                </dl>
+            </footer>
+        </div>
+    </div>
+
     <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
-    <script src="/static/trainer.js?v=3"></script>
+    <script id="trainer-bootstrap" type="application/json"><!--TRAINER_BOOTSTRAP--></script>
+    <script src="/static/trainer.js?v=18"></script>
 </body>
 
 </html>

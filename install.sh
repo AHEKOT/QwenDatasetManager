@@ -71,9 +71,20 @@ fi
 
 APP_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 bootstrap_pip "$APP_PYTHON"
-"$APP_PYTHON" -m pip install --disable-pip-version-check --no-cache-dir -r "$SCRIPT_DIR/requirements.txt"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  LLAMA_CPP_WHEEL_INDEX="https://abetlen.github.io/llama-cpp-python/whl/cu130"
+  echo "Installing the CUDA 13.0 llama.cpp wheel for local vision captioning."
+else
+  LLAMA_CPP_WHEEL_INDEX="https://abetlen.github.io/llama-cpp-python/whl/cpu"
+  echo "NVIDIA GPU was not detected; installing the CPU llama.cpp wheel."
+fi
+"$APP_PYTHON" -m pip install \
+  --disable-pip-version-check \
+  --no-cache-dir \
+  --extra-index-url "$LLAMA_CPP_WHEEL_INDEX" \
+  -r "$SCRIPT_DIR/requirements.txt"
 "$APP_PYTHON" -m pip check
-"$APP_PYTHON" -c "import flask, PIL, app; print('Application import check passed.')"
+"$APP_PYTHON" -c "import flask, PIL, llama_cpp, app; print('Application import check passed; llama.cpp:', llama_cpp.__version__)"
 
 if [ "$SKIP_TRAINER" -eq 0 ]; then
   bash "$SCRIPT_DIR/install_trainer.sh"

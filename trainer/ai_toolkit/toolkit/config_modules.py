@@ -1031,13 +1031,23 @@ class DatasetConfig:
         self.rgba_control_mode: str = str(kwargs.get('rgba_control_mode', 'edit')).lower()
         if self.rgba_control_mode not in ['edit', 'generation']:
             raise ValueError("rgba_control_mode must be either 'edit' or 'generation'")
-        rgba_control_backgrounds = kwargs.get(
-            'rgba_control_backgrounds',
-            kwargs.get('rgba_control_background', [[255, 255, 255], [127, 127, 127], [0, 0, 0]])
+        self.rgba_control_background_path: Union[str, None] = kwargs.get(
+            'rgba_control_background_path', None
         )
-        if len(rgba_control_backgrounds) == 3 and all(isinstance(x, (int, float)) for x in rgba_control_backgrounds):
-            rgba_control_backgrounds = [rgba_control_backgrounds]
-        self.rgba_control_backgrounds: List[List[int]] = rgba_control_backgrounds
+        self.rgba_control_background_files: List[str] = []
+        if self.rgba_control_background_path is not None:
+            self.rgba_control_background_path = os.path.abspath(
+                os.path.expanduser(str(self.rgba_control_background_path))
+            )
+            if not os.path.isdir(self.rgba_control_background_path):
+                raise ValueError("rgba_control_background_path must be an existing directory")
+            supported_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+            self.rgba_control_background_files = sorted(
+                os.path.join(self.rgba_control_background_path, filename)
+                for filename in os.listdir(self.rgba_control_background_path)
+                if os.path.isfile(os.path.join(self.rgba_control_background_path, filename))
+                and os.path.splitext(filename)[1].lower() in supported_extensions
+            )
         if self.rgba_mode and self.alpha_mask:
             raise ValueError("pixel_channels: rgba cannot be combined with alpha_mask")
         if self.rgba_generate_control and not self.rgba_mode:
@@ -1046,6 +1056,17 @@ class DatasetConfig:
             raise ValueError("rgba_generate_control cannot be combined with an explicit control_path")
         if self.rgba_control_mode == 'generation' and not self.rgba_generate_control:
             raise ValueError("rgba_control_mode: generation requires rgba_generate_control: true")
+        if self.rgba_generate_control and self.rgba_control_mode == 'edit':
+            if not self.rgba_control_background_path:
+                raise ValueError(
+                    "rgba_control_mode: edit requires rgba_control_background_path"
+                )
+            if not self.rgba_control_background_files:
+                raise ValueError("RGBA control background directory has no supported images")
+        if self.rgba_control_mode == 'generation' and self.rgba_control_background_path:
+            raise ValueError(
+                "rgba_control_mode: generation cannot use rgba_control_background_path"
+            )
         self.mask_path: str = kwargs.get('mask_path',
                                          None)  # focus mask (black and white. White has higher loss than black)
         self.unconditional_path: str = kwargs.get('unconditional_path',
@@ -1066,6 +1087,14 @@ class DatasetConfig:
         
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        if (
+            self.cache_text_embeddings
+            and self.rgba_generate_control
+            and self.rgba_control_mode == 'edit'
+        ):
+            raise ValueError(
+                "cache_text_embeddings cannot be used with random RGBA background controls"
+            )
         self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
         # A generated QIE control is derived from the processed RGBA target. Keep
         # that tensor available when latents have already been cached.

@@ -36,16 +36,22 @@ upstream entries:
 | Validation | cadence, resolution, sigmas, managed validation image/prompt list |
 | Dataset | target/control mapping, network weight, repeats, per-dataset batch size, default caption, dropout, caption extension, cache latents, regularization flag, flips, complete resolution list |
 | Sampling | cadence/start, FlowMatch/DDPM sampler, guidance, steps, size, seed/walk, skip/force/disable, edit-instruction list, per-sample size/seed/network multiplier, independently uploaded `ctrl_img_1`–`ctrl_img_3` |
-| Runtime | queue, stop, save now, sample now, progress, speed and logs |
+| Runtime | queue, stop, save now, sample now, progress, speed, logs, and a live-polled Samples / VAE Validation gallery |
+| Generated validation media | step/prompt/seed metadata, per-step grouping, original and alpha-preserving thumbnail delivery, checkerboard RGBA display, full-screen zoom/navigation, control-image switching, deletion and ZIP download |
 
 ## Local RGBA preset behavior
 
 - RGBA targets retain their alpha channel through crop, resize, latent cache
   identity, decode and PNG output. Hidden RGB below the alpha threshold is
   cleared and chroma-key spill cleanup is selectable.
-- Each transparent dataset visibly selects `edit` or `generation`. Edit uses
-  paired Control1–3 when present and otherwise makes an RGB composite;
-  generation ignores paired controls and creates an opaque black Control1.
+- Each transparent dataset visibly selects `edit` or `generation`. Edit also
+  selects a managed background dataset and composites the RGBA target over a
+  random opaque image from its `img` folder on every training sample;
+  generation creates an opaque black Control1. Both modes deliberately ignore
+  paired Control1–3 folders for transparent training.
+- Random edit backgrounds disable text-embedding caching because Qwen/Klein
+  visual conditioning is part of that embedding. Target latent caching remains
+  available.
 - The Qwen preset accepts the QIE2511 Lightning sampling LoRA, keeps it inactive
   during training, and forces its intended four steps / CFG 1 during previews.
   Klein 4B/9B expose the same sampling-only path and loader; step/CFG values
@@ -56,6 +62,11 @@ upstream entries:
 - Qwen VAE readiness uses deterministic RGBA round trips instead of diffusion
   sampling. The queue's “Sample now” action runs validation, “Save now” writes
   a checkpoint, and Stop is polled directly by the VAE process.
+- The generated-image viewer ports the modified UI from
+  `D:\AiToolkitNew\AI-Toolkit`: transparent PNGs and their PNG thumbnails are
+  never flattened, and both gallery cards and the full-size viewer render over
+  a checkerboard. VAE round-trip sheets use the same live Samples folder and
+  are labelled “VAE Validation” in the job view.
 | Advanced editor | full process JSON override with model architecture, CUDA device and managed dataset paths locked to the selected QDM job |
 
 ## Deliberate model-scoped behavior

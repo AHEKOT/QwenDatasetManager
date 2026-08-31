@@ -11,6 +11,7 @@ A local web application for managing, reviewing, editing, and transforming Qwen 
 - ⌨️ **Keyboard Navigation** - Navigate with arrow keys, toggle with space, delete with backspace
 - 🧰 **Dataset Tools** - Reshuffle, compress, fit, blur, mirror, merge, import, export, and duplicate review
 - ✏️ **Editing** - Paint/crop images and edit captions with synchronized controls
+- 🤖 **Auto Caption** - Generate preview and full-dataset captions with local GGUF vision-language models through llama.cpp
 - 🗑️ **Recoverable Deletion** - Move complete image/control/caption sets into a hidden `.trash` folder
 - 🚀 **CUDA Trainer** - Train LoRAs for Qwen Image Edit 2511 and FLUX.2 Klein Base 4B/9B from one or more managed datasets
 
@@ -33,6 +34,10 @@ All three folders must contain images with matching filenames (e.g., `image_0000
 The full installer creates separate virtual environments for the application
 and CUDA trainer, installs their pinned dependencies, and runs import,
 dependency, and CUDA checks.
+
+The application environment also installs `llama-cpp-python`. Its CUDA wheel
+is selected automatically when an NVIDIA GPU is present; otherwise the CPU
+wheel is used.
 
 ### Windows
 
@@ -117,10 +122,21 @@ The trainer supports:
 
 Each selected dataset is passed to AI Toolkit as a separate dataset entry: `img/` is the target and every present `Control1/`, `Control2/`, and `Control3/` folder is a control-image source. Jobs, queue state, progress, and logs are stored under `trainer/`; model checkpoints are written to `trainer/output/`.
 
+Transparent RGBA LoRA jobs expose an Edit/Generation switch on every selected
+training dataset. Edit mode requires a separate managed background dataset and
+places a random opaque image from its `img/` folder behind each RGBA target;
+Generation mode creates a black Control1. Transparent modes do not use the
+target dataset's paired Control folders.
+
 The training screen mirrors the AI Toolkit LoRA Trainer settings that apply to
 these three edit architectures: the complete transformer/text-encoder
 quantization lists (including Qwen 2511 ARA), LoRA and LoKr, validation,
 sampling, schedulers, EMA, regularization, compilation and layer offloading.
+Every job also has a live **Samples** tab (labelled **VAE Validation** for RGBA
+VAE training) with per-step grouping, prompt/seed metadata, full-size
+navigation, control-image switching, deletion and ZIP download. The viewer is
+ported from the locally modified AI Toolkit UI and preserves transparent PNG
+previews over a checkerboard instead of flattening alpha.
 `Name or Path` accepts either a local model path or a Hugging Face repository;
 the vendored backend downloads Hugging Face models in the same way as AI
 Toolkit and uses the token saved in Trainer settings. See
@@ -136,6 +152,25 @@ architecture-specific restrictions retained from upstream.
 5. **Navigate** using arrow keys or on-screen buttons
 6. **Delete** mismatched sets by pressing Backspace/Delete
 
+### Local Auto Caption models
+
+Put multimodal GGUF files in `models/llm/`. A selectable model needs both the
+language-model GGUF and its matching vision projector (`mmproj`) GGUF. Multiple
+language-model quantizations are grouped under one model automatically. For
+example:
+
+```text
+models/llm/
+├── Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+├── Qwen2.5-VL-7B-Instruct-Q8_0.gguf
+└── mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
+```
+
+Open **Process Text → Auto Caption**, rescan the directory, choose the model
+and quantization, then generate a random preview or apply captions to the whole
+dataset. Existing caption files are backed up under `.auto-caption-backup/`
+before a completed batch is written.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
@@ -149,6 +184,7 @@ architecture-specific restrictions retained from upstream.
 ## Technical Stack
 
 - **Backend**: Python Flask
+- **Local VLM runtime**: llama.cpp via `llama-cpp-python`
 - **Frontend**: Vanilla JavaScript, HTML5, CSS3
 - **Design**: Modern dark theme with glassmorphism and smooth animations
 

@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,6 +51,13 @@ class TrainerServiceTests(unittest.TestCase):
                 Image.new('RGB', (16, 12), (30, 40, 50)).save(
                     root / f'Control{index}' / f'{stem}.png'
                 )
+        return root
+
+    def make_background_dataset(self, name='backgrounds'):
+        root = self.datasets_root / name
+        (root / 'img').mkdir(parents=True)
+        for index, color in enumerate(((30, 60, 90), (180, 140, 100)), start=1):
+            Image.new('RGB', (24, 18), color).save(root / 'img' / f'background_{index}.jpg')
         return root
 
     def default_payload(self, datasets=None):
@@ -173,6 +181,64 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(preview.mimetype, 'image/png')
         preview.close()
+
+    def test_generated_sample_gallery_routes_preserve_rgba_and_metadata(self):
+        self.make_dataset('demo')
+        payload = self.default_payload()
+        payload['disableSampling'] = False
+        payload['samples'] = [{'dataset': 'demo', 'image': 'one.png', 'prompt': 'Keep the transparent object'}]
+        job, _inspections = self.service.create_job(payload)
+        samples_dir = self.service.output_dir / job['name'] / 'samples'
+        thumbs_dir = samples_dir / '.thumbs'
+        thumbs_dir.mkdir(parents=True)
+        sample_name = '1234567890__000000250_0.png'
+        Image.new('RGBA', (18, 14), (120, 80, 40, 90)).save(samples_dir / sample_name)
+        Image.new('RGBA', (8, 8), (120, 80, 40, 90)).save(thumbs_dir / f'{sample_name}.png')
+        Image.new('RGB', (6, 6), (20, 20, 20)).save(thumbs_dir / f'{sample_name}.jpg')
+
+        app = Flask(__name__)
+        app.register_blueprint(create_trainer_blueprint(self.service))
+        client = app.test_client()
+
+        listed = client.get(f'/api/trainer/jobs/{job["id"]}/samples')
+        self.assertEqual(listed.status_code, 200)
+        body = listed.get_json()
+        self.assertEqual(body['sampleCount'], 1)
+        self.assertEqual(body['samples'][0]['name'], sample_name)
+        self.assertEqual(body['samples'][0]['step'], 250)
+        self.assertEqual(body['samples'][0]['sampleIndex'], 0)
+        self.assertEqual(body['samples'][0]['prompt'], 'Keep the transparent object')
+        self.assertEqual(body['samples'][0]['controlCount'], 2)
+
+        original = client.get(f'/api/trainer/jobs/{job["id"]}/samples/{sample_name}')
+        self.assertEqual(original.status_code, 200)
+        with Image.open(io.BytesIO(original.data)) as image:
+            self.assertEqual(image.mode, 'RGBA')
+            self.assertEqual(image.getpixel((0, 0))[3], 90)
+        original.close()
+
+        thumbnail = client.get(f'/api/trainer/jobs/{job["id"]}/samples/{sample_name}?thumb=1')
+        self.assertEqual(thumbnail.status_code, 200)
+        with Image.open(io.BytesIO(thumbnail.data)) as image:
+            self.assertEqual(image.mode, 'RGBA')
+            self.assertEqual(image.size, (8, 8))
+        thumbnail.close()
+
+        control = client.get(f'/api/trainer/jobs/{job["id"]}/sample-controls/0/0')
+        self.assertEqual(control.status_code, 200)
+        self.assertEqual(control.mimetype, 'image/jpeg')
+        control.close()
+
+        archive = client.get(f'/api/trainer/jobs/{job["id"]}/samples/archive')
+        self.assertEqual(archive.status_code, 200)
+        self.assertIn(archive.mimetype, {'application/zip', 'application/x-zip-compressed'})
+        archive.close()
+
+        deleted = client.delete(f'/api/trainer/jobs/{job["id"]}/samples/{sample_name}')
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse((samples_dir / sample_name).exists())
+        self.assertFalse((thumbs_dir / f'{sample_name}.png').exists())
+        self.assertFalse((thumbs_dir / f'{sample_name}.jpg').exists())
 
     def test_full_upstream_simple_settings_are_forwarded(self):
         self.make_dataset('demo', control_count=3)
@@ -349,6 +415,11 @@ class TrainerServiceTests(unittest.TestCase):
             # Full-process escape hatch and runtime actions from AI Toolkit.
             'trainer-advanced-config-json', 'trainer-use-advanced-config',
             'trainer-save-now-btn', 'trainer-sample-now-btn',
+            # Modified upstream validation/sample gallery with RGBA viewing.
+            'trainer-samples-tab', 'trainer-detail-samples-panel',
+            'trainer-samples-gallery', 'trainer-download-samples',
+            'trainer-sample-viewer', 'trainer-sample-viewer-image',
+            'trainer-sample-controls', 'trainer-sample-delete',
         }
         for control_id in required_control_ids:
             self.assertIn(f'id="{control_id}"', html, control_id)
@@ -367,6 +438,14 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertIn('id="trainer-text-offload-value"', html)
         self.assertIn("syncSlider('trainer-transformer-offload')", javascript)
         self.assertIn("syncSlider('trainer-text-offload')", javascript)
+        self.assertNotIn('trainer-booting', html)
+        self.assertNotIn('TRAINER_CLIENT', html)
+        self.assertIn('<script src="/static/trainer.js?', html)
+        self.assertIn('data-dataset-field="rgbaControlMode"', javascript)
+        self.assertIn('data-dataset-field="rgbaBackgroundDataset"', javascript)
+
+        self.assertIn('function backgroundDatasetOptions', javascript)
+        self.assertIn('Select a background dataset for', javascript)
 
         render_samples = javascript[
             javascript.index('function sampleControlPath'):javascript.index('function renderValidationItems()')
@@ -383,6 +462,9 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertIn('color-scheme: dark', css)
         self.assertIn('.trainer-page select option', css)
         self.assertIn('::-webkit-slider-runnable-track', css)
+        self.assertIn('.trainer-slider-main input[type="range"]', css)
+        self.assertIn('.trainer-mode-toggle', css)
+        self.assertIn('.trainer-rgba-settings', css)
 
         collect_form = javascript[
             javascript.index('function collectForm'):javascript.index('function validateForm')
@@ -408,6 +490,55 @@ class TrainerServiceTests(unittest.TestCase):
         for payload_key in forwarded_payload_keys:
             self.assertIn(f'{payload_key}:', collect_form, payload_key)
         self.assertIn('payload.advancedProcess =', collect_form)
+
+    def test_trainer_jobs_are_bootstrapped_before_the_full_state_request(self):
+        static_root = Path(__file__).resolve().parents[1] / 'static'
+        html = (static_root / 'trainer.html').read_text(encoding='utf-8')
+        javascript = (static_root / 'trainer.js').read_text(encoding='utf-8')
+
+        self.assertIn('id="trainer-bootstrap" type="application/json"', html)
+        self.assertIn('<!--TRAINER_JOB_COUNT-->', html)
+        self.assertIn('<!--TRAINER_JOBS-->', html)
+        self.assertIn('<!--TRAINER_BOOTSTRAP-->', html)
+        self.assertNotIn('<strong>No jobs yet</strong>', html)
+        self.assertIn("const bootstrapState = (() =>", javascript)
+        self.assertIn('jobs: bootstrapState?.jobs || []', javascript)
+        self.assertIn('qtypes: bootstrapState?.qtypes || []', javascript)
+        self.assertIn('const bootstrapCanRestoreEditor = Boolean(', javascript)
+        self.assertIn('bootstrapState.qtypes.length', javascript)
+        self.assertIn('if (!bootstrapCanRestoreEditor)', javascript)
+        self.assertIn('if (bootstrapCanRestoreEditor) restoreInitialView();', javascript)
+        self.assertIn('if (bootstrapState) {', javascript)
+        self.assertIn('renderModelOptions();', javascript)
+        self.assertIn('initialViewChosen: false', javascript)
+        self.assertIn('function restoreInitialView()', javascript)
+        self.assertIn("state.jobs.find(job => job.id === params.get('job'))", javascript)
+        self.assertIn("params.get('edit') === '1'", javascript)
+        self.assertIn("params.get('new') === '1'", javascript)
+        self.assertIn('if (!initial || !bootstrapCanRestoreEditor)', javascript)
+        self.assertIn('initial && !state.initialViewChosen', javascript)
+        self.assertNotIn('initial && !state.selectedJobId && !state.editingJobId', javascript)
+
+    def test_updating_job_persists_quantization_in_form_and_process(self):
+        self.make_dataset()
+        payload = self.default_payload()
+        payload['qtype'] = 'qfloat8'
+        created, _inspections = self.service.create_job(payload)
+
+        payload['qtype'] = 'uint4'
+        updated, _inspections = self.service.update_job(created['id'], payload)
+
+        self.assertEqual(updated['form']['qtype'], 'uint4')
+        self.assertEqual(
+            updated['config']['config']['process'][0]['model']['qtype'],
+            'uint4',
+        )
+        reloaded = self.service.get_job(created['id'])
+        self.assertEqual(reloaded['form']['qtype'], 'uint4')
+        self.assertEqual(
+            reloaded['config']['config']['process'][0]['model']['qtype'],
+            'uint4',
+        )
 
     def test_advanced_process_editor_preserves_scope_and_forwards_upstream_fields(self):
         root = self.make_dataset()
@@ -488,20 +619,55 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertNotIn('control_path', dataset)
         self.assertTrue(inspections[0]['transparentValid'])
 
-    def test_transparent_edit_mode_keeps_paired_controls(self):
+    def test_transparent_edit_mode_uses_selected_background_dataset(self):
         root = self.make_rgba_dataset(control_count=2)
+        backgrounds = self.make_background_dataset()
         vae = self.project_root / 'qwen-rgba-vae'
         vae.mkdir()
-        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512], 'rgbaControlMode': 'edit'}])
-        payload.update({'trainingPreset': 'transparent_lora', 'vaePath': str(vae)})
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'edit',
+            'rgbaBackgroundDataset': 'backgrounds',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'vaePath': str(vae),
+            'cacheTextEmbeddings': True,
+        })
 
         _name, _gpu, config, _inspections = self.service.build_job_config(payload)
 
         dataset = config['config']['process'][0]['datasets'][0]
-        self.assertEqual(dataset['control_path'], [
-            str((root / 'Control1').resolve()), str((root / 'Control2').resolve())
-        ])
-        self.assertNotIn('rgba_generate_control', dataset)
+        self.assertEqual(dataset['folder_path'], str((root / 'img').resolve()))
+        self.assertEqual(
+            dataset['rgba_control_background_path'],
+            str((backgrounds / 'img').resolve()),
+        )
+        self.assertTrue(dataset['rgba_generate_control'])
+        self.assertEqual(dataset['rgba_control_mode'], 'edit')
+        self.assertNotIn('control_path', dataset)
+        self.assertNotIn('rgba_control_backgrounds', dataset)
+        self.assertFalse(config['config']['process'][0]['train']['cache_text_embeddings'])
+        self.assertFalse(config['meta']['qdm']['form']['cacheTextEmbeddings'])
+        self.assertEqual(
+            config['meta']['qdm']['form']['datasets'][0]['rgbaBackgroundDataset'],
+            'backgrounds',
+        )
+
+    def test_transparent_edit_mode_requires_an_opaque_background_dataset(self):
+        self.make_rgba_dataset()
+        vae = self.project_root / 'qwen-rgba-vae'
+        vae.mkdir()
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'edit',
+        }])
+        payload.update({'trainingPreset': 'transparent_lora', 'vaePath': str(vae)})
+
+        with self.assertRaisesRegex(TrainerValidationError, 'background dataset'):
+            self.service.build_job_config(payload)
 
     def test_turbo_sampling_lora_is_forwarded_and_forces_qwen_four_step_preview(self):
         self.make_rgba_dataset(control_count=1)
@@ -509,7 +675,7 @@ class TrainerServiceTests(unittest.TestCase):
         vae.mkdir()
         turbo = self.project_root / 'qwen-lightning.safetensors'
         turbo.write_bytes(b'test')
-        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512]}])
+        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512], 'rgbaControlMode': 'generation'}])
         payload.update({
             'trainingPreset': 'transparent_lora',
             'vaePath': str(vae),
@@ -525,13 +691,80 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(process['sample']['guidance_scale'], 1.0)
         self.assertEqual(process['sample']['sample_steps'], 4)
 
+    def test_default_turbo_lora_is_forwarded_for_every_model(self):
+        self.make_dataset(control_count=1)
+        turbo_root = self.project_root / 'models' / 'turbo_lora'
+        turbo_root.mkdir(parents=True)
+        expected_files = {
+            'qwen_image_edit_2511': 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors',
+            'flux2_klein_4b': 'klein4b_turbo_r128.safetensors',
+            'flux2_klein_9b': 'Flux_Klein_9b_Turbo_lora_rank_256_fp8_standard.safetensors',
+        }
+        for filename in expected_files.values():
+            (turbo_root / filename).write_bytes(b'test')
+
+        for model_key, filename in expected_files.items():
+            with self.subTest(model=model_key):
+                payload = self.default_payload()
+                payload.update({'model': model_key, 'qtype': 'qfloat8'})
+
+                _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+                process = config['config']['process'][0]
+
+                self.assertEqual(
+                    process['model']['sample_lora_path'],
+                    str((turbo_root / filename).resolve()),
+                )
+
+    def test_legacy_job_without_turbo_lora_is_hydrated_and_persisted_on_queue(self):
+        self.make_dataset(control_count=1)
+        turbo = self.project_root / 'models' / 'turbo_lora' / 'klein4b_turbo_r128.safetensors'
+        turbo.parent.mkdir(parents=True)
+        turbo.write_bytes(b'test')
+        expected = str(turbo.resolve())
+
+        payload = self.default_payload()
+        payload.update({'model': 'flux2_klein_4b', 'qtype': 'qfloat8'})
+        job, _inspections = self.service.create_job(payload)
+
+        with self.service.connect() as connection:
+            row = connection.execute(
+                'SELECT job_config FROM "Job" WHERE id = ?', (job['id'],)
+            ).fetchone()
+            legacy_config = json.loads(row['job_config'])
+            legacy_config['config']['process'][0]['model']['sample_lora_path'] = None
+            legacy_config['meta']['qdm']['form']['sampleLoraPath'] = ''
+            connection.execute(
+                'UPDATE "Job" SET job_config = ? WHERE id = ?',
+                (json.dumps(legacy_config), job['id']),
+            )
+
+        hydrated = self.service.get_job(job['id'])
+        self.assertEqual(
+            hydrated['config']['config']['process'][0]['model']['sample_lora_path'],
+            expected,
+        )
+        self.assertEqual(hydrated['form']['sampleLoraPath'], expected)
+
+        self.service.queue_job(job['id'])
+        with self.service.connect() as connection:
+            row = connection.execute(
+                'SELECT job_config FROM "Job" WHERE id = ?', (job['id'],)
+            ).fetchone()
+        persisted = json.loads(row['job_config'])
+        self.assertEqual(
+            persisted['config']['process'][0]['model']['sample_lora_path'],
+            expected,
+        )
+        self.assertEqual(persisted['meta']['qdm']['form']['sampleLoraPath'], expected)
+
     def test_klein_transparent_preset_requires_its_own_rgba_vae_and_keeps_turbo_fields(self):
         self.make_rgba_dataset(control_count=1)
         vae = self.project_root / 'flux2-rgba-vae.safetensors'
         vae.write_bytes(b'test')
         turbo = self.project_root / 'klein-turbo.safetensors'
         turbo.write_bytes(b'test')
-        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512]}])
+        payload = self.default_payload([{'name': 'rgba', 'resolutions': [512], 'rgbaControlMode': 'generation'}])
         payload.update({
             'trainingPreset': 'transparent_lora',
             'model': 'flux2_klein_9b',
@@ -550,6 +783,34 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(process['model']['sample_lora_path'], str(turbo.resolve()))
         self.assertEqual(process['sample']['sample_steps'], 8)
         self.assertEqual(process['sample']['guidance_scale'], 2)
+
+    def test_default_rgba_vae_is_forwarded_for_both_klein_models(self):
+        self.make_rgba_dataset(control_count=1)
+        vae = self.project_root / 'models' / 'vae' / 'flux2-klein-rgba.safetensors'
+        vae.parent.mkdir(parents=True)
+        vae.write_bytes(b'test')
+
+        for model_key, expected_arch in (
+            ('flux2_klein_4b', 'flux2_klein_4b_rgba'),
+            ('flux2_klein_9b', 'flux2_klein_9b_rgba'),
+        ):
+            with self.subTest(model=model_key):
+                payload = self.default_payload([{
+                    'name': 'rgba',
+                    'resolutions': [512],
+                    'rgbaControlMode': 'generation',
+                }])
+                payload.update({
+                    'trainingPreset': 'transparent_lora',
+                    'model': model_key,
+                    'qtype': 'qfloat8',
+                })
+
+                _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+                process = config['config']['process'][0]
+
+                self.assertEqual(process['model']['arch'], expected_arch)
+                self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
 
     def test_qwen_rgba_vae_preset_builds_extension_process_and_readiness_validation(self):
         root = self.make_rgba_dataset()

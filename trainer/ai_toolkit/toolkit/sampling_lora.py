@@ -14,7 +14,9 @@ from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.memory_management import MemoryManager
 
 
-def validate_sampling_lora_path(path: str) -> str:
+def validate_sampling_lora_path(
+    path: str, expected_hidden_size: int | None = None
+) -> str:
     """Validate a local sampling-only LoRA without materializing its tensors."""
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -24,6 +26,19 @@ def validate_sampling_lora_path(path: str) -> str:
 
     with safe_open(str(resolved), framework="pt", device="cpu") as weights:
         keys = set(weights.keys())
+        model_dimensions = set()
+        if expected_hidden_size is not None:
+            for key in keys:
+                if not (
+                    key.endswith(".lora_A.weight")
+                    or key.endswith(".lora_B.weight")
+                    or key.endswith(".lora_down.weight")
+                    or key.endswith(".lora_up.weight")
+                ):
+                    continue
+                shape = tuple(weights.get_slice(key).get_shape())
+                if len(shape) == 2:
+                    model_dimensions.update(shape)
     has_peft = any(key.endswith(".lora_A.weight") for key in keys) and any(
         key.endswith(".lora_B.weight") for key in keys
     )
@@ -34,6 +49,12 @@ def validate_sampling_lora_path(path: str) -> str:
         raise ValueError(
             "Sampling LoRA must contain matching lora_A/lora_B or "
             "lora_down/lora_up tensors"
+        )
+    if expected_hidden_size is not None and expected_hidden_size not in model_dimensions:
+        raise ValueError(
+            f"Sampling LoRA does not match the selected model hidden size "
+            f"{expected_hidden_size}; tensor dimensions include "
+            f"{sorted(model_dimensions)[:12]}"
         )
     return str(resolved)
 
@@ -160,8 +181,11 @@ class SamplingLoRAMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         configured = getattr(self.model_config, "sample_lora_path", None)
+        expected_hidden_size = getattr(self, "sampling_lora_hidden_size", None)
         self.sample_lora_path = (
-            validate_sampling_lora_path(configured) if configured else None
+            validate_sampling_lora_path(configured, expected_hidden_size)
+            if configured
+            else None
         )
         self._sample_lora_network = None
 
