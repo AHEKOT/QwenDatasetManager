@@ -531,11 +531,8 @@ class TrainerService:
         return self.default_turbo_lora('qwen_image_edit_2511')
 
     def default_qwen_rgba_vae(self):
-        dirname = 'TransparentQIE2511VAE_diffusers'
         return self._first_existing_asset(
-            Path('models') / dirname,
-            Path('trainer') / 'models' / dirname,
-            Path(r'D:\AiToolkitNew\AI-Toolkit\models') / dirname,
+            Path('models') / 'vae' / 'QIE2511-rgba.safetensors',
         )
 
     def default_flux2_klein_rgba_vae(self):
@@ -973,7 +970,7 @@ class TrainerService:
             vae_path = self._validate_local_asset(
                 submitted_vae_path,
                 'RGBA VAE path',
-                directory=model_key == 'qwen_image_edit_2511',
+                directory=Path(str(submitted_vae_path)).expanduser().is_dir(),
             )
         submitted_sample_lora_path = (
             payload.get('sampleLoraPath') or self.default_turbo_lora(model_key)
@@ -1030,7 +1027,12 @@ class TrainerService:
                 dataset_config['rgba_generate_control'] = True
                 dataset_config['rgba_control_mode'] = rgba_control_mode
                 background_dataset_name = ''
-                if rgba_control_mode == 'edit':
+                if rgba_control_mode == 'generation':
+                    # The caption identifies where the base model should place
+                    # the alpha mask. Dropping it would train an unrelated
+                    # unconditional mask and encourage content drift.
+                    dataset_config['caption_dropout_rate'] = 0.0
+                else:
                     background_dataset_name = str(
                         submitted.get('rgbaBackgroundDataset', '')
                     ).strip()
@@ -1087,6 +1089,15 @@ class TrainerService:
         samples = [] if disable_sampling else self._build_sample_items(payload, inspections, preset)
         validation_config = self._build_validation_config(payload, inspections)
         model_kwargs = {'match_target_res': bool(payload.get('matchTargetResolution', False))}
+        if transparent:
+            model_kwargs.update({
+                'rgba_lora_loss_alpha': clamp_number(
+                    payload.get('rgbaLoraLossAlpha'), 0, 1000, 4
+                ),
+                'rgba_lora_loss_alpha_edge': clamp_number(
+                    payload.get('rgbaLoraLossAlphaEdge'), 0, 1000, 2
+                ),
+            })
         unload_text_encoder = bool(payload.get('unloadTextEncoder', False)) and model['allowUnloadTextEncoder']
         cache_text_embeddings = bool(payload.get('cacheTextEmbeddings', False)) and not dynamic_rgba_backgrounds
         if cache_text_embeddings:
@@ -1119,7 +1130,12 @@ class TrainerService:
             'optimizer_params': {'weight_decay': clamp_number(payload.get('weightDecay'), 0, 1, 0.0001)},
             'unload_text_encoder': unload_text_encoder,
             'cache_text_embeddings': cache_text_embeddings,
-            'lr': clamp_number(payload.get('learningRate'), 0.000000001, 1, 0.0001),
+            'lr': clamp_number(
+                payload.get('learningRate'),
+                0.000000001,
+                1,
+                0.00001 if transparent else 0.0001,
+            ),
             'ema_config': {
                 'use_ema': bool(payload.get('useEma', False)),
                 'ema_decay': clamp_number(payload.get('emaDecay'), 0, 1, 0.99),
@@ -1270,6 +1286,8 @@ class TrainerService:
                 'datasets': dataset_configs,
             })
             advanced_model['arch'] = model_arch
+            if transparent:
+                advanced_model.setdefault('model_kwargs', {}).update(model_kwargs)
             if vae_path:
                 advanced_model['vae_path'] = vae_path
             else:
@@ -1316,6 +1334,56 @@ class TrainerService:
                 raise TrainerValidationError('A job with this name already exists') from exc
         return self.get_job(job_id), inspections
 
+    @staticmethod
+    def _next_clone_name(connection, source_name):
+        suffix_index = 1
+        while True:
+            suffix = '_copy' if suffix_index == 1 else f'_copy_{suffix_index}'
+            candidate = f'{source_name[:96 - len(suffix)]}{suffix}'
+            exists = connection.execute(
+                'SELECT 1 FROM "Job" WHERE name = ?', (candidate,)
+            ).fetchone()
+            if exists is None:
+                return candidate
+            suffix_index += 1
+
+    def clone_job(self, job_id):
+        source = self._get_job_row(job_id)
+        config = json.loads(source['job_config'])
+        job_id_copy = str(uuid.uuid4())
+        now = utc_now()
+        with self._db_lock, self.connect() as connection:
+            clone_name = self._next_clone_name(connection, source['name'])
+            config.setdefault('config', {})['name'] = clone_name
+            qdm = config.setdefault('meta', {}).setdefault('qdm', {})
+            form = qdm.get('form')
+            if isinstance(form, dict):
+                form['name'] = clone_name
+            highest = connection.execute(
+                'SELECT MAX(queue_position) AS value FROM "Job"'
+            ).fetchone()['value'] or 0
+            connection.execute(
+                '''INSERT INTO "Job" (
+                    id, name, gpu_ids, job_config, created_at, updated_at,
+                    status, stop, return_to_queue, step, total_steps, info,
+                    speed_string, queue_position, pid, job_type, job_ref,
+                    save_now, sample_now
+                ) VALUES (?, ?, ?, ?, ?, ?, 'stopped', 0, 0, 0, ?, 'Ready',
+                          '', ?, NULL, ?, NULL, 0, 0)''',
+                (
+                    job_id_copy,
+                    clone_name,
+                    source['gpu_ids'],
+                    json.dumps(config),
+                    now,
+                    now,
+                    source['total_steps'],
+                    highest + 1000,
+                    source['job_type'],
+                ),
+            )
+        return self.get_job(job_id_copy)
+
     def _get_job_row(self, job_id):
         with self._db_lock, self.connect() as connection:
             row = connection.execute('SELECT * FROM "Job" WHERE id = ?', (job_id,)).fetchone()
@@ -1329,20 +1397,34 @@ class TrainerService:
         if qdm.get('trainingPreset') in VAE_TRAINING_PRESETS:
             return False
         model_key = qdm.get('modelKey')
-        default_sample_lora = self.default_turbo_lora(model_key)
-        if not default_sample_lora:
-            return False
-
         process = config.get('config', {}).get('process', [{}])[0]
         model = process.get('model')
         if not isinstance(model, dict):
             return False
         changed = False
-        if not model.get('sample_lora_path'):
+        form = qdm.get('form')
+
+        if qdm.get('trainingPreset') == 'transparent_lora' and model_key == 'qwen_image_edit_2511':
+            default_vae = self.default_qwen_rgba_vae()
+            configured_vae = str(model.get('vae_path') or '')
+            legacy_vae = Path(configured_vae).name == 'TransparentQIE2511VAE_diffusers'
+            if default_vae and (not configured_vae or legacy_vae):
+                model['vae_path'] = default_vae
+                changed = True
+            if isinstance(form, dict):
+                form_vae = str(form.get('vaePath') or '')
+                if default_vae and (
+                    not form_vae
+                    or Path(form_vae).name == 'TransparentQIE2511VAE_diffusers'
+                ):
+                    form['vaePath'] = default_vae
+                    changed = True
+
+        default_sample_lora = self.default_turbo_lora(model_key)
+        if default_sample_lora and not model.get('sample_lora_path'):
             model['sample_lora_path'] = default_sample_lora
             changed = True
-        form = qdm.get('form')
-        if isinstance(form, dict) and not form.get('sampleLoraPath'):
+        if default_sample_lora and isinstance(form, dict) and not form.get('sampleLoraPath'):
             form['sampleLoraPath'] = default_sample_lora
             changed = True
         return changed
@@ -1803,6 +1885,13 @@ def create_trainer_blueprint(service: TrainerService):
         try:
             job, inspections = service.update_job(job_id, request.get_json() or {})
             return jsonify({'job': job, 'datasets': inspections})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.post('/api/trainer/jobs/<job_id>/clone')
+    def clone_trainer_job(job_id):
+        try:
+            return jsonify({'job': service.clone_job(job_id)}), 201
         except Exception as exc:
             return handle_error(exc)
 

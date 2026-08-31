@@ -479,7 +479,7 @@
                     </div></div>
                     ${settings.rgbaControlMode === 'edit'
                         ? `<label class="trainer-field trainer-background-dataset-field"><span>Background dataset <small>required</small></span><select data-dataset-field="rgbaBackgroundDataset" data-dataset-index="${index}">${backgroundDatasetOptions(settings.rgbaBackgroundDataset)}</select><small>A random opaque image from its img folder is placed behind the RGBA target on every training sample.</small></label>`
-                        : `<div class="trainer-rgba-mode-note"><strong>Generation mode</strong><span>Control1 is generated as a solid black image. Background datasets and paired Control folders are ignored.</span></div>`}
+                        : `<div class="trainer-rgba-mode-note"><strong>Generation mode · alpha residual only</strong><span>The PNG supplies only its alpha mask and edges. RGB content is preserved from the frozen base model, caption dropout is disabled, and Control1 is solid black.</span></div>`}
                 </section>`
                 : '';
             const datasetSettings = isVaePreset(preset)
@@ -728,6 +728,8 @@
             rgbaEdgeCorrection: $('trainer-rgba-edge-correction').value,
             rgbaEdgeWidth: numberValue('trainer-rgba-edge-width'),
             rgbaAlphaThreshold: numberValue('trainer-rgba-alpha-threshold'),
+            rgbaLoraLossAlpha: numberValue('trainer-rgba-lora-alpha-loss'),
+            rgbaLoraLossAlphaEdge: numberValue('trainer-rgba-lora-edge-loss'),
             qtype: $('trainer-qtype').value,
             qtypeTextEncoder: $('trainer-qtype-te').value,
             lowVram: checked('trainer-low-vram'),
@@ -885,6 +887,7 @@
             sampleSeed: 42, walkSeed: true, skipFirstSample: false, forceFirstSample: false, disableSampling: true, samples: [],
             layerOffloading: false, transformerOffload: 1, textEncoderOffload: 1, advancedProcess: '', datasets: [],
             vaePath: null, sampleLoraPath: null, rgbaEdgeCorrection: 'matte_despill', rgbaEdgeWidth: 3, rgbaAlphaThreshold: 1 / 255,
+            rgbaLoraLossAlpha: 4, rgbaLoraLossAlphaEdge: 2,
             sourceVaePath: 'Qwen/Qwen-Image-Edit-2511', sourceVaeSubfolder: 'vae', sourceVaeLocalOnly: false,
             vaeResolution: 512, vaeTrainScope: 'full', vaeDtype: 'bf16', vaeAlphaLrMultiplier: 10,
             vaeWorkers: 2, vaeMaxGradNorm: 1, vaeValidateEvery: 250, vaeValidationMaxImages: 32,
@@ -903,6 +906,8 @@
         setInput('trainer-rgba-edge-correction', data.rgbaEdgeCorrection);
         setInput('trainer-rgba-edge-width', data.rgbaEdgeWidth);
         setInput('trainer-rgba-alpha-threshold', data.rgbaAlphaThreshold);
+        setInput('trainer-rgba-lora-alpha-loss', data.rgbaLoraLossAlpha);
+        setInput('trainer-rgba-lora-edge-loss', data.rgbaLoraLossAlphaEdge);
         setInput('trainer-qtype', data.qtype);
         setInput('trainer-qtype-te', data.qtypeTextEncoder);
         setInput('trainer-low-vram', data.lowVram);
@@ -1192,7 +1197,17 @@
     async function deleteGeneratedSample() {
         const job = currentJob();
         const sample = state.generatedSamples[selectedGeneratedSampleIndex()];
-        if (!job || !sample || !window.confirm(`Delete validation image “${sample.name}”? This cannot be undone.`)) return;
+        if (!job || !sample) return;
+        const confirmed = await appDialog.confirm(
+            `Delete validation image “${sample.name}”? This cannot be undone.`,
+            {
+                title: 'Delete Validation Image',
+                tone: 'warning',
+                confirmLabel: 'Delete Image',
+                danger: true
+            }
+        );
+        if (!confirmed) return;
         try {
             await api(generatedSampleUrl(job.id, sample.name), { method: 'DELETE' });
             closeSampleViewer();
@@ -1433,7 +1448,17 @@
 
     async function deleteJob() {
         const job = currentJob();
-        if (!job || !window.confirm(`Delete job “${job.name}”? Output files will be kept.`)) return;
+        if (!job) return;
+        const confirmed = await appDialog.confirm(
+            `Delete job “${job.name}”? Output files will be kept.`,
+            {
+                title: 'Delete Training Job',
+                tone: 'warning',
+                confirmLabel: 'Delete Job',
+                danger: true
+            }
+        );
+        if (!confirmed) return;
         try {
             await api(`/api/trainer/jobs/${job.id}`, { method: 'DELETE' });
             state.selectedJobId = null;
@@ -1441,6 +1466,38 @@
             showEditor();
             showToast('Training job deleted. Output files were kept.');
         } catch (error) { showToast(error.message, true); }
+    }
+
+    async function cloneJob() {
+        const job = currentJob();
+        if (!job) return;
+        const button = $('trainer-clone-job-btn');
+        button.disabled = true;
+        try {
+            const existingNames = new Set(state.jobs.map(item => item.name));
+            let copyIndex = 1;
+            let copyName = '';
+            do {
+                const suffix = copyIndex === 1 ? '_copy' : `_copy_${copyIndex}`;
+                copyName = `${job.name.slice(0, 96 - suffix.length)}${suffix}`;
+                copyIndex += 1;
+            } while (existingNames.has(copyName));
+
+            const payload = JSON.parse(JSON.stringify(job.form || {}));
+            payload.name = copyName;
+            const result = await api('/api/trainer/jobs', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            });
+            state.selectedJobId = result.job.id;
+            await refreshState();
+            showDetail(result.job.id);
+            showToast(`Job cloned as ${result.job.name}.`);
+        } catch (error) {
+            showToast(error.message, true);
+        } finally {
+            button.disabled = false;
+        }
     }
 
     function openSettings() {
@@ -1482,6 +1539,14 @@
         $('trainer-model').addEventListener('change', () => {
             const previousPreset = $('trainer-preset').value;
             $('trainer-preset').value = selectedPreset();
+            if (selectedPreset() === 'transparent_lora' && previousPreset !== selectedPreset()) {
+                const learningRate = $('trainer-learning-rate');
+                if (!learningRate.value || Number(learningRate.value) === 0.0001) {
+                    // Latent-transparency adapters are substantially more sensitive
+                    // than ordinary edit LoRAs; use the conservative LayerDiffuse rate.
+                    learningRate.value = '0.00001';
+                }
+            }
             if (isVaePreset(selectedPreset()) && selectedPreset() !== previousPreset) {
                 setVaeSourceDefaults(true);
             }
@@ -1628,6 +1693,7 @@
             renderJobs();
         }));
         $('trainer-edit-job-btn').addEventListener('click', () => showEditor(currentJob()));
+        $('trainer-clone-job-btn').addEventListener('click', cloneJob);
         $('trainer-start-job-btn').addEventListener('click', () => runJobAction('start'));
         $('trainer-stop-job-btn').addEventListener('click', () => runJobAction('stop'));
         $('trainer-save-now-btn').addEventListener('click', () => requestRuntimeAction('save'));

@@ -301,6 +301,146 @@ select:focus {
 
 .hidden { display: none !important; }
 
+/* ─── Application Dialog ────────────────────────────────────────── */
+.app-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 8000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(6, 6, 10, 0.82);
+  backdrop-filter: blur(16px);
+}
+
+.app-dialog-card {
+  position: relative;
+  width: min(560px, 94vw);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 26px;
+  outline: none;
+  background:
+    radial-gradient(circle at 92% 0%, rgba(255, 143, 163, 0.15), transparent 35%),
+    linear-gradient(180deg, rgba(29, 25, 39, 0.99), rgba(17, 16, 26, 0.99));
+  box-shadow: 0 32px 90px rgba(0, 0, 0, 0.62);
+  animation: modalIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.app-dialog-accent {
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-lavender));
+}
+
+.app-dialog[data-tone="success"] .app-dialog-accent { background: var(--success); }
+.app-dialog[data-tone="warning"] .app-dialog-accent { background: var(--warning); }
+.app-dialog[data-tone="error"] .app-dialog-accent { background: var(--error); }
+
+.app-dialog-close {
+  position: absolute;
+  top: 19px;
+  right: 19px;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.app-dialog-close:hover {
+  color: var(--text-primary);
+  border-color: var(--border-hover);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.app-dialog-body {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 1rem;
+  padding: 2rem 4.25rem 1.45rem 1.55rem;
+}
+
+.app-dialog-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border: 1px solid var(--accent-border);
+  border-radius: 17px;
+  color: var(--accent-hover);
+  background: var(--accent-subtle);
+}
+
+.app-dialog-icon svg {
+  width: 25px;
+  height: 25px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-dialog[data-tone="success"] .app-dialog-icon { color: var(--success); border-color: rgba(0, 214, 143, 0.3); background: rgba(0, 214, 143, 0.08); }
+.app-dialog[data-tone="warning"] .app-dialog-icon { color: var(--warning); border-color: rgba(255, 170, 0, 0.3); background: rgba(255, 170, 0, 0.08); }
+.app-dialog[data-tone="error"] .app-dialog-icon { color: var(--error); border-color: rgba(255, 71, 87, 0.3); background: rgba(255, 71, 87, 0.08); }
+
+.app-dialog-copy { min-width: 0; }
+.app-dialog-kicker {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: var(--accent-hover);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.app-dialog-copy h2 {
+  color: var(--text-primary);
+  font-size: 1.45rem;
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+}
+
+.app-dialog-copy p {
+  margin-top: 0.65rem;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.app-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.7rem;
+  padding: 1rem 1.4rem 1.3rem;
+  border-top: 1px solid var(--border);
+}
+
+.app-dialog-actions .action-btn { min-width: 96px; }
+.app-dialog-confirm.is-danger {
+  color: #fff;
+  border-color: rgba(255, 71, 87, 0.4);
+  background: linear-gradient(135deg, #ff5d6b, #d92f43);
+  box-shadow: 0 8px 24px rgba(255, 71, 87, 0.2);
+}
+
+@media (max-width: 600px) {
+  .app-dialog { padding: 0.8rem; }
+  .app-dialog-card { width: 100%; border-radius: 21px; }
+  .app-dialog-body { grid-template-columns: 42px minmax(0, 1fr); padding: 1.5rem 3.5rem 1.1rem 1.1rem; }
+  .app-dialog-icon { width: 42px; height: 42px; border-radius: 14px; }
+  .app-dialog-copy h2 { font-size: 1.2rem; }
+  .app-dialog-actions { padding: 0.9rem 1rem 1rem; }
+}
+
 /* ─── Dataset Name Modal ────────────────────────────────────────── */
 .dataset-name-modal {
   position: fixed;
@@ -2956,6 +3096,16 @@ input[type="range"]::-moz-range-thumb {
   .pt-preview-panel,
   .ac-config { min-height: 420px; overflow: visible; }
   .ac-preview-frame { min-height: 240px; flex-basis: 260px; }
+}
+
+.pt-btn-stop {
+  background: rgba(255,71,87,0.12);
+  border-color: rgba(255,71,87,0.42);
+  color: var(--error);
+}
+.pt-btn-stop:hover:not(:disabled) {
+  background: rgba(255,71,87,0.22);
+  border-color: var(--error);
 }
 
 /* ─── Stitch Mode ────────────────────────────────────────────────── */

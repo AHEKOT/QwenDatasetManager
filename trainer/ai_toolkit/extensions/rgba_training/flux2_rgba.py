@@ -10,8 +10,10 @@ from extensions_built_in.diffusion_models.flux2.flux2_klein_model import (
 )
 from toolkit.rgba_utils import ensure_normalized_rgba_tensor
 
+from .lora_loss import RGBALoRALossMixin
 
-class Flux2KleinRGBAMixin:
+
+class Flux2KleinRGBAMixin(RGBALoRALossMixin):
     """FLUX.2 Klein backend for a separately trained four-channel VAE.
 
     Klein uses a 32-channel latent space, so the Qwen RGBA VAE cannot be

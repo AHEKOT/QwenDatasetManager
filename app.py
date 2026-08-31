@@ -3685,6 +3685,23 @@ def update_auto_caption_item(job_id, index, status, *, caption=None, error=None)
         job['progressPercent'] = round((job['processedItems'] / total) * 100, 1) if total else 100.0
 
 
+def auto_caption_stop_requested(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        return bool(job and job.get('stopRequested'))
+
+
+def mark_queued_auto_caption_items_stopped(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return
+        for item in job['items']:
+            if item['status'] == 'queued':
+                item['status'] = 'stopped'
+        job['currentItem'] = None
+
+
 def _auto_caption_image_paths(dataset_dir):
     img_dir = dataset_dir / 'img'
     if not img_dir.is_dir():
@@ -3695,7 +3712,7 @@ def _auto_caption_image_paths(dataset_dir):
     )
 
 
-def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
+def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all, missing_only=False):
     staging_dir = None
     try:
         dataset_dir = resolve_dataset_dir(folder, must_exist=True)
@@ -3712,6 +3729,7 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
 
         successful = []
         errors = []
+        stopped = False
         if apply_all:
             staging_dir = dataset_dir / f'.auto-caption-staging-{job_id}'
             staging_dir.mkdir(exist_ok=False)
@@ -3719,15 +3737,21 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
         # llama.cpp owns one large model instance. Keep whole jobs serialized so
         # another preview cannot evict a model halfway through a dataset run.
         with AUTO_CAPTION_RUN_LOCK:
-            update_auto_caption_job(
-                job_id,
-                status='loading',
-                currentItem=variant['filename']
-            )
-            AUTO_CAPTION_ENGINE.ensure_loaded(variant)
-            update_auto_caption_job(job_id, status='running', currentItem=None)
+            if auto_caption_stop_requested(job_id):
+                stopped = True
+            else:
+                update_auto_caption_job(
+                    job_id,
+                    status='loading',
+                    currentItem=variant['filename']
+                )
+                AUTO_CAPTION_ENGINE.ensure_loaded(variant)
+                update_auto_caption_job(job_id, status='running', currentItem=None)
 
             for index, image_path in enumerate(image_paths):
+                if stopped or auto_caption_stop_requested(job_id):
+                    stopped = True
+                    break
                 update_auto_caption_item(job_id, index, 'generating')
                 try:
                     caption = AUTO_CAPTION_ENGINE.caption(image_path, config)
@@ -3737,8 +3761,19 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
                     update_auto_caption_item(job_id, index, 'completed', caption=caption)
                 except Exception as exc:
                     error = str(exc)
+                    app.logger.exception(
+                        'Auto Caption failed for %s: %s',
+                        image_path.name,
+                        error,
+                    )
                     errors.append({'file': image_path.name, 'error': error})
                     update_auto_caption_item(job_id, index, 'error', error=error)
+
+            if auto_caption_stop_requested(job_id):
+                stopped = True
+
+        if stopped:
+            mark_queued_auto_caption_items_stopped(job_id)
 
         backup_relative = None
         if apply_all and successful:
@@ -3768,6 +3803,8 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
             'mode': 'apply' if apply_all else 'preview',
             'generated': len(successful),
             'failed': len(errors),
+            'stopped': stopped,
+            'missingOnly': bool(apply_all and missing_only),
             'errors': errors,
             'backup': backup_relative,
             'model': variant['modelLabel'],
@@ -3780,9 +3817,12 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
             })
         update_auto_caption_job(
             job_id,
-            status='completed',
+            status='stopped' if stopped else 'completed',
             currentItem=None,
-            progressPercent=100.0,
+            progressPercent=(
+                round(((len(successful) + len(errors)) / len(image_paths)) * 100, 1)
+                if stopped and image_paths else 100.0
+            ),
             result=result,
             finished=True,
             finishedAt=utc_now_iso()
@@ -3802,7 +3842,7 @@ def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all):
         release_datasets(job_id)
 
 
-def _start_auto_caption_job(folder, config, *, apply_all):
+def _start_auto_caption_job(folder, config, *, apply_all, missing_only=False):
     dataset_dir = resolve_dataset_dir(folder, must_exist=True)
     catalog = scan_gguf_catalog(MODELS_LLM_DIR)
     config = normalize_auto_caption_config(config, catalog=catalog, require_model=True)
@@ -3810,7 +3850,17 @@ def _start_auto_caption_job(folder, config, *, apply_all):
     all_images = _auto_caption_image_paths(dataset_dir)
     if not all_images:
         raise FileNotFoundError('No target images were found in this dataset')
-    image_paths = all_images if apply_all else [random.choice(all_images)]
+    if apply_all and missing_only:
+        image_paths = [
+            image_path
+            for image_path in all_images
+            if not image_path.with_suffix('.txt').is_file()
+            or not image_path.with_suffix('.txt').read_text(encoding='utf-8').strip()
+        ]
+        if not image_paths:
+            raise FileNotFoundError('All target images already have captions')
+    else:
+        image_paths = all_images if apply_all else [random.choice(all_images)]
 
     job_id = uuid.uuid4().hex
     conflicts = claim_datasets([folder], job_id)
@@ -3823,6 +3873,7 @@ def _start_auto_caption_job(folder, config, *, apply_all):
             AUTO_CAPTION_JOBS[job_id] = {
                 'jobId': job_id,
                 'mode': 'apply' if apply_all else 'preview',
+                'missingOnly': bool(apply_all and missing_only),
                 'status': 'queued',
                 'processedItems': 0,
                 'totalItems': len(image_paths),
@@ -3835,13 +3886,14 @@ def _start_auto_caption_job(folder, config, *, apply_all):
                 'result': None,
                 'error': None,
                 'finished': False,
+                'stopRequested': False,
                 'createdAt': utc_now_iso(),
                 'finishedAt': None,
             }
         worker = threading.Thread(
             target=run_auto_caption_job,
             args=(job_id, folder, config, image_paths),
-            kwargs={'apply_all': apply_all},
+            kwargs={'apply_all': apply_all, 'missing_only': missing_only},
             name=f'auto-caption-{job_id[:8]}',
             daemon=True,
         )
@@ -3911,8 +3963,20 @@ def auto_caption_apply():
     if not folder:
         return jsonify({'error': 'folder required'}), 400
     try:
-        job = _start_auto_caption_job(folder, data.get('config', {}), apply_all=True)
-        return jsonify({'success': True, 'jobId': job['jobId']})
+        missing_only = data.get('missingOnly', False)
+        if not isinstance(missing_only, bool):
+            raise ValueError('missingOnly must be a boolean')
+        job = _start_auto_caption_job(
+            folder,
+            data.get('config', {}),
+            apply_all=True,
+            missing_only=missing_only,
+        )
+        return jsonify({
+            'success': True,
+            'jobId': job['jobId'],
+            'totalItems': job['totalItems'],
+        })
     except FileNotFoundError as exc:
         return jsonify({'error': str(exc)}), 404
     except RuntimeError as exc:
@@ -3928,6 +3992,18 @@ def auto_caption_job_status(job_id):
         if not job:
             return jsonify({'error': 'Auto Caption job not found'}), 404
         return jsonify(job)
+
+
+@app.route('/api/auto-caption/jobs/<job_id>/stop', methods=['POST'])
+def auto_caption_job_stop(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return jsonify({'error': 'Auto Caption job not found'}), 404
+        if job.get('finished'):
+            return jsonify({'error': 'Auto Caption job has already finished'}), 409
+        job['stopRequested'] = True
+        return jsonify({'success': True})
 
 
 @app.route('/api/stitch', methods=['POST'])

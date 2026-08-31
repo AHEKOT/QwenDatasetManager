@@ -964,13 +964,19 @@ class ImageEditor {
                 return true;
             } else {
                 const data = await response.json().catch(() => ({}));
-                alert(`Failed to save image: ${data.error || response.statusText}`);
+                await appDialog.alert(`Failed to save image: ${data.error || response.statusText}`, {
+                    title: 'Save Failed',
+                    tone: 'error'
+                });
                 return false;
             }
 
         } catch (e) {
             console.error('Save error:', e);
-            alert('Error saving image');
+            await appDialog.alert('Error saving image.', {
+                title: 'Save Failed',
+                tone: 'error'
+            });
             return false;
         } finally {
             if (wasSelecting) {
@@ -1016,7 +1022,10 @@ class ImageEditor {
             const data = await response.json();
 
             if (data.success) {
-                alert('Augmented pair created successfully!');
+                await appDialog.alert('Augmented pair created successfully!', {
+                    title: 'Augment Created',
+                    tone: 'success'
+                });
                 // Reset selection
                 this.selectionRect = null;
                 this.redrawCanvas();
@@ -1027,12 +1036,18 @@ class ImageEditor {
                     window.onImageSaved(true); // reloadList = true
                 }
             } else {
-                alert(`Failed to create augment: ${data.error}`);
+                await appDialog.alert(`Failed to create augment: ${data.error}`, {
+                    title: 'Augment Failed',
+                    tone: 'error'
+                });
             }
 
         } catch (e) {
             console.error('Crop error:', e);
-            alert('Error creating augmented pair');
+            await appDialog.alert('Error creating augmented pair.', {
+                title: 'Augment Failed',
+                tone: 'error'
+            });
         } finally {
             applyBtn.textContent = originalText;
             if (this.selectionRect) applyBtn.disabled = false;

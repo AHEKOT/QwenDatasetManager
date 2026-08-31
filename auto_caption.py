@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import mimetypes
+import io
 import os
 import re
 import threading
 from pathlib import Path
+
+from PIL import Image, ImageOps
 
 
 DEFAULT_AUTO_CAPTION_CONFIG = {
@@ -32,6 +34,8 @@ _PAIR_IGNORED_TOKENS = {
     "gguf", "mmproj", "mm", "proj", "projector", "vision", "model",
     "f16", "f32", "fp16", "fp32", "bf16",
 }
+
+_VL_MAX_IMAGE_SIZE = (1024, 1024)
 
 
 def _stable_id(kind: str, value: str) -> str:
@@ -94,6 +98,8 @@ def _select_projector(model_path: Path, projectors: list[Path]):
 
 def _handler_for_family(family: str) -> str:
     normalized = family.lower().replace("_", "-")
+    if "qwen3.5" in normalized or "qwen35" in normalized:
+        return "mtmd"
     if "qwen" in normalized and "vl" in normalized:
         return "qwen25-vl"
     if "minicpm" in normalized:
@@ -212,9 +218,17 @@ def normalize_auto_caption_config(config, *, catalog=None, require_model=False):
 
 
 def _image_data_uri(image_path: Path) -> str:
-    mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+    """Encode a VL-only copy, downscaled to fit within 1024x1024 pixels."""
+    image_path = Path(image_path)
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail(_VL_MAX_IMAGE_SIZE, Image.Resampling.LANCZOS)
+        if image.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
+            image = image.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=False)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 class AutoCaptionEngine:
@@ -244,6 +258,7 @@ class AutoCaptionEngine:
             ) from exc
 
         handler_classes = {
+            "mtmd": "MTMDChatHandler",
             "qwen25-vl": "Qwen25VLChatHandler",
             "minicpm-v2.6": "MiniCPMv26ChatHandler",
             "moondream2": "MoondreamChatHandler",

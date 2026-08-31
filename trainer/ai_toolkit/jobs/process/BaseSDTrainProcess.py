@@ -1619,7 +1619,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         prompt_list = []
         for item in validation_items:
             img = Image.open(item.image_path)
-            img = ImageOps.exif_transpose(img).convert('RGB')
+            img = ImageOps.exif_transpose(img).convert(
+                'RGBA' if getattr(self.sd, 'supports_rgba_training_loss', False) else 'RGB'
+            )
             # deterministic resize that keeps the aspect ratio, matches the pixel budget
             # of the resolution and the bucket divisibility of the model
             bucket = get_bucket_for_image_size(

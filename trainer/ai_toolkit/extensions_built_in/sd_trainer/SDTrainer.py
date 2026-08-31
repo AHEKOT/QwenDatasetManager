@@ -532,6 +532,7 @@ class SDTrainer(BaseSDTrainProcess):
     ):
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
+        is_rgba_generation = self._is_rgba_generation_batch(batch)
         additional_loss = 0.0
 
         prior_mask_multiplier = None
@@ -649,7 +650,7 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             target = noise
             
-        if self.dfe is not None:
+        if self.dfe is not None and not is_rgba_generation:
             if self.dfe.version == 1:
                 model = self.sd
                 if model is not None and hasattr(model, 'get_stepped_pred'):
@@ -727,7 +728,7 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 raise ValueError(f"Unknown diffusion feature extractor version {self.dfe.version}")
         
-        if self.train_config.do_guidance_loss:
+        if self.train_config.do_guidance_loss and not is_rgba_generation:
             with torch.no_grad():
                 # we make cached blank prompt embeds that match the batch size
                 unconditional_embeds = concat_prompt_embeds(
@@ -942,13 +943,21 @@ class SDTrainer(BaseSDTrainProcess):
                     timestep_weight = timestep_weight.view(-1, 1, 1, 1, 1).detach()
                 loss = loss * timestep_weight
 
-        if self.train_config.do_prior_divergence and prior_pred is not None:
+        if self.train_config.do_prior_divergence and prior_pred is not None and not is_rgba_generation:
             loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
 
         if self.train_config.train_turbo:
             mask_multiplier = mask_multiplier[:, 3:, :, :]
             # resize to the size of the loss
             mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
+
+        if hasattr(self.sd, "get_rgba_latent_loss_multiplier") and loss.ndim == 4:
+            loss = loss * self.sd.get_rgba_latent_loss_multiplier(
+                batch,
+                size=loss.shape[-2:],
+                device=loss.device,
+                dtype=loss.dtype,
+            )
 
         # multiply by our mask
         try:
@@ -1026,7 +1035,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss = loss + self.adapter.additional_loss.mean()
             self.adapter.additional_loss = None
 
-        if self.train_config.target_norm_std:
+        if self.train_config.target_norm_std and not is_rgba_generation:
             # seperate out the batch and channels
             pred_std = noise_pred.std([2, 3], keepdim=True)
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
@@ -1035,7 +1044,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         loss = loss + additional_loss
         
-        if hasattr(self.sd, "get_additional_loss"):
+        if hasattr(self.sd, "get_additional_loss") and not is_rgba_generation:
             additional_model_loss = self.sd.get_additional_loss(pred, target)
             if additional_model_loss is not None:
                 loss = loss + additional_model_loss
@@ -1050,6 +1059,15 @@ class SDTrainer(BaseSDTrainProcess):
             loss = torch.clamp(loss, max=self.train_config.max_loss)
         
         return loss
+
+    @staticmethod
+    def _is_rgba_generation_batch(batch: 'DataLoaderBatchDTO') -> bool:
+        dataset = batch.dataset_config
+        return bool(
+            dataset is not None
+            and getattr(dataset, "rgba_generate_control", False)
+            and getattr(dataset, "rgba_control_mode", "edit") == "generation"
+        )
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -1964,6 +1982,7 @@ class SDTrainer(BaseSDTrainProcess):
                     ]
 
                 prior_pred = None
+                is_rgba_generation = self._is_rgba_generation_batch(batch)
 
                 do_inverted_masked_prior = False
                 if self.train_config.inverted_mask_prior and batch.mask_tensor is not None:
@@ -1984,10 +2003,10 @@ class SDTrainer(BaseSDTrainProcess):
                     with self.timer('prior predict'):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
-                        if self.train_config.diff_output_preservation:
+                        if self.train_config.diff_output_preservation and not is_rgba_generation:
                             prior_embeds_to_use = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                         
-                        if self.train_config.blank_prompt_preservation:
+                        if self.train_config.blank_prompt_preservation and not is_rgba_generation:
                             blank_embeds = self.cached_blank_embeds.clone().detach().to(
                                 self.device_torch, dtype=dtype
                             )
@@ -2165,7 +2184,10 @@ class SDTrainer(BaseSDTrainProcess):
                         prior_to_calculate_loss = prior_pred
                         # if we are doing diff_output_preservation and not noing inverted masked prior
                         # then we need to send none here so it will not target the prior
-                        doing_preservation = self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation
+                        doing_preservation = (
+                            self.train_config.diff_output_preservation
+                            or self.train_config.blank_prompt_preservation
+                        ) and not is_rgba_generation
                         if doing_preservation and not do_inverted_masked_prior:
                             prior_to_calculate_loss = None
                         
@@ -2179,7 +2201,10 @@ class SDTrainer(BaseSDTrainProcess):
                             prior_pred=prior_to_calculate_loss,
                         )
                     
-                    if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
+                    if (
+                        self.train_config.diff_output_preservation
+                        or self.train_config.blank_prompt_preservation
+                    ) and not is_rgba_generation:
                         with torch.no_grad():
                             if self.train_config.diff_output_preservation:
                                 preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])

@@ -412,6 +412,8 @@ class TrainerServiceTests(unittest.TestCase):
             'trainer-disable-sampling', 'trainer-sample-items',
             'trainer-layer-offloading', 'trainer-transformer-offload',
             'trainer-text-offload',
+            'trainer-rgba-lora-alpha-loss', 'trainer-rgba-lora-edge-loss',
+            'trainer-clone-job-btn',
             # Full-process escape hatch and runtime actions from AI Toolkit.
             'trainer-advanced-config-json', 'trainer-use-advanced-config',
             'trainer-save-now-btn', 'trainer-sample-now-btn',
@@ -486,10 +488,50 @@ class TrainerServiceTests(unittest.TestCase):
             'walkSeed', 'skipFirstSample', 'forceFirstSample',
             'disableSampling', 'samples', 'layerOffloading',
             'transformerOffload', 'textEncoderOffload', 'datasets',
+            'rgbaLoraLossAlpha', 'rgbaLoraLossAlphaEdge',
         }
         for payload_key in forwarded_payload_keys:
             self.assertIn(f'{payload_key}:', collect_form, payload_key)
         self.assertIn('payload.advancedProcess =', collect_form)
+        clone_job = javascript[
+            javascript.index('async function cloneJob()'):javascript.index('function openSettings()')
+        ]
+        self.assertIn("api('/api/trainer/jobs'", clone_job)
+        self.assertNotIn("/clone`,", clone_job)
+
+    def test_clone_job_copies_config_with_fresh_runtime_state_and_unique_name(self):
+        self.make_dataset()
+        payload = self.default_payload()
+        payload['name'] = 'clone_source'
+        source, _inspections = self.service.create_job(payload)
+
+        first = self.service.clone_job(source['id'])
+        second = self.service.clone_job(source['id'])
+
+        self.assertNotEqual(first['id'], source['id'])
+        self.assertEqual(first['name'], 'clone_source_copy')
+        self.assertEqual(second['name'], 'clone_source_copy_2')
+        self.assertEqual(first['status'], 'stopped')
+        self.assertEqual(first['step'], 0)
+        self.assertEqual(first['info'], 'Ready')
+        self.assertEqual(first['form']['name'], first['name'])
+        self.assertEqual(first['config']['config']['name'], first['name'])
+        self.assertEqual(first['form']['datasets'], source['form']['datasets'])
+        self.assertEqual(first['config']['config']['process'], source['config']['config']['process'])
+
+    def test_clone_job_route_returns_created_copy(self):
+        self.make_dataset()
+        source, _inspections = self.service.create_job(self.default_payload())
+        app = Flask(__name__)
+        app.register_blueprint(create_trainer_blueprint(self.service))
+
+        response = app.test_client().post(f'/api/trainer/jobs/{source["id"]}/clone')
+
+        self.assertEqual(response.status_code, 201)
+        clone = response.get_json()['job']
+        self.assertNotEqual(clone['id'], source['id'])
+        self.assertEqual(clone['name'], f'{source["name"]}_copy')
+        self.assertEqual(clone['status'], 'stopped')
 
     def test_trainer_jobs_are_bootstrapped_before_the_full_state_request(self):
         static_root = Path(__file__).resolve().parents[1] / 'static'
@@ -611,13 +653,53 @@ class TrainerServiceTests(unittest.TestCase):
         dataset = process['datasets'][0]
         self.assertEqual(process['model']['arch'], 'qwen_image_edit_plus_rgba')
         self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
+        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha'], 4)
+        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha_edge'], 2)
+        self.assertNotIn('rgba_lora_loss_visible_rgb', process['model']['model_kwargs'])
+        self.assertNotIn('rgba_lora_loss_composite', process['model']['model_kwargs'])
+        self.assertNotIn('rgba_lora_loss_base_preservation', process['model']['model_kwargs'])
+        self.assertNotIn('rgba_lora_loss_resolution', process['model']['model_kwargs'])
         self.assertEqual(process['sample']['format'], 'png')
         self.assertEqual(dataset['folder_path'], str((root / 'img').resolve()))
         self.assertEqual(dataset['pixel_channels'], 'rgba')
         self.assertTrue(dataset['rgba_generate_control'])
         self.assertEqual(dataset['rgba_control_mode'], 'generation')
+        self.assertEqual(dataset['caption_dropout_rate'], 0.0)
         self.assertNotIn('control_path', dataset)
         self.assertTrue(inspections[0]['transparentValid'])
+
+    def test_rgba_latent_weight_settings_are_transparent_only_and_clamped(self):
+        self.make_rgba_dataset()
+        vae = self.project_root / 'qwen-rgba-vae'
+        vae.mkdir()
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'vaePath': str(vae),
+            'rgbaLoraLossAlpha': 8,
+            'rgbaLoraLossAlphaEdge': 3,
+        })
+
+        _name, _gpu, transparent, _inspections = self.service.build_job_config(payload)
+        kwargs = transparent['config']['process'][0]['model']['model_kwargs']
+        self.assertEqual(transparent['config']['process'][0]['train']['lr'], 0.00001)
+        self.assertEqual(kwargs['rgba_lora_loss_alpha'], 8)
+        self.assertEqual(kwargs['rgba_lora_loss_alpha_edge'], 3)
+        self.assertEqual(set(key for key in kwargs if key.startswith('rgba_lora_loss_')), {
+            'rgba_lora_loss_alpha',
+            'rgba_lora_loss_alpha_edge',
+        })
+
+        self.make_dataset()
+        standard_payload = self.default_payload()
+        _name, _gpu, standard, _inspections = self.service.build_job_config(standard_payload)
+        standard_kwargs = standard['config']['process'][0]['model']['model_kwargs']
+        self.assertEqual(standard['config']['process'][0]['train']['lr'], 0.0001)
+        self.assertFalse(any(key.startswith('rgba_lora_loss_') for key in standard_kwargs))
 
     def test_transparent_edit_mode_uses_selected_background_dataset(self):
         root = self.make_rgba_dataset(control_count=2)
@@ -758,6 +840,42 @@ class TrainerServiceTests(unittest.TestCase):
         )
         self.assertEqual(persisted['meta']['qdm']['form']['sampleLoraPath'], expected)
 
+    def test_legacy_qwen_job_external_vae_path_is_replaced_by_project_asset(self):
+        self.make_rgba_dataset(control_count=1)
+        vae = self.project_root / 'models' / 'vae' / 'QIE2511-rgba.safetensors'
+        vae.parent.mkdir(parents=True)
+        vae.write_bytes(b'test')
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'vaePath': str(vae),
+        })
+        job, _inspections = self.service.create_job(payload)
+        legacy = r'D:\AiToolkitNew\AI-Toolkit\models\TransparentQIE2511VAE_diffusers'
+
+        with self.service.connect() as connection:
+            row = connection.execute(
+                'SELECT job_config FROM "Job" WHERE id = ?', (job['id'],)
+            ).fetchone()
+            config = json.loads(row['job_config'])
+            config['config']['process'][0]['model']['vae_path'] = legacy
+            config['meta']['qdm']['form']['vaePath'] = legacy
+            connection.execute(
+                'UPDATE "Job" SET job_config = ? WHERE id = ?',
+                (json.dumps(config), job['id']),
+            )
+
+        hydrated = self.service.get_job(job['id'])
+        expected = str(vae.resolve())
+        self.assertEqual(
+            hydrated['config']['config']['process'][0]['model']['vae_path'], expected
+        )
+        self.assertEqual(hydrated['form']['vaePath'], expected)
+
     def test_klein_transparent_preset_requires_its_own_rgba_vae_and_keeps_turbo_fields(self):
         self.make_rgba_dataset(control_count=1)
         vae = self.project_root / 'flux2-rgba-vae.safetensors'
@@ -811,6 +929,27 @@ class TrainerServiceTests(unittest.TestCase):
 
                 self.assertEqual(process['model']['arch'], expected_arch)
                 self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
+
+    def test_default_qwen_rgba_vae_uses_project_models_vae_file(self):
+        self.make_rgba_dataset(control_count=1)
+        vae = self.project_root / 'models' / 'vae' / 'QIE2511-rgba.safetensors'
+        vae.parent.mkdir(parents=True)
+        vae.write_bytes(b'test')
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'qwen_image_edit_2511',
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
+        self.assertNotIn('AiToolkitNew', process['model']['vae_path'])
 
     def test_qwen_rgba_vae_preset_builds_extension_process_and_readiness_validation(self):
         root = self.make_rgba_dataset()

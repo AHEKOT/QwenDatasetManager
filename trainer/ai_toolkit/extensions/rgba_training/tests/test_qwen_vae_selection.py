@@ -56,6 +56,41 @@ class QwenRGBAVAESelectionTests(unittest.TestCase):
         )
         self.assertNotIn(standard_path, from_pretrained.call_args.args)
 
+    def test_rgba_arch_loads_project_standalone_safetensors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rgba_path = Path(temp_dir) / "QIE2511-rgba.safetensors"
+            rgba_path.write_bytes(b"weights")
+            fake_vae = MagicMock()
+            fake_vae.config = SimpleNamespace(
+                input_channels=4,
+                z_dim=16,
+                latents_mean=QWEN_IMAGE_LATENTS_MEAN,
+                latents_std=QWEN_IMAGE_LATENTS_STD,
+            )
+            model = object.__new__(QwenImageEditPlusRGBAModel)
+            model.model_config = SimpleNamespace(
+                vae_path=str(rgba_path),
+                model_kwargs={"rgba_vae_subfolder": "vae"},
+            )
+            model.vae_torch_dtype = torch.bfloat16
+
+            state = {"encoder.conv_in.weight": torch.zeros(1)}
+            with patch(
+                "extensions.rgba_training.qwen_image_edit_plus_rgba."
+                "AutoencoderKLQwenImage.from_config",
+                return_value=fake_vae,
+            ) as from_config, patch(
+                "extensions.rgba_training.qwen_image_edit_plus_rgba.load_file",
+                return_value=state,
+            ) as load_weights:
+                loaded = model._load_rgba_vae()
+
+            self.assertIs(loaded, fake_vae)
+            from_config.assert_called_once()
+            fake_vae.to.assert_called_once_with(dtype=torch.bfloat16)
+            load_weights.assert_called_once_with(str(rgba_path), device="cpu")
+            fake_vae.load_state_dict.assert_called_once_with(state, strict=True)
+
     def test_sampling_lora_validation_accepts_qwen_transformer_format(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "lightning.safetensors"

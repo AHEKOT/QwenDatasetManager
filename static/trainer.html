@@ -215,8 +215,10 @@
                                 <label class="trainer-field" for="trainer-rgba-edge-correction"><span>Edge cleanup</span><select id="trainer-rgba-edge-correction"><option value="matte_despill">Green matte despill</option><option value="nearest_opaque">Nearest opaque</option><option value="none">None</option></select></label>
                                 <label class="trainer-field" for="trainer-rgba-edge-width"><span>Edge width</span><input id="trainer-rgba-edge-width" type="number" min="0.1" step="0.1" value="3"></label>
                                 <label class="trainer-field" for="trainer-rgba-alpha-threshold"><span>Hidden RGB alpha threshold</span><input id="trainer-rgba-alpha-threshold" type="number" min="0" max="1" step="0.0001" value="0.0039215686"></label>
+                                <label class="trainer-field" for="trainer-rgba-lora-alpha-loss"><span>Alpha region emphasis</span><input id="trainer-rgba-lora-alpha-loss" type="number" min="0" step="0.1" value="4"></label>
+                                <label class="trainer-field" for="trainer-rgba-lora-edge-loss"><span>Alpha edge emphasis</span><input id="trainer-rgba-lora-edge-loss" type="number" min="0" step="0.1" value="2"></label>
                             </div>
-                            <p class="trainer-help">Targets stay RGBA. Fully transparent hidden RGB is cleared, resizing is performed in premultiplied-alpha space, and green spill can be corrected only at the alpha boundary. Klein 4B and 9B default to models/vae/flux2-klein-rgba.safetensors; the Qwen z=16 VAE is intentionally rejected.</p>
+                            <p class="trainer-help">The standard diffusion loss trains RGBA latents from the four-channel VAE. A lightweight alpha map only balances transparent, opaque, and boundary regions in that existing loss; it performs no extra model forward and no VAE decode. Recommended learning rate: 0.00001.</p>
                         </section>
 
                         <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
@@ -367,6 +369,7 @@
                             <button id="trainer-save-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Save now</button>
                             <button id="trainer-sample-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Sample now</button>
                             <button id="trainer-edit-job-btn" class="trainer-btn trainer-btn-secondary" type="button">Edit</button>
+                            <button id="trainer-clone-job-btn" class="trainer-btn trainer-btn-secondary" type="button">Clone</button>
                             <button id="trainer-delete-job-btn" class="trainer-btn trainer-btn-danger" type="button">Delete</button>
                             <button id="trainer-stop-job-btn" class="trainer-btn trainer-btn-danger hidden" type="button">Stop</button>
                             <button id="trainer-start-job-btn" class="trainer-btn trainer-btn-primary" type="button">
@@ -495,7 +498,8 @@
 
     <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
     <script id="trainer-bootstrap" type="application/json"><!--TRAINER_BOOTSTRAP--></script>
-    <script src="/static/trainer.js?v=18"></script>
+    <script src="/static/ui-dialog.js?v=1"></script>
+    <script src="/static/trainer.js?v=24"></script>
 </body>
 
 </html>

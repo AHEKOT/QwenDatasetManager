@@ -166,10 +166,16 @@ models/llm/
 └── mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
 ```
 
+Qwen 3.5 multimodal GGUF pairs are also supported through llama.cpp's generic
+multimodal handler (for example, `Qwen3.5-4B-Q8_0.gguf` together with its
+matching `mmproj-Qwen3.5-4B-BF16.gguf`).
+
 Open **Process Text → Auto Caption**, rescan the directory, choose the model
-and quantization, then generate a random preview or apply captions to the whole
-dataset. Existing caption files are backed up under `.auto-caption-backup/`
-before a completed batch is written.
+and quantization, then generate a random preview, generate only missing/empty
+captions, or replace captions for the whole dataset. Existing caption files are
+backed up under `.auto-caption-backup/` before a completed replacement batch is
+written. A running batch can be stopped after its current image; captions that
+already completed are still saved.
 
 ## Keyboard Shortcuts
 

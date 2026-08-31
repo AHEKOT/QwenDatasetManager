@@ -23,9 +23,27 @@ from toolkit.memory_management import MemoryManager
 from toolkit.rgba_utils import ensure_normalized_rgba_tensor
 
 from .qwen_compat import (
+    QWEN_IMAGE_LATENTS_MEAN,
+    QWEN_IMAGE_LATENTS_STD,
     validate_qie2511_transformer_config,
     validate_qwen_rgba_vae_config,
 )
+from .lora_loss import RGBALoRALossMixin
+
+
+QWEN_RGBA_VAE_CONFIG = {
+    "_class_name": "AutoencoderKLQwenImage",
+    "attn_scales": [],
+    "base_dim": 96,
+    "dim_mult": [1, 2, 4, 4],
+    "dropout": 0.0,
+    "input_channels": 4,
+    "latents_mean": QWEN_IMAGE_LATENTS_MEAN,
+    "latents_std": QWEN_IMAGE_LATENTS_STD,
+    "num_res_blocks": 2,
+    "temperal_downsample": [False, True, True],
+    "z_dim": 16,
+}
 
 
 def validate_qwen_sampling_lora(path: str) -> str:
@@ -153,12 +171,12 @@ class QwenImageEditPlusRGBACustomPipeline(QwenImageEditPlusCustomPipeline):
         return super()._encode_vae_image(image=image, generator=generator)
 
 
-class QwenImageEditPlusRGBAModel(QwenImageEditPlusModel):
+class QwenImageEditPlusRGBAModel(RGBALoRALossMixin, QwenImageEditPlusModel):
     """QIE2511 LoRA backend using the toolkit-trained, QIE-compatible RGBA VAE."""
 
     arch = "qwen_image_edit_plus_rgba"
     default_rgba_vae_path = str(
-        Path(__file__).resolve().parents[2] / "models" / "TransparentQIE2511VAE_diffusers"
+        Path(__file__).resolve().parents[4] / "models" / "vae" / "QIE2511-rgba.safetensors"
     )
     _qwen_pipeline = QwenImageEditPlusRGBACustomPipeline
 
@@ -181,8 +199,14 @@ class QwenImageEditPlusRGBAModel(QwenImageEditPlusModel):
         vae_subfolder = self.model_config.model_kwargs.get("rgba_vae_subfolder", "vae")
         load_kwargs = {"torch_dtype": self.vae_torch_dtype}
 
+        if os.path.isfile(vae_path) and Path(vae_path).suffix.lower() == ".safetensors":
+            vae = AutoencoderKLQwenImage.from_config(QWEN_RGBA_VAE_CONFIG)
+            vae.to(dtype=self.vae_torch_dtype)
+            state_dict = load_file(vae_path, device="cpu")
+            vae.load_state_dict(state_dict, strict=True)
+            del state_dict
         # A directly exported Diffusers VAE contains config.json at its root.
-        if os.path.isdir(vae_path) and os.path.isfile(os.path.join(vae_path, "config.json")):
+        elif os.path.isdir(vae_path) and os.path.isfile(os.path.join(vae_path, "config.json")):
             vae = AutoencoderKLQwenImage.from_pretrained(vae_path, **load_kwargs)
         elif vae_subfolder in (None, ""):
             vae = AutoencoderKLQwenImage.from_pretrained(vae_path, **load_kwargs)
