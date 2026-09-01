@@ -93,23 +93,45 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.lora_dim = lora_dim
         self.full_rank = network.network_type.lower() == "fullrank"
 
+        # Sampling-only adapters immediately replace every tensor from their
+        # checkpoint. Construct them on meta so nn.Linear/Conv2d do not allocate
+        # and randomly initialize a second checkpoint-sized set of throwaway
+        # weights first. load_state_dict(assign=True) materializes the real CPU
+        # tensors directly afterwards.
+        factory_kwargs = {"device": "meta"} if not initialize_weights else {}
+
         if org_module.__class__.__name__ in CONV_MODULES:
             kernel_size = org_module.kernel_size
             stride = org_module.stride
             padding = org_module.padding
             if self.full_rank:
-                self.lora_down = torch.nn.Conv2d(in_dim, out_dim, kernel_size, stride, padding, bias=False)
+                self.lora_down = torch.nn.Conv2d(
+                    in_dim, out_dim, kernel_size, stride, padding,
+                    bias=False, **factory_kwargs
+                )
                 self.lora_up = IdentityModule()
             else:
-                self.lora_down = torch.nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
-                self.lora_up = torch.nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=use_bias)
+                self.lora_down = torch.nn.Conv2d(
+                    in_dim, self.lora_dim, kernel_size, stride, padding,
+                    bias=False, **factory_kwargs
+                )
+                self.lora_up = torch.nn.Conv2d(
+                    self.lora_dim, out_dim, (1, 1), (1, 1),
+                    bias=use_bias, **factory_kwargs
+                )
         else:
             if self.full_rank:
-                self.lora_down = torch.nn.Linear(in_dim, out_dim, bias=False)
+                self.lora_down = torch.nn.Linear(
+                    in_dim, out_dim, bias=False, **factory_kwargs
+                )
                 self.lora_up = IdentityModule()
             else:
-                self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
-                self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=use_bias)
+                self.lora_down = torch.nn.Linear(
+                    in_dim, self.lora_dim, bias=False, **factory_kwargs
+                )
+                self.lora_up = torch.nn.Linear(
+                    self.lora_dim, out_dim, bias=use_bias, **factory_kwargs
+                )
 
         if type(alpha) == torch.Tensor:
             alpha = float(alpha.detach().float().item())

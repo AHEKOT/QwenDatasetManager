@@ -14,6 +14,7 @@ from toolkit.rgba_utils import (
     ensure_normalized_rgba_tensor,
     fit_rgb_background,
     prepare_rgba_image,
+    prepare_rgba_validation_pair,
     resize_rgba_alpha_safe,
     rgba_tensor_to_rgb_control,
     rgba_tensor_to_rgb_control_image,
@@ -235,6 +236,40 @@ class RGBAPreprocessingTests(unittest.TestCase):
             self.assertEqual(cache_info["rgba_control_mode"], "generation")
             self.assertNotIn("rgba_control_backgrounds", cache_info)
 
+    def test_rgba_validation_pair_preserves_alpha_and_matches_training_controls(self):
+        source = np.zeros((8, 8, 4), dtype=np.uint8)
+        source[2:6, 2:6] = [220, 40, 20, 255]
+        source[1:7, 1:7, 3] = np.maximum(source[1:7, 1:7, 3], 128)
+        image = Image.fromarray(source, "RGBA")
+
+        generation_target, generation_control = prepare_rgba_validation_pair(
+            image, (16, 16), control_mode="generation"
+        )
+        self.assertEqual(tuple(generation_target.shape), (4, 16, 16))
+        self.assertTrue(torch.equal(generation_control, torch.zeros_like(generation_control)))
+        self.assertLess(generation_target[3].min().item(), -0.9)
+        self.assertGreater(generation_target[3].max().item(), 0.9)
+
+        background_image = Image.new("RGB", (5, 9), (30, 100, 180))
+        edit_target, edit_control = prepare_rgba_validation_pair(
+            image,
+            (16, 16),
+            control_mode="edit",
+            background_image=background_image,
+        )
+        expected_background = torch.tensor([30, 100, 180], dtype=torch.float32) / 255.0
+        self.assertTrue(torch.allclose(edit_control[:, 0, 0], expected_background, atol=1 / 255))
+        self.assertTrue(torch.equal(edit_target[3], generation_target[3]))
+
+        automatic_target, automatic_control = prepare_rgba_validation_pair(
+            image,
+            (16, 16),
+            control_mode="edit",
+        )
+        self.assertTrue(torch.equal(automatic_target[3], generation_target[3]))
+        self.assertGreater(automatic_control.std().item(), 0.05)
+        self.assertFalse(torch.equal(automatic_control, generation_control))
+
     def test_generation_control_mode_requires_generated_rgba_control(self):
         with self.assertRaisesRegex(ValueError, "requires rgba_generate_control"):
             DatasetConfig(
@@ -251,6 +286,19 @@ class RGBAPreprocessingTests(unittest.TestCase):
                 pixel_channels="rgba",
                 rgba_generate_control=True,
                 rgba_control_mode="edit",
+            )
+
+    def test_klein_random_edit_controls_allow_text_embedding_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Image.new("RGB", (8, 8), "white").save(Path(temp_dir) / "background.png")
+            DatasetConfig(
+                folder_path="unused",
+                pixel_channels="rgba",
+                rgba_generate_control=True,
+                rgba_control_mode="edit",
+                rgba_control_background_path=temp_dir,
+                cache_text_embeddings=True,
+                rgba_dynamic_control_text_cache_safe=True,
             )
 
     def test_rgba_dataset_rejects_rgb_only_files(self):

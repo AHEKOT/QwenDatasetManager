@@ -381,6 +381,16 @@ class SDTrainer(BaseSDTrainProcess):
                     # keep legacy usage for now. 
                     self.sd.text_encoder_to("cpu")
                 flush()
+
+        # A sampling-only LoRA must be allocated before the first optimizer
+        # step. With skip_first_sample enabled, lazy construction at the first
+        # checkpoint otherwise happens after Adam states have filled RAM and a
+        # large Turbo adapter can stall in OS paging for minutes.
+        if (
+            not self.train_config.disable_sampling
+            and hasattr(self.sd, "prepare_sampling_lora")
+        ):
+            self.sd.prepare_sampling_lora()
         
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
@@ -951,14 +961,6 @@ class SDTrainer(BaseSDTrainProcess):
             # resize to the size of the loss
             mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
 
-        if hasattr(self.sd, "get_rgba_latent_loss_multiplier") and loss.ndim == 4:
-            loss = loss * self.sd.get_rgba_latent_loss_multiplier(
-                batch,
-                size=loss.shape[-2:],
-                device=loss.device,
-                dtype=loss.dtype,
-            )
-
         # multiply by our mask
         try:
             if len(noise_pred.shape) == 5:
@@ -1020,6 +1022,27 @@ class SDTrainer(BaseSDTrainProcess):
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
         loss = loss.mean()
+
+        if hasattr(self.sd, "get_rgba_diffusion_loss_weight"):
+            rgba_diffusion_weight = self.sd.get_rgba_diffusion_loss_weight(batch)
+            if rgba_diffusion_weight != 1.0:
+                # RGBA generation batches contribute alpha-specific supervision
+                # only. Edit batches retain exact latent flow supervision because
+                # their control image supplies the subject being preserved.
+                self.additional_logs["loss/rgba_full_image"] = loss.detach().item()
+                loss = loss * rgba_diffusion_weight
+
+        if hasattr(self.sd, "get_rgba_latent_auxiliary_loss") and pred.ndim == 4:
+            rgba_auxiliary_loss, rgba_metrics = self.sd.get_rgba_latent_auxiliary_loss(
+                batch,
+                pred=pred,
+                target=target,
+                noisy_latents=noisy_latents,
+                timesteps=timesteps,
+            )
+            loss = loss + rgba_auxiliary_loss
+            for metric_name, metric_value in rgba_metrics.items():
+                self.additional_logs[f"loss/{metric_name}"] = metric_value.item()
         
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:

@@ -99,6 +99,22 @@ LOSS_OPTIONS = {'mse', 'mae', 'wavelet', 'stepped'}
 SAMPLER_OPTIONS = {'flowmatch', 'ddpm'}
 SAVE_DTYPE_OPTIONS = {'bf16', 'fp16', 'fp32'}
 RESOLUTION_OPTIONS = {256, 512, 768, 1024, 1280, 1328, 1536, 2048}
+RGBA_LORA_VALIDATION_THRESHOLDS = {
+    'max': {
+        # Errors are measured against the alpha represented by the exact target
+        # VAE latent, so these limits do not demand impossible pixel-perfect
+        # inversion from the VAE/probe itself.
+        'representation_alpha_mae': 0.015,
+        'representation_boundary_mae': 0.035,
+        'representation_boundary_edge_mae': 0.025,
+        'background_residual_mae': 0.008,
+        'background_false_positive_rate': 0.001,
+        'foreground_false_negative_rate': 0.002,
+    },
+    'min': {
+        'representation_alpha_iou': 0.985,
+    },
+}
 
 
 def utc_now():
@@ -125,6 +141,7 @@ class TrainerService:
         self.root = self.project_root / 'trainer'
         self.output_dir = self.root / 'output'
         self.sample_images_dir = self.root / 'sample_images'
+        self.validation_images_dir = self.root / 'validation_images'
         self.vendor_root = self.root / 'ai_toolkit'
         self.db_path = self.root / 'trainer.db'
         self.venv_python = (
@@ -136,6 +153,7 @@ class TrainerService:
         self.root.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self.sample_images_dir.mkdir(exist_ok=True)
+        self.validation_images_dir.mkdir(exist_ok=True)
         self._init_db()
         self._reconcile_jobs()
 
@@ -601,6 +619,49 @@ class TrainerService:
             raise TrainerValidationError('Invalid sample image filename')
         return self.resolve_sample_image(str(self.sample_images_dir / filename))
 
+    def save_validation_image(self, upload):
+        original_name = Path(getattr(upload, 'filename', '') or '').name
+        extension = Path(original_name).suffix.lower()
+        if not original_name or extension not in {'.png', '.webp'}:
+            raise TrainerValidationError('Validation target must be an RGBA PNG or WebP image')
+        destination = self.validation_images_dir / f'{uuid.uuid4().hex}{extension}'
+        try:
+            upload.save(destination)
+            with Image.open(destination) as image:
+                image.load()
+                if 'A' not in image.getbands() and 'transparency' not in image.info:
+                    raise TrainerValidationError('Validation target must contain an alpha channel')
+                alpha_min, alpha_max = image.convert('RGBA').getchannel('A').getextrema()
+                if alpha_min > 1 or alpha_max <= 1:
+                    raise TrainerValidationError(
+                        'Validation target must contain both visible and transparent pixels'
+                    )
+        except TrainerValidationError:
+            if destination.exists():
+                destination.unlink()
+            raise
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink()
+            raise TrainerValidationError('Uploaded validation target is invalid') from exc
+        return destination.resolve()
+
+    def resolve_validation_image(self, value):
+        if not isinstance(value, str) or not value.strip():
+            raise TrainerValidationError('Upload a validation target image')
+        candidate = Path(value.strip()).resolve()
+        root = self.validation_images_dir.resolve()
+        if candidate == root or root not in candidate.parents or not candidate.is_file():
+            raise TrainerValidationError('Validation image is outside the trainer upload directory')
+        if candidate.suffix.lower() not in {'.png', '.webp'}:
+            raise TrainerValidationError('Unsupported validation target type')
+        return candidate
+
+    def validation_image_preview(self, filename):
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise TrainerValidationError('Invalid validation image filename')
+        return self.resolve_validation_image(str(self.validation_images_dir / filename))
+
     def _black_sample_control(self, width, height):
         width = clamp_number(width, 64, 4096, 1024, integer=True)
         height = clamp_number(height, 64, 4096, 1024, integer=True)
@@ -686,7 +747,14 @@ class TrainerService:
             samples.append(sample)
         return samples
 
-    def _build_validation_config(self, payload, inspections):
+    def _build_validation_config(
+        self,
+        payload,
+        inspections,
+        *,
+        transparent=False,
+        dataset_configs=None,
+    ):
         if not payload.get('validationEnabled', False):
             return None
         raw_items = payload.get('validationItems', [])
@@ -695,15 +763,79 @@ class TrainerService:
         if len(raw_items) > 100:
             raise TrainerValidationError('Too many validation images')
         selected_names = {item['name'] for item in inspections}
+        dataset_config_by_name = {
+            inspection['name']: dataset_config
+            for inspection, dataset_config in zip(inspections, dataset_configs or [])
+        }
         items = []
         for raw in raw_items:
             if not isinstance(raw, dict):
                 raise TrainerValidationError('Invalid validation item')
-            dataset_name = raw.get('dataset') or inspections[0]['name']
-            if dataset_name not in selected_names:
-                raise TrainerValidationError('Validation images must come from a selected dataset')
-            _dataset_dir, target = self._resolve_managed_target(dataset_name, raw.get('image', ''))
-            items.append({'image_path': str(target), 'prompt': str(raw.get('prompt', '')).strip()})
+            uploaded_target = raw.get('targetPath', raw.get('target_path'))
+            if uploaded_target:
+                target = self.resolve_validation_image(uploaded_target)
+                dataset_config = {}
+            else:
+                # Compatibility for jobs saved before validation targets became
+                # independent uploads.
+                dataset_name = raw.get('dataset') or inspections[0]['name']
+                if dataset_name not in selected_names:
+                    raise TrainerValidationError('Validation image dataset is unavailable')
+                _dataset_dir, target = self._resolve_managed_target(
+                    dataset_name, raw.get('image', '')
+                )
+                dataset_config = dataset_config_by_name.get(dataset_name, {})
+            prompt = str(raw.get('prompt', '')).strip()
+            if not prompt and dataset_config:
+                caption_ext = str(dataset_config.get('caption_ext', 'txt')).lstrip('.')
+                caption_path = target.with_suffix(f'.{caption_ext}')
+                if caption_path.is_file():
+                    prompt = caption_path.read_text(encoding='utf-8').strip()
+            if not prompt and dataset_config:
+                prompt = str(dataset_config.get('default_caption', '')).strip()
+            item = {'image_path': str(target), 'prompt': prompt}
+            if transparent:
+                with Image.open(target) as image:
+                    if 'A' not in image.getbands() and 'transparency' not in image.info:
+                        raise TrainerValidationError(
+                            f'Transparent validation target has no alpha channel: {target.name}'
+                        )
+                    alpha_min, alpha_max = image.convert('RGBA').getchannel('A').getextrema()
+                alpha_threshold = clamp_number(
+                    payload.get('rgbaAlphaThreshold'), 0, 1, 1 / 255
+                )
+                threshold_u8 = round(alpha_threshold * 255)
+                if alpha_min > threshold_u8 or alpha_max <= threshold_u8:
+                    raise TrainerValidationError(
+                        'Transparent validation target must contain both visible and '
+                        f'transparent pixels: {target.name}'
+                    )
+                item.update({
+                    'rgba_control_mode': (
+                        str(raw.get('mode', raw.get('rgbaControlMode', 'generation')))
+                        if uploaded_target
+                        else dataset_config.get('rgba_control_mode', 'edit')
+                    ),
+                    'rgba_control_background_path': dataset_config.get(
+                        'rgba_control_background_path'
+                    ),
+                    'rgba_alpha_threshold': alpha_threshold,
+                    'rgba_hidden_rgb_color': [0, 0, 0],
+                    'rgba_edge_color_correction': str(
+                        payload.get('rgbaEdgeCorrection', 'matte_despill')
+                    ),
+                    'rgba_edge_matte_color': dataset_config.get(
+                        'rgba_edge_matte_color', [0, 255, 0]
+                    ),
+                    'rgba_edge_width': clamp_number(
+                        payload.get('rgbaEdgeWidth'), 0, 128, 3
+                    ),
+                })
+                if item['rgba_control_mode'] not in {'edit', 'generation'}:
+                    raise TrainerValidationError(
+                        'Validation mode must be edit or generation'
+                    )
+            items.append(item)
         raw_sigmas = payload.get('validationSigmas', [0.5])
         if not isinstance(raw_sigmas, list):
             raw_sigmas = [0.5]
@@ -717,12 +849,17 @@ class TrainerService:
                 sigmas.append(parsed)
         if not sigmas:
             sigmas = [0.5]
-        return {
+        config = {
             'validation_items': items,
             'resolution': clamp_number(payload.get('validationResolution'), 64, 4096, 1024, integer=True),
             'validate_every_n_steps': clamp_number(payload.get('validateEvery'), 1, 1_000_000, 1, integer=True),
             'validation_sigmas': sigmas,
         }
+        if transparent:
+            config['rgba_pass_thresholds'] = copy.deepcopy(
+                RGBA_LORA_VALIDATION_THRESHOLDS
+            )
+        return config
 
     def list_datasets(self):
         root = self.datasets_dir
@@ -999,7 +1136,6 @@ class TrainerService:
                 'resolution': resolutions,
                 'num_repeats': clamp_number(submitted.get('repeats'), 1, 1000, 1, integer=True),
                 'network_weight': clamp_number(submitted.get('weight'), 0, 100, 1),
-                'batch_size': clamp_number(submitted.get('batchSize'), 1, 128, 1, integer=True),
                 'cache_latents_to_disk': bool(submitted.get('cacheLatents', False)),
                 'is_reg': bool(submitted.get('isRegularization', False)),
                 'flip_x': bool(submitted.get('flipX', False)),
@@ -1026,6 +1162,9 @@ class TrainerService:
                 dataset_config.pop('control_path', None)
                 dataset_config['rgba_generate_control'] = True
                 dataset_config['rgba_control_mode'] = rgba_control_mode
+                dataset_config['rgba_dynamic_control_text_cache_safe'] = (
+                    model_key in {'flux2_klein_4b', 'flux2_klein_9b'}
+                )
                 background_dataset_name = ''
                 if rgba_control_mode == 'generation':
                     # The caption identifies where the base model should place
@@ -1087,21 +1226,39 @@ class TrainerService:
 
         disable_sampling = bool(payload.get('disableSampling', not payload.get('sampleEnabled', False)))
         samples = [] if disable_sampling else self._build_sample_items(payload, inspections, preset)
-        validation_config = self._build_validation_config(payload, inspections)
+        validation_config = self._build_validation_config(
+            payload,
+            inspections,
+            transparent=transparent,
+            dataset_configs=dataset_configs,
+        )
         model_kwargs = {'match_target_res': bool(payload.get('matchTargetResolution', False))}
         if transparent:
             model_kwargs.update({
                 'rgba_lora_loss_alpha': clamp_number(
-                    payload.get('rgbaLoraLossAlpha'), 0, 1000, 4
+                    payload.get('rgbaLoraLossAlpha'), 0, 1000, 1
                 ),
                 'rgba_lora_loss_alpha_edge': clamp_number(
-                    payload.get('rgbaLoraLossAlphaEdge'), 0, 1000, 2
+                    payload.get('rgbaLoraLossAlphaEdge'), 0, 1000, 0.5
                 ),
             })
-        unload_text_encoder = bool(payload.get('unloadTextEncoder', False)) and model['allowUnloadTextEncoder']
-        cache_text_embeddings = bool(payload.get('cacheTextEmbeddings', False)) and not dynamic_rgba_backgrounds
-        if cache_text_embeddings:
-            unload_text_encoder = False
+        dynamic_text_cache_safe = model_key in {'flux2_klein_4b', 'flux2_klein_9b'}
+        klein_rgba_text_cache_required = transparent and dynamic_text_cache_safe
+        # Klein RGBA training never needs a live text encoder after the initial
+        # caption pass.  Keep this invariant server-side as well as in the UI so
+        # a stale cached client cannot silently save both switches as false.
+        unload_text_encoder = (
+            bool(payload.get('unloadTextEncoder', False))
+            or klein_rgba_text_cache_required
+        ) and model['allowUnloadTextEncoder']
+        cache_text_embeddings = (
+            (
+                bool(payload.get('cacheTextEmbeddings', False))
+                or unload_text_encoder
+                or klein_rgba_text_cache_required
+            )
+            and (not dynamic_rgba_backgrounds or dynamic_text_cache_safe)
+        )
         dop_enabled = bool(payload.get('diffOutputPreservation', False))
         bpp_enabled = bool(payload.get('blankPromptPreservation', False)) and not dop_enabled
         skip_first_sample = bool(payload.get('skipFirstSample', False))
@@ -1162,6 +1319,7 @@ class TrainerService:
         normalized_form = copy.deepcopy(payload)
         normalized_form['datasets'] = copy.deepcopy(normalized_datasets)
         normalized_form['cacheTextEmbeddings'] = cache_text_embeddings
+        normalized_form['unloadTextEncoder'] = unload_text_encoder
         normalized_form['qtype'] = qtype
         config = {
             'job': 'extension',
@@ -1267,8 +1425,13 @@ class TrainerService:
             if not isinstance(advanced_train, dict):
                 raise TrainerValidationError('Advanced process config is missing training settings')
             advanced_train['noise_scheduler'] = model['noiseScheduler']
-            if dynamic_rgba_backgrounds:
+            if klein_rgba_text_cache_required:
+                advanced_train['unload_text_encoder'] = True
+                advanced_train['cache_text_embeddings'] = True
+            elif dynamic_rgba_backgrounds and not dynamic_text_cache_safe:
                 advanced_train['cache_text_embeddings'] = False
+            elif advanced_train.get('unload_text_encoder', unload_text_encoder):
+                advanced_train['cache_text_embeddings'] = True
             advanced_sample = advanced_process.get('sample')
             if not isinstance(advanced_sample, dict) or advanced_sample.get('sampler', 'flowmatch') not in SAMPLER_OPTIONS:
                 raise TrainerValidationError('Unsupported sampler in advanced config')
@@ -1612,6 +1775,77 @@ class TrainerService:
                 handle.seek(size - max_bytes)
             return handle.read().decode('utf-8', errors='replace')
 
+    def validation_results(self, job_id):
+        row = self._get_job_row(job_id)
+        config = json.loads(row['job_config'])
+        metrics_path = (self.output_dir / row['name'] / 'loss_log.db').resolve()
+        if not metrics_path.is_file():
+            return {'step': None, 'passed': None, 'items': []}
+        connection = sqlite3.connect(
+            f'file:{metrics_path.as_posix()}?mode=ro', uri=True, timeout=5.0
+        )
+        try:
+            latest = connection.execute(
+                "SELECT MAX(step) FROM metrics WHERE key = 'val/rgba_pass'"
+            ).fetchone()[0]
+            if latest is None:
+                return {'step': None, 'passed': None, 'items': []}
+            metric_rows = connection.execute(
+                "SELECT key, value_real, value_text FROM metrics "
+                "WHERE step = ? AND (key = 'val/rgba_pass' "
+                "OR key = 'val/rgba_failed_checks' OR key LIKE 'val/item_%')",
+                (latest,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        process = config.get('config', {}).get('process', [{}])[0]
+        configured_items = (
+            process.get('train', {})
+            .get('validation_config', {})
+            .get('validation_items', [])
+        )
+        items = {}
+        overall_pass = None
+        overall_failed = 'none'
+        for key, value_real, value_text in metric_rows:
+            if key == 'val/rgba_pass':
+                overall_pass = bool(value_real)
+                continue
+            if key == 'val/rgba_failed_checks':
+                overall_failed = value_text or 'none'
+                continue
+            match = re.fullmatch(
+                r'val/item_(\d+)_(rgba_pass|failed_checks|worst_(.+))', key
+            )
+            if not match:
+                continue
+            index = int(match.group(1)) - 1
+            item = items.setdefault(index, {'index': index, 'metrics': {}})
+            field = match.group(2)
+            if field == 'rgba_pass':
+                item['passed'] = bool(value_real)
+            elif field == 'failed_checks':
+                item['failedChecks'] = value_text or 'none'
+            else:
+                item['metrics'][match.group(3)] = value_real
+        result_items = []
+        for index in sorted(items):
+            item = items[index]
+            configured = configured_items[index] if index < len(configured_items) else {}
+            item['name'] = Path(str(configured.get('image_path', ''))).name or (
+                f'Validation image {index + 1}'
+            )
+            item.setdefault('passed', False)
+            item.setdefault('failedChecks', 'missing validation result')
+            result_items.append(item)
+        return {
+            'step': int(latest),
+            'passed': overall_pass,
+            'failedChecks': overall_failed,
+            'items': result_items,
+        }
+
     def _job_samples_dir(self, job_id):
         row = self._get_job_row(job_id)
         output_root = self.output_dir.resolve()
@@ -1888,6 +2122,30 @@ def create_trainer_blueprint(service: TrainerService):
         except Exception as exc:
             return handle_error(exc)
 
+    @blueprint.post('/api/trainer/validation-images')
+    def upload_trainer_validation_image():
+        try:
+            upload = request.files.get('file')
+            if upload is None:
+                uploads = request.files.getlist('files')
+                upload = uploads[0] if uploads else None
+            if upload is None:
+                raise TrainerValidationError('Choose an RGBA validation target')
+            path = service.save_validation_image(upload)
+            return jsonify({
+                'path': str(path),
+                'previewUrl': f'/api/trainer/validation-images/{path.name}',
+            }), 201
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/validation-images/<filename>')
+    def preview_trainer_validation_image(filename):
+        try:
+            return send_file(service.validation_image_preview(filename), conditional=True)
+        except Exception as exc:
+            return handle_error(exc)
+
     @blueprint.post('/api/trainer/jobs/<job_id>/clone')
     def clone_trainer_job(job_id):
         try:
@@ -1980,6 +2238,13 @@ def create_trainer_blueprint(service: TrainerService):
     def trainer_job_log(job_id):
         try:
             return jsonify({'log': service.read_log(job_id)})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/validation-results')
+    def trainer_job_validation_results(job_id):
+        try:
+            return jsonify(service.validation_results(job_id))
         except Exception as exc:
             return handle_error(exc)
 

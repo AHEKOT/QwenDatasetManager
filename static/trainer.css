@@ -568,7 +568,23 @@
 .trainer-repeat-card-heading strong { font-size: 11px; color: var(--text-secondary); }
 .trainer-repeat-grid { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: 8px; }
 .trainer-repeat-prompt { grid-column: span 2; }
-.trainer-validation-item-grid { grid-template-columns: minmax(160px, .8fr) minmax(180px, 1fr) minmax(260px, 2fr); }
+.trainer-validation-item-editor { display: grid; grid-template-columns: 156px minmax(0, 1fr); align-items: stretch; gap: 12px; }
+.trainer-validation-image-slot { width: 156px; height: 122px; }
+.trainer-validation-image-slot .trainer-sample-image-picker strong { max-width: 135px; font-size: 9px; }
+.trainer-validation-image-slot .trainer-sample-image-picker span { font-size: 8px; }
+.trainer-validation-item-grid { grid-template-columns: minmax(190px, .7fr) minmax(300px, 1.5fr); align-content: start; }
+.trainer-validation-item-grid > p { grid-column: 1 / -1; margin: 0; color: var(--text-muted); font-size: 9px; line-height: 1.45; }
+.trainer-validation-results { margin-top: 12px; padding: 14px; }
+.trainer-validation-results .trainer-card-heading { padding: 0 0 10px; }
+.trainer-validation-results .trainer-card-heading small { color: var(--text-muted); font: 9px var(--font-mono); }
+#trainer-validation-results-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
+.trainer-validation-result { padding: 10px; display: grid; gap: 6px; background: rgba(0,0,0,.16); border: 1px solid var(--border); border-radius: 8px; }
+.trainer-validation-result > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.trainer-validation-result strong { overflow: hidden; color: var(--text-secondary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.trainer-validation-result b { font: 800 10px var(--font-mono); }
+.trainer-validation-result.is-pass b { color: var(--success); }
+.trainer-validation-result.is-fail b { color: var(--danger); }
+.trainer-validation-result p { margin: 0; color: var(--text-muted); font: 8px/1.45 var(--font-mono); overflow-wrap: anywhere; }
 .trainer-inline-help { margin-top: 7px; color: var(--text-muted); font-size: 9px; }
 .trainer-full-btn { width: 100%; margin-top: 10px; }
 
@@ -740,7 +756,8 @@
   .trainer-card-grid-top { grid-template-columns: 1fr; }
   .trainer-training-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .trainer-option-groups { grid-template-columns: 1fr; }
-  .trainer-validation-grid, .trainer-validation-item-grid { grid-template-columns: 1fr; }
+  .trainer-validation-grid, .trainer-validation-item-grid, .trainer-validation-item-editor { grid-template-columns: 1fr; }
+  .trainer-validation-image-slot { width: 100%; height: 150px; }
   .trainer-sampling-grid, .trainer-repeat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .trainer-repeat-prompt { grid-column: 1 / -1; }
   .trainer-sample-parameters { grid-template-columns: repeat(2, minmax(0, 1fr)); }

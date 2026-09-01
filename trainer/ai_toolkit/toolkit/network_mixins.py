@@ -185,7 +185,7 @@ class ToolkitModuleMixin:
         runtime_scale = getattr(self, "_runtime_scale", None)
         if runtime_scale is None:
             reference = next(self.parameters(), None)
-            if reference is None:
+            if reference is None or reference.is_meta:
                 runtime_scale = torch.tensor(self.scale, dtype=torch.float32)
             else:
                 runtime_scale = reference.new_tensor(self.scale, dtype=torch.float32)
@@ -783,7 +783,11 @@ class ToolkitNetworkMixin:
             print(" Attempting to load with forced keymap")
             return self.load_weights(file, force_weight_mapping=True)
 
-        info = self.load_state_dict(load_sd, False)
+        # Inference-only LoRA modules are constructed on meta. Assigning adopts
+        # safetensors-backed CPU tensors directly instead of allocating a blank
+        # checkpoint and copying the loaded checkpoint over it.
+        assign_weights = getattr(self, "initialize_weights", True) is False
+        info = self.load_state_dict(load_sd, False, assign=assign_weights)
         if len(extra_dict.keys()) == 0:
             extra_dict = None
         return extra_dict

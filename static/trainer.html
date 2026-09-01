@@ -6,10 +6,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qwen Dataset Manager — Trainer</title>
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="stylesheet" href="/static/trainer.css?v=18">
+    <link rel="stylesheet" href="/static/trainer.css?v=20">
 </head>
 
-<body class="trainer-page">
+<body class="trainer-page" data-independent-validation-uploads="<!--TRAINER_VALIDATION_UPLOADS-->">
     <div class="trainer-app">
         <header class="trainer-topbar">
             <div class="trainer-topbar-start">
@@ -215,10 +215,10 @@
                                 <label class="trainer-field" for="trainer-rgba-edge-correction"><span>Edge cleanup</span><select id="trainer-rgba-edge-correction"><option value="matte_despill">Green matte despill</option><option value="nearest_opaque">Nearest opaque</option><option value="none">None</option></select></label>
                                 <label class="trainer-field" for="trainer-rgba-edge-width"><span>Edge width</span><input id="trainer-rgba-edge-width" type="number" min="0.1" step="0.1" value="3"></label>
                                 <label class="trainer-field" for="trainer-rgba-alpha-threshold"><span>Hidden RGB alpha threshold</span><input id="trainer-rgba-alpha-threshold" type="number" min="0" max="1" step="0.0001" value="0.0039215686"></label>
-                                <label class="trainer-field" for="trainer-rgba-lora-alpha-loss"><span>Alpha region emphasis</span><input id="trainer-rgba-lora-alpha-loss" type="number" min="0" step="0.1" value="4"></label>
-                                <label class="trainer-field" for="trainer-rgba-lora-edge-loss"><span>Alpha edge emphasis</span><input id="trainer-rgba-lora-edge-loss" type="number" min="0" step="0.1" value="2"></label>
+                                <label class="trainer-field" for="trainer-rgba-lora-alpha-loss"><span>Alpha consistency strength</span><input id="trainer-rgba-lora-alpha-loss" type="number" min="0" step="0.1" value="1"></label>
+                                <label class="trainer-field" for="trainer-rgba-lora-edge-loss"><span>Alpha edge consistency</span><input id="trainer-rgba-lora-edge-loss" type="number" min="0" step="0.1" value="0.5"></label>
                             </div>
-                            <p class="trainer-help">The standard diffusion loss trains RGBA latents from the four-channel VAE. A lightweight alpha map only balances transparent, opaque, and boundary regions in that existing loss; it performs no extra model forward and no VAE decode. Recommended learning rate: 0.00001.</p>
+                            <p class="trainer-help">A calibrated fixed latent probe gently reinforces the VAE's shared alpha direction while the standard diffusion MSE remains primary. It performs no extra transformer forward and no VAE decode. Recommended starting values: alpha 1, edges 0.5, learning rate 0.00001.</p>
                         </section>
 
                         <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
@@ -281,6 +281,7 @@
                                     <label class="trainer-field" for="trainer-validation-resolution"><span>Validation resolution</span><input id="trainer-validation-resolution" type="number" min="64" max="4096" value="1024"></label>
                                     <label class="trainer-field" for="trainer-validation-sigmas"><span>Validation sigmas</span><select id="trainer-validation-sigmas"><option value="0.5">0.5</option><option value="1,0.5">1.0, 0.5</option><option value="1,0.66,0.33">1.0, 0.66, 0.33</option><option value="1,0.75,0.5,0.25">1.0, 0.75, 0.5, 0.25</option></select></label>
                                 </div>
+                                <p id="trainer-independent-validation-help" class="trainer-help hidden">Upload an independent RGBA target set here. These files are not taken from or added to the training datasets. Each image receives its own strict alpha PASS/FAIL at the worst selected sigma.</p>
                                 <div id="trainer-validation-items" class="trainer-repeat-list"></div>
                                 <button id="trainer-add-validation-btn" class="trainer-btn trainer-btn-secondary trainer-full-btn" type="button">Add validation image</button>
                             </div>
@@ -404,6 +405,11 @@
                             </section>
                         </div>
 
+                        <section id="trainer-validation-results" class="trainer-card trainer-validation-results hidden">
+                            <div class="trainer-card-heading"><span>RGBA validation results</span><small id="trainer-validation-results-summary"></small></div>
+                            <div id="trainer-validation-results-items"></div>
+                        </section>
+
                         <section class="trainer-card trainer-log-card">
                             <div class="trainer-card-heading trainer-log-heading">
                                 <div><span>Trainer log</span><small>Last 200 KB</small></div>
@@ -499,7 +505,7 @@
     <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
     <script id="trainer-bootstrap" type="application/json"><!--TRAINER_BOOTSTRAP--></script>
     <script src="/static/ui-dialog.js?v=1"></script>
-    <script src="/static/trainer.js?v=24"></script>
+    <script src="/static/trainer.js?v=27"></script>
 </body>
 
 </html>

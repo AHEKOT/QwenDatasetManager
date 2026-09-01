@@ -8,6 +8,7 @@ from collections import OrderedDict
 import os
 import re
 import traceback
+from types import SimpleNamespace
 from typing import Union, List, Optional
 
 import numpy as np
@@ -45,6 +46,7 @@ from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
 from toolkit.prompt_utils import concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
+from toolkit.rgba_utils import prepare_rgba_validation_pair
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
     load_ip_adapter_model, load_custom_adapter_model
@@ -149,10 +151,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.dataset_configs: List[DatasetConfig] = []
         self.params = []
         
+        # Unloading the text encoder must not silently replace every dataset
+        # caption with a blank prompt. Cache the complete caption set first,
+        # then the trainer can remove the encoder before the optimization loop.
+        # This also repairs older saved Klein jobs whose UI wrote
+        # unload_text_encoder=true together with cache_text_embeddings=false.
+        if self.train_config.unload_text_encoder:
+            self.train_config.cache_text_embeddings = True
+
         # add dataset text embedding cache to their config
         if self.train_config.cache_text_embeddings:
             for raw_dataset in raw_datasets:
                 raw_dataset['cache_text_embeddings'] = True
+                if self.model_config.arch in {
+                    'flux2_klein_4b_rgba',
+                    'flux2_klein_9b_rgba',
+                }:
+                    # Klein's random RGB edit control is encoded separately by
+                    # the transformer and does not invalidate text embeddings.
+                    raw_dataset['rgba_dynamic_control_text_cache_safe'] = True
 
         # pass diff output preservation to the datasets so the data loader can build
         # and cache the DOP caption (dataset trigger word replaced with the class)
@@ -1616,12 +1633,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         divisibility = self.sd.get_bucket_divisibility()
 
         image_list = []
+        control_list = []
+        rgba_mode_list = []
         prompt_list = []
+        validation_name_list = []
+        supports_rgba = bool(getattr(self.sd, 'supports_rgba_latent_loss', False))
         for item in validation_items:
-            img = Image.open(item.image_path)
-            img = ImageOps.exif_transpose(img).convert(
-                'RGBA' if getattr(self.sd, 'supports_rgba_training_loss', False) else 'RGB'
-            )
+            with Image.open(item.image_path) as source:
+                img = ImageOps.exif_transpose(source).copy()
             # deterministic resize that keeps the aspect ratio, matches the pixel budget
             # of the resolution and the bucket divisibility of the model
             bucket = get_bucket_for_image_size(
@@ -1629,9 +1648,52 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 resolution=resolution,
                 divisibility=divisibility,
             )
-            img = img.resize((bucket['width'], bucket['height']), Image.BICUBIC)
-            tensor = transforms.ToTensor()(img) * 2.0 - 1.0
+            target_size = (bucket['width'], bucket['height'])
+            control = None
+            rgba_mode = None
+            if supports_rgba:
+                rgba_mode = item.rgba_control_mode or 'generation'
+                background = None
+                if rgba_mode == 'edit':
+                    background_root = item.rgba_control_background_path
+                    if background_root:
+                        if not os.path.isdir(background_root):
+                            raise ValueError(
+                                f"RGBA edit validation background directory is missing: {background_root}"
+                            )
+                        background_files = sorted(
+                            path for path in glob.glob(os.path.join(background_root, '*'))
+                            if os.path.isfile(path)
+                            and os.path.splitext(path)[1].lower() in {'.png', '.jpg', '.jpeg', '.webp'}
+                        )
+                        if not background_files:
+                            raise ValueError(
+                                f"RGBA edit validation background directory is empty: {background_root}"
+                            )
+                        digest = hashlib.sha256(item.image_path.encode('utf-8')).digest()
+                        background_path = background_files[
+                            int.from_bytes(digest[:8], 'big') % len(background_files)
+                        ]
+                        with Image.open(background_path) as background_source:
+                            background = ImageOps.exif_transpose(background_source).copy()
+                tensor, control = prepare_rgba_validation_pair(
+                    img,
+                    target_size,
+                    control_mode=rgba_mode,
+                    background_image=background,
+                    alpha_threshold=item.rgba_alpha_threshold,
+                    hidden_rgb_color=item.rgba_hidden_rgb_color,
+                    edge_color_correction=item.rgba_edge_color_correction,
+                    edge_matte_color=item.rgba_edge_matte_color,
+                    edge_width=item.rgba_edge_width,
+                )
+            else:
+                img = img.convert('RGB').resize(target_size, Image.BICUBIC)
+                tensor = transforms.ToTensor()(img) * 2.0 - 1.0
             image_list.append(tensor)
+            control_list.append(control)
+            rgba_mode_list.append(rgba_mode)
+            validation_name_list.append(os.path.basename(item.image_path))
             prompt = item.prompt
             if self.trigger_word is not None:
                 prompt = self.sd.inject_trigger_into_prompt(
@@ -1648,10 +1710,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             te_list = te if isinstance(te, list) else ([te] if te is not None else [])
             orig_te_devices = [next(t.parameters()).device for t in te_list]
             self.sd.text_encoder_to(device)
-            embeds_list = [
-                self.sd.encode_prompt([prompt]).to('cpu', dtype=torch.float32).detach()
-                for prompt in prompt_list
-            ]
+            embeds_list = []
+            for prompt, control in zip(prompt_list, control_list):
+                prompt_kwargs = {}
+                if self.sd.encode_control_in_text_embeddings and control is not None:
+                    prompt_kwargs['control_images'] = control.unsqueeze(0).to(
+                        device, dtype=dtype
+                    )
+                embeds_list.append(
+                    self.sd.encode_prompt([prompt], **prompt_kwargs)
+                    .to('cpu', dtype=torch.float32)
+                    .detach()
+                )
             for t, te_device in zip(te_list, orig_te_devices):
                 t.to(te_device)
 
@@ -1677,8 +1747,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'latents': latent_list,
             'noise': noise_list,
             'embeds': embeds_list,
+            'rgba_targets': image_list if supports_rgba else [None] * len(image_list),
+            'controls': control_list,
+            'rgba_modes': rgba_mode_list,
+            'names': validation_name_list,
         }
         flush()
+
+    @staticmethod
+    def _evaluate_rgba_validation_pass(metric_values, thresholds):
+        checks = []
+        passed = True
+        for name, limit in thresholds.get('max', {}).items():
+            value = metric_values.get(name)
+            ok = value is not None and value <= float(limit)
+            checks.append((name, value, '<=', float(limit), ok))
+            passed = passed and ok
+        for name, limit in thresholds.get('min', {}).items():
+            value = metric_values.get(name)
+            ok = value is not None and value >= float(limit)
+            checks.append((name, value, '>=', float(limit), ok))
+            passed = passed and ok
+        return passed, checks
 
     def validate(self):
         val_config = self.train_config.validation_config
@@ -1711,12 +1801,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # images can have different aspect ratios, so each image is predicted as its
             # own batch with all sigmas at once
             losses = []
-            for latents_cpu, noise_cpu, embeds_cpu in zip(cache['latents'], cache['noise'], cache['embeds']):
+            rgba_metrics = {}
+            rgba_item_metrics = []
+            for latents_cpu, noise_cpu, embeds_cpu, rgba_target_cpu, control_cpu, rgba_mode in zip(
+                cache['latents'],
+                cache['noise'],
+                cache['embeds'],
+                cache.get('rgba_targets', [None] * len(cache['latents'])),
+                cache.get('controls', [None] * len(cache['latents'])),
+                cache.get('rgba_modes', [None] * len(cache['latents'])),
+            ):
+                current_rgba_metrics = {}
                 latents = latents_cpu.to(device, dtype=dtype)
                 noise = noise_cpu.to(device, dtype=dtype)
                 batch_latents = torch.cat([latents] * len(sigmas), dim=0)
                 batch_noise = torch.cat([noise] * len(sigmas), dim=0)
                 batch_embeds = concat_prompt_embeds([embeds_cpu.clone().to(device, dtype=dtype)] * len(sigmas))
+                validation_batch = None
+                if control_cpu is not None:
+                    batch_control = torch.cat(
+                        [control_cpu.unsqueeze(0)] * len(sigmas), dim=0
+                    )
+                    validation_batch = SimpleNamespace(
+                        control_tensor=batch_control,
+                        control_tensor_list=None,
+                        dataset_config=SimpleNamespace(
+                            rgba_generate_control=True,
+                            rgba_control_mode=rgba_mode,
+                        ),
+                    )
 
                 noisy_latents = self.sd.add_noise(batch_latents, batch_noise, timesteps).detach()
 
@@ -1727,6 +1840,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     guidance_scale=1.0,
                     guidance_embedding_scale=self.train_config.cfg_scale,
                     bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
+                    batch=validation_batch,
                 )
 
                 if self.sd.is_flow_matching:
@@ -1738,8 +1852,109 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 losses.append(torch.nn.functional.mse_loss(noise_pred.float(), target.float()))
 
+                if (
+                    rgba_target_cpu is not None
+                    and hasattr(self.sd, 'get_rgba_validation_metrics')
+                    and self.sd.is_flow_matching
+                ):
+                    sigma = timesteps.float() / 1000.0
+                    while sigma.ndim < noise_pred.ndim:
+                        sigma = sigma.unsqueeze(-1)
+                    predicted_clean = noisy_latents.float() - sigma * noise_pred.float()
+                    target_rgba = torch.cat(
+                        [rgba_target_cpu.unsqueeze(0)] * len(sigmas), dim=0
+                    ).to(device, dtype=torch.float32)
+                    # Score each image/sigma independently. Pass/fail below uses
+                    # the worst result, so a small broken hair boundary cannot
+                    # disappear inside a large empty canvas or a batch mean.
+                    for index in range(len(sigmas)):
+                        item_metrics = self.sd.get_rgba_validation_metrics(
+                            predicted_clean=predicted_clean[index:index + 1],
+                            target_clean=batch_latents[index:index + 1].float(),
+                            target_rgba=target_rgba[index:index + 1],
+                        )
+                        for name, value in item_metrics.items():
+                            rgba_metrics.setdefault(name, []).append(value.detach().float())
+                            current_rgba_metrics.setdefault(name, []).append(
+                                value.detach().float()
+                            )
+                rgba_item_metrics.append(current_rgba_metrics)
+
             val_loss = torch.stack(losses).mean()
             self.additional_logs['val/loss'] = val_loss.item()
+            for name, values in rgba_metrics.items():
+                self.additional_logs[f'val/{name}'] = torch.stack(values).mean().item()
+            if rgba_metrics:
+                threshold_config = val_config.rgba_pass_thresholds or {}
+                threshold_names_max = set(threshold_config.get('max', {}))
+                threshold_names_min = set(threshold_config.get('min', {}))
+                worst_metrics = {}
+                for name in threshold_names_max | threshold_names_min:
+                    values = rgba_metrics.get(name, [])
+                    if values:
+                        stacked = torch.stack(values)
+                        worst = stacked.min() if name in threshold_names_min else stacked.max()
+                        worst_metrics[name] = worst.item()
+                        self.additional_logs[f'val/worst_{name}'] = worst.item()
+                passed, checks = self._evaluate_rgba_validation_pass(
+                    worst_metrics, threshold_config
+                )
+                self.additional_logs['val/rgba_pass'] = float(passed)
+                failed_checks = [
+                    f"{name}={value:.6f} {operator} {limit:.6f}"
+                    if value is not None
+                    else f"{name}=missing {operator} {limit:.6f}"
+                    for name, value, operator, limit, ok in checks
+                    if not ok
+                ]
+                self.additional_logs['val/rgba_failed_checks'] = (
+                    'none' if not failed_checks else '; '.join(failed_checks)
+                )
+                for item_index, item_values in enumerate(rgba_item_metrics):
+                    item_worst = {}
+                    for name in threshold_names_max | threshold_names_min:
+                        values = item_values.get(name, [])
+                        if values:
+                            stacked = torch.stack(values)
+                            worst = (
+                                stacked.min()
+                                if name in threshold_names_min
+                                else stacked.max()
+                            )
+                            item_worst[name] = worst.item()
+                            self.additional_logs[
+                                f'val/item_{item_index + 1}_worst_{name}'
+                            ] = worst.item()
+                    item_passed, item_checks = self._evaluate_rgba_validation_pass(
+                        item_worst, threshold_config
+                    )
+                    self.additional_logs[
+                        f'val/item_{item_index + 1}_rgba_pass'
+                    ] = float(item_passed)
+                    item_failed = [
+                        f"{name}={value:.6f} {operator} {limit:.6f}"
+                        if value is not None
+                        else f"{name}=missing {operator} {limit:.6f}"
+                        for name, value, operator, limit, ok in item_checks
+                        if not ok
+                    ]
+                    self.additional_logs[
+                        f'val/item_{item_index + 1}_failed_checks'
+                    ] = 'none' if not item_failed else '; '.join(item_failed)
+                    item_name = cache.get('names', [])[item_index]
+                    print_acc(
+                        f"RGBA validation item {item_index + 1} ({item_name}): "
+                        f"{'PASS' if item_passed else 'FAIL'}"
+                    )
+                print_acc(
+                    f"RGBA validation: {'PASS' if passed else 'FAIL'}; "
+                    + ", ".join(
+                        f"worst_{name}={worst_metrics[name]:.6f}"
+                        for name in sorted(worst_metrics)
+                    )
+                )
+                if failed_checks:
+                    print_acc("RGBA validation failed checks: " + '; '.join(failed_checks))
         network.multiplier = start_multiplier
         if was_unet_training:
             self.sd.unet.train()

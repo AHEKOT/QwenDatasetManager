@@ -201,3 +201,75 @@ def fit_rgb_background(image: Image.Image, size: Sequence[int]) -> Image.Image:
         method=Image.Resampling.LANCZOS,
         centering=(0.5, 0.5),
     )
+
+
+def prepare_rgba_validation_pair(
+    image: Image.Image,
+    size: tuple[int, int],
+    *,
+    control_mode: str,
+    background_image: Image.Image | None = None,
+    alpha_threshold: float = 1.0 / 255.0,
+    hidden_rgb_color: Sequence[int] = (0, 0, 0),
+    edge_color_correction: str = "none",
+    edge_matte_color: Sequence[int] = (0, 255, 0),
+    edge_width: float = 3.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the deterministic RGBA target and matching RGB validation control.
+
+    The target uses the exact training cleanup and an alpha-safe resize.  Edit
+    mode composites it over a fixed opaque background; when none is supplied an
+    intentionally varied deterministic background is generated locally.
+    Generation mode uses the same black control as training. Returned target is
+    normalized CHW [-1, 1] and control is CHW RGB [0, 1].
+    """
+
+    if control_mode not in {"edit", "generation"}:
+        raise ValueError("RGBA validation control_mode must be edit or generation")
+    prepared = prepare_rgba_image(
+        image,
+        require_alpha=True,
+        alpha_threshold=alpha_threshold,
+        hidden_rgb_color=hidden_rgb_color,
+        edge_color_correction=edge_color_correction,
+        edge_matte_color=edge_matte_color,
+        edge_width=edge_width,
+    )
+    prepared = resize_rgba_alpha_safe(
+        prepared,
+        size,
+        alpha_epsilon=alpha_threshold,
+        hidden_rgb_color=hidden_rgb_color,
+    )
+    rgba_array = np.asarray(prepared, dtype=np.float32) / 255.0
+    target = torch.from_numpy(rgba_array.copy()).permute(2, 0, 1) * 2.0 - 1.0
+
+    if control_mode == "generation":
+        control = torch.zeros((3, size[1], size[0]), dtype=torch.float32)
+    else:
+        if background_image is None:
+            width, height = size
+            yy, xx = np.mgrid[0:height, 0:width]
+            tile = max(8, min(width, height) // 12)
+            checker = ((xx // tile + yy // tile) % 2).astype(np.float32)
+            x_norm = xx.astype(np.float32) / max(width - 1, 1)
+            y_norm = yy.astype(np.float32) / max(height - 1, 1)
+            color_a = np.stack((
+                35.0 + 80.0 * x_norm,
+                80.0 + 100.0 * y_norm,
+                190.0 - 70.0 * x_norm,
+            ), axis=-1)
+            color_b = np.stack((
+                235.0 - 60.0 * y_norm,
+                155.0 + 60.0 * x_norm,
+                45.0 + 75.0 * y_norm,
+            ), axis=-1)
+            generated = color_a * (1.0 - checker[..., None]) + color_b * checker[..., None]
+            background_image = Image.fromarray(
+                np.clip(generated, 0, 255).astype(np.uint8), mode="RGB"
+            )
+        fitted = fit_rgb_background(background_image, size)
+        background_array = np.asarray(fitted, dtype=np.float32) / 255.0
+        background = torch.from_numpy(background_array.copy()).permute(2, 0, 1)
+        control = rgba_tensor_to_rgb_control_image(target, background)
+    return target, control

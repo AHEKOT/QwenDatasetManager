@@ -1304,6 +1304,9 @@ def trainer_page():
         page.replace('<!--TRAINER_JOB_COUNT-->', job_count)
         .replace('<!--TRAINER_JOBS-->', jobs_markup)
         .replace('<!--TRAINER_BOOTSTRAP-->', bootstrap)
+        .replace('<!--TRAINER_VALIDATION_UPLOADS-->', 'true')
+        .replace('trainer-independent-validation-help" class="trainer-help hidden',
+                 'trainer-independent-validation-help" class="trainer-help')
     )
     response = app.response_class(page, mimetype='text/html')
     response.headers['Cache-Control'] = 'no-store'

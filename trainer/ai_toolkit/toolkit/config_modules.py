@@ -343,6 +343,21 @@ class ValidationItem:
     def __init__(self, **kwargs):
         self.image_path: str = kwargs.get('image_path', '')
         self.prompt: str = kwargs.get('prompt', '')
+        self.rgba_control_mode: str | None = kwargs.get('rgba_control_mode', None)
+        self.rgba_control_background_path: str | None = kwargs.get(
+            'rgba_control_background_path', None
+        )
+        self.rgba_alpha_threshold: float = kwargs.get(
+            'rgba_alpha_threshold', 1.0 / 255.0
+        )
+        self.rgba_hidden_rgb_color = kwargs.get('rgba_hidden_rgb_color', [0, 0, 0])
+        self.rgba_edge_color_correction: str = kwargs.get(
+            'rgba_edge_color_correction', 'none'
+        )
+        self.rgba_edge_matte_color = kwargs.get(
+            'rgba_edge_matte_color', [0, 255, 0]
+        )
+        self.rgba_edge_width: float = kwargs.get('rgba_edge_width', 3.0)
 
 
 class ValidationConfig:
@@ -354,6 +369,7 @@ class ValidationConfig:
         self.resolution: int = kwargs.get('resolution', 512)
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
         self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
+        self.rgba_pass_thresholds: dict = kwargs.get('rgba_pass_thresholds', {})
 
 
 class EmbeddingConfig:
@@ -1087,10 +1103,18 @@ class DatasetConfig:
         
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # Random controls only invalidate a text-embedding cache for models
+        # (Qwen Image Edit) that encode the control together with the text.
+        # FLUX.2 Klein encodes its control in the transformer path, so its text
+        # captions remain stable and safe to cache.
+        self.rgba_dynamic_control_text_cache_safe: bool = kwargs.get(
+            'rgba_dynamic_control_text_cache_safe', False
+        )
         if (
             self.cache_text_embeddings
             and self.rgba_generate_control
             and self.rgba_control_mode == 'edit'
+            and not self.rgba_dynamic_control_text_cache_safe
         ):
             raise ValueError(
                 "cache_text_embeddings cannot be used with random RGBA background controls"

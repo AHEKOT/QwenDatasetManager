@@ -49,12 +49,14 @@
         generatedSamples: [],
         generatedSampleCount: 1,
         generatedSamplesStatus: 'idle',
+        validationResults: null,
         selectedGeneratedSample: null,
         selectedSampleControl: null,
         sampleZoom: 1,
     };
 
     const $ = id => document.getElementById(id);
+    const independentValidationUploads = document.body.dataset.independentValidationUploads === 'true';
     const editorView = $('trainer-editor-view');
     const detailView = $('trainer-detail-view');
     const form = $('trainer-job-form');
@@ -392,7 +394,6 @@
             name,
             repeats: Number(settings.repeats ?? 1),
             weight: Number(settings.weight ?? 1),
-            batchSize: Number(settings.batchSize ?? 1),
             captionDropout: Number(settings.captionDropout ?? 0.05),
             defaultCaption: settings.defaultCaption || '',
             captionExtension: settings.captionExtension || 'txt',
@@ -423,15 +424,35 @@
     }
 
     function syncRgbaCacheState() {
-        const dynamicBackgrounds = selectedPreset() === 'transparent_lora'
+        const isTransparent = selectedPreset() === 'transparent_lora';
+        const dynamicBackgrounds = isTransparent
             && state.selectedDatasets.some(dataset => dataset.rgbaControlMode === 'edit');
+        const dynamicTextCacheSafe = ['flux2_klein_4b', 'flux2_klein_9b'].includes(
+            selectedTrainingChoice().modelKey
+        );
+        const cacheRequired = isTransparent && dynamicTextCacheSafe;
+        const cacheUnsafe = dynamicBackgrounds && !dynamicTextCacheSafe;
         const input = $('trainer-cache-text');
         const wrap = $('trainer-cache-text-wrap');
-        input.disabled = dynamicBackgrounds;
-        if (dynamicBackgrounds) input.checked = false;
-        wrap.classList.toggle('is-disabled', dynamicBackgrounds);
-        wrap.title = dynamicBackgrounds
+        const unloadInput = $('trainer-unload-text');
+        const unloadWrap = $('trainer-unload-text-wrap');
+        if (cacheRequired) {
+            input.checked = true;
+            unloadInput.checked = true;
+        } else if (cacheUnsafe) {
+            input.checked = false;
+        }
+        input.disabled = cacheUnsafe || cacheRequired;
+        unloadInput.disabled = cacheRequired;
+        wrap.classList.toggle('is-disabled', cacheUnsafe || cacheRequired);
+        unloadWrap.classList.toggle('is-disabled', cacheRequired);
+        wrap.title = cacheRequired
+            ? 'Klein RGBA training caches captions once and keeps the text encoder unloaded.'
+            : (cacheUnsafe
             ? 'Random background controls are generated on every training sample and cannot use cached text embeddings.'
+            : '');
+        unloadWrap.title = cacheRequired
+            ? 'Klein RGBA training keeps the text encoder unloaded after caption caching.'
             : '';
     }
 
@@ -439,7 +460,7 @@
         const container = $('trainer-selected-datasets');
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
         const fallbackName = state.selectedDatasets[0]?.name || '';
-        [...state.samples, ...state.validationItems].forEach(item => {
+        state.samples.forEach(item => {
             if (!selectedNames.has(item.dataset)) item.dataset = fallbackName;
         });
         if (!state.selectedDatasets.length) {
@@ -492,7 +513,6 @@
                 : `<div class="trainer-dataset-settings">
                     <label class="trainer-field"><span>Repeats</span><input data-dataset-field="repeats" data-dataset-index="${index}" type="number" min="1" max="1000" value="${settings.repeats}"></label>
                     <label class="trainer-field"><span>LoRA weight</span><input data-dataset-field="weight" data-dataset-index="${index}" type="number" min="0" max="100" step="0.1" value="${settings.weight}"></label>
-                    <label class="trainer-field"><span>Batch size</span><input data-dataset-field="batchSize" data-dataset-index="${index}" type="number" min="1" max="128" value="${settings.batchSize}"></label>
                     <label class="trainer-field"><span>Caption dropout</span><input data-dataset-field="captionDropout" data-dataset-index="${index}" type="number" min="0" max="1" step="0.01" value="${settings.captionDropout}"></label>
                     <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
                     <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
@@ -662,16 +682,104 @@
         requestValue.send(body);
     }
 
+    function validationTargetPath(item) {
+        return item.targetPath || item.target_path || '';
+    }
+
+    function validationImagePreviewUrl(path) {
+        const filename = String(path || '').split(/[\\/]/).pop();
+        return filename ? `/api/trainer/validation-images/${encodeURIComponent(filename)}` : '';
+    }
+
+    function renderValidationImageSlot(item, index) {
+        const path = validationTargetPath(item);
+        const preview = validationImagePreviewUrl(path);
+        const previewContent = path
+            ? `<img src="${escapeHtml(preview)}" alt="RGBA validation target ${index + 1}">`
+            : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>Upload RGBA target</strong><span>PNG or WebP · click or drop</span>`;
+        return `<div class="trainer-sample-image-slot trainer-validation-image-slot${path ? ' has-image' : ''}" data-validation-image-slot="${index}">
+            <button class="trainer-sample-image-picker" type="button" data-pick-validation-image="${index}" aria-label="${path ? 'Replace' : 'Upload'} RGBA validation target">${previewContent}</button>
+            ${path ? `<button class="trainer-sample-image-clear" type="button" data-clear-validation-image="${index}" aria-label="Clear validation target" title="Clear image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>` : ''}
+            <input class="hidden" type="file" accept="image/png,image/webp" data-validation-file="${index}" tabindex="-1">
+            <div class="trainer-sample-upload-overlay hidden" aria-live="polite"><div class="trainer-sample-upload-track"><span></span></div><small>Uploading… <b>0%</b></small></div>
+        </div>`;
+    }
+
     function renderValidationItems() {
         const container = $('trainer-validation-items');
+        if (!independentValidationUploads) {
+            container.innerHTML = state.validationItems.map((item, index) => `<article class="trainer-repeat-card">
+                <div class="trainer-repeat-card-heading"><strong>Validation image ${index + 1}</strong><button class="trainer-icon-btn" type="button" data-remove-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+                <div class="trainer-repeat-grid trainer-validation-item-grid">
+                    <label class="trainer-field"><span>Dataset</span><select data-validation-field="dataset" data-validation-index="${index}">${selectedDatasetOptions(item.dataset)}</select></label>
+                    <label class="trainer-field"><span>Target image</span><input data-validation-field="image" data-validation-index="${index}" type="text" value="${escapeHtml(item.image || '')}" placeholder="image.png"></label>
+                    <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}"></label>
+                </div>
+            </article>`).join('');
+            return;
+        }
         container.innerHTML = state.validationItems.map((item, index) => `<article class="trainer-repeat-card">
             <div class="trainer-repeat-card-heading"><strong>Validation image ${index + 1}</strong><button class="trainer-icon-btn" type="button" data-remove-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
-            <div class="trainer-repeat-grid trainer-validation-item-grid">
-                <label class="trainer-field"><span>Dataset</span><select data-validation-field="dataset" data-validation-index="${index}">${selectedDatasetOptions(item.dataset)}</select></label>
-                <label class="trainer-field"><span>Target image <small>blank = first</small></span><input data-validation-field="image" data-validation-index="${index}" type="text" value="${escapeHtml(item.image || '')}" placeholder="image.png"></label>
-                <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}"></label>
+            <div class="trainer-validation-item-editor">
+                ${renderValidationImageSlot(item, index)}
+                <div class="trainer-repeat-grid trainer-validation-item-grid">
+                    ${selectedPreset() === 'transparent_lora' ? `<label class="trainer-field"><span>Validation mode</span><select data-validation-field="mode" data-validation-index="${index}"><option value="generation"${(item.mode || 'generation') === 'generation' ? ' selected' : ''}>Generation · black control</option><option value="edit"${item.mode === 'edit' ? ' selected' : ''}>Edit · automatic opaque control</option></select></label>` : ''}
+                    <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}" placeholder="Optional validation prompt"></label>
+                    <p>PASS/FAIL is calculated against this image’s alpha channel at every selected sigma; the worst result decides the image status.</p>
+                </div>
             </div>
         </article>`).join('');
+    }
+
+    function renderValidationItemsPreservingPlace() {
+        const workspace = document.querySelector('.trainer-workspace');
+        const scrollTop = workspace?.scrollTop || 0;
+        renderValidationItems();
+        if (workspace) workspace.scrollTop = scrollTop;
+        requestAnimationFrame(() => { if (workspace) workspace.scrollTop = scrollTop; });
+    }
+
+    function uploadValidationImage(input, droppedFile = null) {
+        const file = droppedFile || input.files?.[0];
+        if (!file) return;
+        const index = Number(input.dataset.validationFile);
+        const item = state.validationItems[index];
+        if (!item) return;
+        const slot = input.closest('.trainer-validation-image-slot');
+        const overlay = slot.querySelector('.trainer-sample-upload-overlay');
+        const progressBar = overlay.querySelector('span');
+        const progressText = overlay.querySelector('b');
+        overlay.classList.remove('hidden');
+        const requestValue = new XMLHttpRequest();
+        requestValue.open('POST', '/api/trainer/validation-images');
+        requestValue.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const percent = Math.round((event.loaded / event.total) * 100);
+            progressBar.style.width = `${percent}%`;
+            progressText.textContent = `${percent}%`;
+        });
+        requestValue.addEventListener('load', () => {
+            let result = {};
+            try { result = JSON.parse(requestValue.responseText || '{}'); } catch (_) { /* handled below */ }
+            if (requestValue.status < 200 || requestValue.status >= 300 || !result.path) {
+                overlay.classList.add('hidden');
+                showToast(result.error || `Upload failed (${requestValue.status})`, true);
+                return;
+            }
+            item.targetPath = result.path;
+            item.targetName = file.name;
+            delete item.target_path;
+            delete item.dataset;
+            delete item.image;
+            renderValidationItemsPreservingPlace();
+        });
+        requestValue.addEventListener('error', () => {
+            overlay.classList.add('hidden');
+            showToast('Validation target upload failed.', true);
+        });
+        const body = new FormData();
+        body.append('files', file);
+        requestValue.send(body);
     }
 
     function updateRepeatedItem(input, collection, indexKey, fieldKey) {
@@ -829,6 +937,12 @@
             if (sampleWithoutInstruction) return 'Enter an edit instruction for every sample.';
         }
         if (payload.validationEnabled && !payload.validationItems.length) return 'Add at least one validation image.';
+        if (payload.validationEnabled && independentValidationUploads) {
+            const missingValidationTarget = payload.validationItems.find(item =>
+                !validationTargetPath(item) && !(item.dataset && item.image)
+            );
+            if (missingValidationTarget) return 'Upload an RGBA target for every validation image.';
+        }
         if (payload.advancedProcess) {
             try { JSON.parse(payload.advancedProcess); } catch (error) { return `Advanced process JSON is invalid: ${error.message}`; }
         }
@@ -887,7 +1001,7 @@
             sampleSeed: 42, walkSeed: true, skipFirstSample: false, forceFirstSample: false, disableSampling: true, samples: [],
             layerOffloading: false, transformerOffload: 1, textEncoderOffload: 1, advancedProcess: '', datasets: [],
             vaePath: null, sampleLoraPath: null, rgbaEdgeCorrection: 'matte_despill', rgbaEdgeWidth: 3, rgbaAlphaThreshold: 1 / 255,
-            rgbaLoraLossAlpha: 4, rgbaLoraLossAlphaEdge: 2,
+            rgbaLoraLossAlpha: 1, rgbaLoraLossAlphaEdge: 0.5,
             sourceVaePath: 'Qwen/Qwen-Image-Edit-2511', sourceVaeSubfolder: 'vae', sourceVaeLocalOnly: false,
             vaeResolution: 512, vaeTrainScope: 'full', vaeDtype: 'bf16', vaeAlphaLrMultiplier: 10,
             vaeWorkers: 2, vaeMaxGradNorm: 1, vaeValidateEvery: 250, vaeValidationMaxImages: 32,
@@ -1281,6 +1395,7 @@
         state.generatedSamples = [];
         state.generatedSampleCount = 1;
         state.generatedSamplesStatus = 'idle';
+        state.validationResults = null;
         editorView.classList.add('hidden');
         detailView.classList.remove('hidden');
         renderJobs();
@@ -1355,6 +1470,7 @@
             const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 20;
             output.textContent = formatTrainerLog(result.log) || 'No log output yet.';
             if (atBottom) output.scrollTop = output.scrollHeight;
+            await refreshValidationResults();
             if (notify) showToast('Trainer log refreshed.');
         } catch (error) {
             if (notify) showToast(error.message, true);
@@ -1391,6 +1507,39 @@
         if (initial && !state.initialViewChosen) {
             restoreInitialView();
         }
+    }
+
+    function renderValidationResults() {
+        const section = $('trainer-validation-results');
+        const result = state.validationResults;
+        if (!result || !result.items?.length) {
+            section.classList.add('hidden');
+            return;
+        }
+        section.classList.remove('hidden');
+        const overall = result.passed ? 'PASS' : 'FAIL';
+        $('trainer-validation-results-summary').textContent = `Step ${Number(result.step).toLocaleString()} · overall ${overall}`;
+        $('trainer-validation-results-items').innerHTML = result.items.map(item => {
+            const passed = Boolean(item.passed);
+            const details = item.failedChecks === 'none'
+                ? 'All strict alpha thresholds passed.'
+                : (item.failedChecks || 'Validation result is incomplete.');
+            return `<article class="trainer-validation-result ${passed ? 'is-pass' : 'is-fail'}">
+                <div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><b>${passed ? 'PASS' : 'FAIL'}</b></div>
+                <p>${escapeHtml(details)}</p>
+            </article>`;
+        }).join('');
+    }
+
+    async function refreshValidationResults() {
+        const job = currentJob();
+        if (!job) return;
+        try {
+            state.validationResults = await api(`/api/trainer/jobs/${job.id}/validation-results`);
+        } catch (_) {
+            state.validationResults = null;
+        }
+        renderValidationResults();
     }
 
     function restoreInitialView() {
@@ -1570,10 +1719,12 @@
             renderConditionalOptions();
         });
         $('trainer-cache-text').addEventListener('change', () => {
-            if ($('trainer-cache-text').checked) $('trainer-unload-text').checked = false;
+            if (!$('trainer-cache-text').checked && $('trainer-unload-text').checked) {
+                $('trainer-unload-text').checked = false;
+            }
         });
         $('trainer-unload-text').addEventListener('change', () => {
-            if ($('trainer-unload-text').checked) $('trainer-cache-text').checked = false;
+            if ($('trainer-unload-text').checked) $('trainer-cache-text').checked = true;
         });
         $('trainer-skip-first-sample').addEventListener('change', () => {
             if ($('trainer-skip-first-sample').checked) $('trainer-force-first-sample').checked = false;
@@ -1667,18 +1818,60 @@
             if (file && input) uploadSampleImage(input, file);
         });
         $('trainer-add-validation-btn').addEventListener('click', () => {
-            state.validationItems.push({ dataset: state.selectedDatasets[0]?.name || '', image: '', prompt: '' });
+            state.validationItems.push(independentValidationUploads
+                ? { targetPath: '', prompt: '', mode: 'generation' }
+                : { dataset: state.selectedDatasets[0]?.name || '', image: '', prompt: '' }
+            );
             renderValidationItems();
         });
         $('trainer-validation-items').addEventListener('click', event => {
-            const button = event.target.closest('[data-remove-validation]');
-            if (!button) return;
-            state.validationItems.splice(Number(button.dataset.removeValidation), 1);
-            renderValidationItems();
+            const removeButton = event.target.closest('[data-remove-validation]');
+            const pickerButton = event.target.closest('[data-pick-validation-image]');
+            const clearButton = event.target.closest('[data-clear-validation-image]');
+            if (removeButton) {
+                state.validationItems.splice(Number(removeButton.dataset.removeValidation), 1);
+                renderValidationItems();
+                return;
+            }
+            if (pickerButton) {
+                $('trainer-validation-items').querySelector(`[data-validation-file="${pickerButton.dataset.pickValidationImage}"]`)?.click();
+                return;
+            }
+            if (clearButton) {
+                const item = state.validationItems[Number(clearButton.dataset.clearValidationImage)];
+                if (!item) return;
+                item.targetPath = '';
+                delete item.target_path;
+                renderValidationItemsPreservingPlace();
+            }
         });
         $('trainer-validation-items').addEventListener('input', event => {
             const input = event.target.closest('[data-validation-field]');
             if (input) updateRepeatedItem(input, state.validationItems, 'validationIndex', 'validationField');
+        });
+        $('trainer-validation-items').addEventListener('change', event => {
+            const input = event.target.closest('[data-validation-file]');
+            if (input) uploadValidationImage(input);
+        });
+        ['dragenter', 'dragover'].forEach(eventName => $('trainer-validation-items').addEventListener(eventName, event => {
+            const slot = event.target.closest('[data-validation-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+            slot.classList.add('is-dragging');
+        }));
+        $('trainer-validation-items').addEventListener('dragleave', event => {
+            const slot = event.target.closest('[data-validation-image-slot]');
+            if (slot && !slot.contains(event.relatedTarget)) slot.classList.remove('is-dragging');
+        });
+        $('trainer-validation-items').addEventListener('drop', event => {
+            const slot = event.target.closest('[data-validation-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            slot.classList.remove('is-dragging');
+            const file = event.dataTransfer?.files?.[0];
+            const input = slot.querySelector('[data-validation-file]');
+            if (file && input) uploadValidationImage(input, file);
         });
         form.addEventListener('submit', event => { event.preventDefault(); saveJob(false); });
         $('trainer-save-start-btn').addEventListener('click', () => saveJob(true));

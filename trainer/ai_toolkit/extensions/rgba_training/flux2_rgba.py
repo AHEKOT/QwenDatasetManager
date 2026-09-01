@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import torch
+from safetensors.torch import load_file
 
 from extensions_built_in.diffusion_models.flux2.flux2_klein_model import (
     Flux2Klein4BModel,
@@ -28,6 +30,24 @@ class Flux2KleinRGBAMixin(RGBALoRALossMixin):
                 "Transparent FLUX.2 Klein training requires vae_path pointing "
                 "to a compatible four-channel FLUX.2 VAE"
             )
+        configured_probe = self.model_config.model_kwargs.get(
+            "rgba_lora_alpha_probe_path"
+        )
+        probe_path = (
+            Path(configured_probe).expanduser().resolve()
+            if configured_probe
+            else Path(self.model_config.vae_path)
+            .expanduser()
+            .resolve()
+            .with_suffix(".alpha-probe.safetensors")
+        )
+        if not probe_path.is_file():
+            raise ValueError(
+                "Transparent FLUX.2 Klein training requires the calibrated "
+                f"alpha probe next to its RGBA VAE: {probe_path}"
+            )
+        self.set_rgba_alpha_probe(load_file(str(probe_path), device="cpu"))
+        self.rgba_alpha_probe_path = str(probe_path)
         identity = f"{self.model_config.vae_path}|rgba-preprocess-v1"
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         self.latent_space_version = f"flux2-klein-rgba-{digest}"

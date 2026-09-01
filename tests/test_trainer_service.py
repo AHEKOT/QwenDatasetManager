@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,6 +115,18 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(len(process['datasets'][1]['control_path']), 3)
         self.assertEqual([item['name'] for item in inspections], ['demo', 'second'])
 
+    def test_global_batch_size_is_not_shadowed_by_legacy_dataset_batch(self):
+        self.make_dataset()
+        payload = self.default_payload()
+        payload['batchSize'] = 10
+        payload['datasets'][0]['batchSize'] = 1
+
+        _name, _gpu_ids, config, _inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(process['train']['batch_size'], 10)
+        self.assertNotIn('batch_size', process['datasets'][0])
+
     def test_validation_sample_uses_real_control_images(self):
         self.make_dataset('demo')
         payload = self.default_payload()
@@ -181,6 +194,78 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(preview.mimetype, 'image/png')
         preview.close()
+
+    def test_validation_target_upload_is_independent_and_requires_real_alpha(self):
+        stream = io.BytesIO()
+        target = Image.new('RGBA', (18, 14), (120, 80, 40, 0))
+        for x in range(4, 14):
+            for y in range(3, 11):
+                target.putpixel((x, y), (120, 80, 40, 255))
+        target.save(stream, format='PNG')
+        stream.seek(0)
+        app = Flask(__name__)
+        app.register_blueprint(create_trainer_blueprint(self.service))
+        client = app.test_client()
+
+        response = client.post(
+            '/api/trainer/validation-images',
+            data={'files': (stream, 'independent-alpha.png')},
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        uploaded = response.get_json()
+        uploaded_path = Path(uploaded['path'])
+        self.assertTrue(uploaded_path.is_file())
+        self.assertEqual(uploaded_path.parent, self.service.validation_images_dir.resolve())
+        preview = client.get(uploaded['previewUrl'])
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.mimetype, 'image/png')
+        preview.close()
+
+    def test_validation_results_return_per_image_pass_fail(self):
+        self.make_dataset('demo')
+        payload = self.default_payload()
+        payload.update({
+            'validationEnabled': True,
+            'validationItems': [{
+                'dataset': 'demo',
+                'image': 'two.png',
+                'prompt': 'validation',
+            }],
+        })
+        job, _inspections = self.service.create_job(payload)
+        metrics_dir = self.service.output_dir / job['name']
+        metrics_dir.mkdir(parents=True)
+        metrics_db = metrics_dir / 'loss_log.db'
+        connection = sqlite3.connect(metrics_db)
+        connection.execute(
+            'CREATE TABLE metrics (step INTEGER, key TEXT, value_real REAL, value_text TEXT)'
+        )
+        connection.executemany(
+            'INSERT INTO metrics VALUES (?, ?, ?, ?)',
+            [
+                (100, 'val/rgba_pass', 0.0, None),
+                (100, 'val/rgba_failed_checks', None, 'boundary failed'),
+                (100, 'val/item_1_rgba_pass', 0.0, None),
+                (100, 'val/item_1_failed_checks', None, 'boundary failed'),
+                (100, 'val/item_1_worst_representation_boundary_mae', 0.08, None),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        result = self.service.validation_results(job['id'])
+
+        self.assertEqual(result['step'], 100)
+        self.assertFalse(result['passed'])
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['name'], 'two.png')
+        self.assertFalse(result['items'][0]['passed'])
+        self.assertEqual(result['items'][0]['failedChecks'], 'boundary failed')
+        self.assertEqual(
+            result['items'][0]['metrics']['representation_boundary_mae'], 0.08
+        )
 
     def test_generated_sample_gallery_routes_preserve_rgba_and_metadata(self):
         self.make_dataset('demo')
@@ -379,6 +464,7 @@ class TrainerServiceTests(unittest.TestCase):
         _name, _gpu, klein_config, _inspection = self.service.build_job_config(klein_payload)
         klein_process = klein_config['config']['process'][0]
         self.assertTrue(klein_process['train']['unload_text_encoder'])
+        self.assertTrue(klein_process['train']['cache_text_embeddings'])
         self.assertEqual(klein_process['train']['noise_scheduler'], 'flowmatch')
 
     def test_gui_exposes_every_scoped_upstream_training_group(self):
@@ -653,8 +739,8 @@ class TrainerServiceTests(unittest.TestCase):
         dataset = process['datasets'][0]
         self.assertEqual(process['model']['arch'], 'qwen_image_edit_plus_rgba')
         self.assertEqual(process['model']['vae_path'], str(vae.resolve()))
-        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha'], 4)
-        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha_edge'], 2)
+        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha'], 1)
+        self.assertEqual(process['model']['model_kwargs']['rgba_lora_loss_alpha_edge'], 0.5)
         self.assertNotIn('rgba_lora_loss_visible_rgb', process['model']['model_kwargs'])
         self.assertNotIn('rgba_lora_loss_composite', process['model']['model_kwargs'])
         self.assertNotIn('rgba_lora_loss_base_preservation', process['model']['model_kwargs'])
@@ -736,6 +822,135 @@ class TrainerServiceTests(unittest.TestCase):
             config['meta']['qdm']['form']['datasets'][0]['rgbaBackgroundDataset'],
             'backgrounds',
         )
+
+    def test_klein_edit_caches_captions_then_unloads_text_encoder(self):
+        self.make_rgba_dataset(control_count=2)
+        self.make_background_dataset()
+        vae = self.project_root / 'klein-rgba-vae.safetensors'
+        vae.write_bytes(b'test')
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'edit',
+            'rgbaBackgroundDataset': 'backgrounds',
+            'defaultCaption': 'Make transparent background.',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'flux2_klein_4b',
+            'vaePath': str(vae),
+            # A stale browser used to submit both switches as false.  The
+            # server must still preserve the Klein RGBA caching invariant.
+            'unloadTextEncoder': False,
+            'cacheTextEmbeddings': False,
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertTrue(process['train']['unload_text_encoder'])
+        self.assertTrue(process['train']['cache_text_embeddings'])
+        self.assertTrue(process['datasets'][0]['rgba_dynamic_control_text_cache_safe'])
+        self.assertTrue(config['meta']['qdm']['form']['unloadTextEncoder'])
+        self.assertTrue(config['meta']['qdm']['form']['cacheTextEmbeddings'])
+
+    def test_transparent_validation_keeps_rgba_mode_background_and_caption(self):
+        root = self.make_rgba_dataset(control_count=0)
+        backgrounds = self.make_background_dataset()
+        target = root / 'img' / 'one.png'
+        rgba = Image.new('RGBA', (16, 12), (20, 40, 60, 0))
+        for x in range(4, 12):
+            for y in range(2, 10):
+                rgba.putpixel((x, y), (200, 80, 30, 255))
+        rgba.save(target)
+        vae = self.project_root / 'klein-rgba-vae.safetensors'
+        vae.write_bytes(b'test')
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'edit',
+            'rgbaBackgroundDataset': 'backgrounds',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'flux2_klein_4b',
+            'vaePath': str(vae),
+            'validationEnabled': True,
+            'validationItems': [{'dataset': 'rgba', 'image': 'one.png', 'prompt': ''}],
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        item = config['config']['process'][0]['train']['validation_config']['validation_items'][0]
+        thresholds = config['config']['process'][0]['train']['validation_config']['rgba_pass_thresholds']
+        self.assertEqual(item['rgba_control_mode'], 'edit')
+        self.assertEqual(item['rgba_control_background_path'], str((backgrounds / 'img').resolve()))
+        self.assertEqual(item['prompt'], 'caption one')
+        self.assertEqual(item['rgba_hidden_rgb_color'], [0, 0, 0])
+        self.assertEqual(thresholds['max']['background_false_positive_rate'], 0.001)
+        self.assertEqual(thresholds['max']['representation_boundary_mae'], 0.035)
+        self.assertEqual(thresholds['min']['representation_alpha_iou'], 0.985)
+
+    def test_transparent_validation_uses_independent_uploaded_target(self):
+        self.make_rgba_dataset(control_count=0)
+        vae = self.project_root / 'klein-rgba-vae.safetensors'
+        vae.write_bytes(b'test')
+        stream = io.BytesIO()
+        rgba = Image.new('RGBA', (20, 16), (20, 40, 60, 0))
+        for x in range(5, 15):
+            for y in range(3, 13):
+                rgba.putpixel((x, y), (200, 80, 30, 255))
+        rgba.save(stream, format='PNG')
+        stream.seek(0)
+        uploaded = self.service.save_validation_image(FileStorage(
+            stream=stream,
+            filename='held-out-alpha.png',
+            content_type='image/png',
+        ))
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'flux2_klein_4b',
+            'vaePath': str(vae),
+            'validationEnabled': True,
+            'validationItems': [{
+                'targetPath': str(uploaded),
+                'mode': 'edit',
+                'prompt': 'Make the background transparent.',
+            }],
+        })
+
+        _name, _gpu, config, _inspections = self.service.build_job_config(payload)
+
+        item = config['config']['process'][0]['train']['validation_config']['validation_items'][0]
+        self.assertEqual(item['image_path'], str(uploaded))
+        self.assertEqual(item['rgba_control_mode'], 'edit')
+        self.assertIsNone(item['rgba_control_background_path'])
+        self.assertEqual(item['prompt'], 'Make the background transparent.')
+
+    def test_transparent_validation_rejects_constant_alpha_target(self):
+        self.make_rgba_dataset(control_count=0)
+        vae = self.project_root / 'klein-rgba-vae.safetensors'
+        vae.write_bytes(b'test')
+        payload = self.default_payload([{
+            'name': 'rgba',
+            'resolutions': [512],
+            'rgbaControlMode': 'generation',
+        }])
+        payload.update({
+            'trainingPreset': 'transparent_lora',
+            'model': 'flux2_klein_4b',
+            'vaePath': str(vae),
+            'validationEnabled': True,
+            'validationItems': [{'dataset': 'rgba', 'image': 'one.png'}],
+        })
+
+        with self.assertRaisesRegex(TrainerValidationError, 'visible and transparent'):
+            self.service.build_job_config(payload)
 
     def test_transparent_edit_mode_requires_an_opaque_background_dataset(self):
         self.make_rgba_dataset()

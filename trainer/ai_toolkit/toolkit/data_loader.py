@@ -704,9 +704,11 @@ def get_dataloader_from_datasets(
     for config in dataset_config_list:
 
         if config.type == 'image':
-            # dataset level batch_size overrides the train config batch_size when set
-            dataset_batch_size = config.batch_size if config.batch_size is not None else batch_size
-            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd)
+            # Qwen Dataset Manager exposes one training batch size.  Older saved
+            # jobs may still contain the former per-dataset default (usually 1),
+            # so the train-level value must remain authoritative here as well as
+            # in newly generated configs.
+            dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
             datasets.append(dataset)
             if config.buckets:
                 has_buckets = True
@@ -755,13 +757,8 @@ def get_dataloader_from_datasets(
             **dataloader_kwargs
         )
     else:
-        # without buckets the dataloader batches across all datasets at once,
-        # so a dataset level batch_size cannot apply
-        for config in dataset_config_list:
-            if config.batch_size is not None:
-                raise ValueError(
-                    f"Dataset level batch_size requires buckets to be enabled. Dataset {config.folder_path or config.dataset_path} has buckets disabled."
-                )
+        # Without buckets the dataloader batches across all datasets at once.
+        # Ignore legacy per-dataset values and use the authoritative train batch.
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=batch_size,
