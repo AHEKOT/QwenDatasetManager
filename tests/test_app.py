@@ -1,11 +1,16 @@
 import io
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
+# Importing the Flask module must not start a second queue worker against the
+# developer's real trainer database.
+os.environ['QDM_DISABLE_TRAINER_WORKER'] = '1'
 import app as manager
 
 
@@ -92,7 +97,10 @@ class DatasetManagerApiTests(unittest.TestCase):
         body = state.get_json()
         self.assertEqual(
             {model['key'] for model in body['models']},
-            {'qwen_image_edit_2511', 'flux2_klein_4b', 'flux2_klein_9b'},
+            {
+                'qwen_image_edit_2511', 'flux2_klein_4b', 'flux2_klein_9b',
+                'qdm_anime_keymatte_v3',
+            },
         )
         self.assertEqual(body['datasets'][0]['name'], 'demo')
         self.assertEqual(body['datasets'][0]['controls'][0]['name'], 'Control1')
@@ -213,6 +221,53 @@ class DatasetManagerApiTests(unittest.TestCase):
         self.assertEqual((target / 'img' / f'{new_stem}.txt').read_text(encoding='utf-8'), 'caption')
         self.assertTrue((target / 'Control1' / f'{new_stem}.jpg').is_file())
         self.assertTrue((target / 'Control2' / f'{new_stem}.webp').is_file())
+
+    def test_copy_from_training_dataset_is_allowed(self):
+        source = self.root / 'demo'
+        target = self.make_dataset('target')
+        self.save_image(source / 'img' / 'entry.png')
+        (source / 'img' / 'entry.txt').write_text('caption', encoding='utf-8')
+
+        with patch.object(manager.TRAINER_SERVICE, 'active_dataset_names', return_value={'demo'}):
+            response = self.client.post(
+                '/api/transfer/entry.png?folder=demo',
+                json={'targetFolder': 'target', 'operation': 'copy'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue((source / 'img' / 'entry.png').is_file())
+        copied_stem = Path(response.get_json()['newFilename']).stem
+        self.assertTrue((target / 'img' / f'{copied_stem}.png').is_file())
+
+    def test_copy_into_training_dataset_is_blocked(self):
+        source = self.root / 'demo'
+        self.make_dataset('target')
+        self.save_image(source / 'img' / 'entry.png')
+
+        with patch.object(manager.TRAINER_SERVICE, 'active_dataset_names', return_value={'target'}):
+            response = self.client.post(
+                '/api/transfer/entry.png?folder=demo',
+                json={'targetFolder': 'target', 'operation': 'copy'}
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()['datasets'], ['target'])
+        self.assertTrue((source / 'img' / 'entry.png').is_file())
+
+    def test_transfer_from_training_dataset_remains_blocked(self):
+        source = self.root / 'demo'
+        self.make_dataset('target')
+        self.save_image(source / 'img' / 'entry.png')
+
+        with patch.object(manager.TRAINER_SERVICE, 'active_dataset_names', return_value={'demo'}):
+            response = self.client.post(
+                '/api/transfer/entry.png?folder=demo',
+                json={'targetFolder': 'target', 'operation': 'transfer'}
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()['datasets'], ['demo'])
+        self.assertTrue((source / 'img' / 'entry.png').is_file())
 
     def test_transfer_rejects_unknown_operation(self):
         self.make_dataset('target')

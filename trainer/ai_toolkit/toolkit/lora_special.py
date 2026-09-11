@@ -174,11 +174,10 @@ def _dequantize_if_needed(t):
 
 class FullModule(ToolkitModuleMixin, torch.nn.Module):
     """
-    Full weight "lora" for layers that have no sensible low rank decomposition (norm layers, embeddings,
+    Full parameter "lora" for layers that have no sensible low rank decomposition (norm layers, embeddings,
     stray biases, etc). It does not have an up/down projection. It holds a trainable delta that is added to
-    the original weight (and bias) of the wrapped module. On save it emits `<name>.diff` (and `<name>.diff_b`
-    for bias) which ComfyUI applies as `weight += strength * diff`, so it merges directly into the model
-    weights without any extra adapter.
+    the selected parameter (``weight`` by default) and optional bias. On save it emits `<name>.diff` (and
+    `<name>.diff_b` for bias), so it merges directly into the model without an extra adapter.
 
     If the wrapped module's weight is torchao-quantized, the delta is kept in full precision and the original
     weight is dequantized on the fly in the forward pass (the original quantized tensor is left untouched).
@@ -190,6 +189,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             org_module: torch.nn.Module,
             multiplier=1.0,
             network: 'LoRASpecialNetwork' = None,
+            parameter_name: str = 'weight',
             **kwargs
     ):
         self.can_merge_in = True
@@ -200,6 +200,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         self.org_module = [org_module]
         self.orig_module_ref = weakref.ref(org_module)
         self.multiplier: Union[float, List[float]] = multiplier
+        self.parameter_name = parameter_name
         # these are unused for full modules but the mixin/forward path expects them to exist
         self.dropout = None
         self.rank_dropout = None
@@ -208,12 +209,14 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
 
         # trainable delta, zero initialized so an untrained layer is a no-op (zero diff)
         # dequantize first so the delta is full precision and shaped like the real (unpacked) weight
-        org_weight = org_module.weight  # single access: dequantizes on OstrisLinear
-        self.weight_is_quantized = _is_quantized_tensor(org_weight)
-        ref_weight = _dequantize_if_needed(org_weight)
-        self.diff = torch.nn.Parameter(torch.zeros_like(ref_weight))
+        org_parameter = getattr(org_module, parameter_name)
+        self.weight_is_quantized = (
+            parameter_name == 'weight' and _is_quantized_tensor(org_parameter)
+        )
+        ref_parameter = _dequantize_if_needed(org_parameter)
+        self.diff = torch.nn.Parameter(torch.zeros_like(ref_parameter))
         # some modules (e.g. Embedding) have no bias attribute at all
-        org_bias = getattr(org_module, 'bias', None)
+        org_bias = getattr(org_module, 'bias', None) if parameter_name == 'weight' else None
         if org_bias is not None:
             self.diff_b = torch.nn.Parameter(torch.zeros_like(org_bias))
         else:
@@ -234,7 +237,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # weight space application can't be done per sample, so use the mean (same as the DoRA path)
         mult = multiplier.mean() if isinstance(multiplier, torch.Tensor) else multiplier
 
-        orig_weight = om._parameters['weight']
+        orig_weight = om._parameters[self.parameter_name]
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
@@ -247,13 +250,13 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
 
         # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
         # this keeps autograd flowing into our delta while supporting any layer type.
-        om._parameters['weight'] = eff_weight
+        om._parameters[self.parameter_name] = eff_weight
         if has_bias:
             om._parameters['bias'] = eff_bias
         try:
             out = self.org_forward(x, *args, **kwargs)
         finally:
-            om._parameters['weight'] = orig_weight
+            om._parameters[self.parameter_name] = orig_weight
             if has_bias:
                 om._parameters['bias'] = orig_bias
         return out
@@ -267,6 +270,13 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         if not self.diff.any() and (self.diff_b is None or not self.diff_b.any()):
             return
         om = self.org_module[0]
+        if self.parameter_name != 'weight':
+            parameter = om._parameters[self.parameter_name]
+            parameter.data = (
+                parameter.data.float()
+                + merge_weight * self.diff.float().to(parameter.device)
+            ).to(parameter.dtype)
+            return
         if getattr(om, "is_ostris_quantized", False):
             # fp32 dequant straight from the backend; the bf16 weight property
             # would resample the quant scales on every merge cycle

@@ -33,8 +33,12 @@ TRAINING_PRESETS = {
     'transparent_lora': 'Transparent RGBA LoRA',
     'qwen_rgba_vae': 'Qwen RGBA VAE',
     'flux2_rgba_vae': 'FLUX.2 Klein RGBA VAE',
+    'chromakey_tiny': 'QDM CleanMatte — Alpha First',
 }
 VAE_TRAINING_PRESETS = {'qwen_rgba_vae', 'flux2_rgba_vae'}
+CHROMAKEY_PRESET = 'chromakey_tiny'
+CHROMAKEY_MODEL_KEY = 'qdm_cleanmatte_v1'
+CHROMAKEY_RESOLUTION_OPTIONS = {256, 320, 384, 448, 512, 640, 768, 896, 1024}
 EDIT_MODELS = {
     'qwen_image_edit_2511': {
         'label': 'Qwen Image Edit 2511',
@@ -142,6 +146,7 @@ class TrainerService:
         self.output_dir = self.root / 'output'
         self.sample_images_dir = self.root / 'sample_images'
         self.validation_images_dir = self.root / 'validation_images'
+        self.chromakey_validation_images_dir = self.root / 'chromakey_validation_images'
         self.vendor_root = self.root / 'ai_toolkit'
         self.db_path = self.root / 'trainer.db'
         self.venv_python = (
@@ -154,8 +159,8 @@ class TrainerService:
         self.output_dir.mkdir(exist_ok=True)
         self.sample_images_dir.mkdir(exist_ok=True)
         self.validation_images_dir.mkdir(exist_ok=True)
+        self.chromakey_validation_images_dir.mkdir(exist_ok=True)
         self._init_db()
-        self._reconcile_jobs()
 
     @property
     def datasets_dir(self):
@@ -214,6 +219,7 @@ class TrainerService:
     def start_worker(self):
         if self._worker_started:
             return
+        self._reconcile_jobs()
         self._worker_started = True
         thread = threading.Thread(target=self._worker_loop, name='qdm-trainer-queue', daemon=True)
         thread.start()
@@ -232,6 +238,12 @@ class TrainerService:
             return False
         try:
             os.kill(int(pid), 0)
+            return True
+        except PermissionError:
+            # Signal 0 can require more rights than the caller has on Windows.
+            # Access denied proves that the process exists; treating it as dead
+            # corrupts a live trainer row when a lower-privilege process imports
+            # the application (for example, the test runner).
             return True
         except (OSError, ValueError):
             return False
@@ -287,11 +299,26 @@ class TrainerService:
                 ('Trainer dependencies are not installed. Run the CUDA trainer installer.', utc_now(), row['id'])
             )
             return
-        run_path = self.vendor_root / 'run.py'
+        config = json.loads(row['job_config'])
+        cleanmatte = config.get('config', {}).get('process', [{}])[0].get('type') == 'qdm_cleanmatte_trainer'
+        run_path = self.vendor_root / ('run_cleanmatte.py' if cleanmatte else 'run.py')
         if not run_path.is_file():
             connection.execute(
                 '''UPDATE "Job" SET status = 'error', info = ?, updated_at = ? WHERE id = ?''',
                 ('AI Toolkit backend is not installed in trainer/ai_toolkit.', utc_now(), row['id'])
+            )
+            return
+
+        # A stop/requeue race can leave the previous detached Windows runner
+        # alive even though the database row is queued again. Never launch a
+        # second writer into the same output directory. Restore the truthful
+        # runtime state so the existing process can finish or be stopped.
+        previous_pid = row['pid']
+        if previous_pid and self._pid_alive(previous_pid):
+            connection.execute(
+                '''UPDATE "Job" SET status = 'running', info = ?, updated_at = ?
+                   WHERE id = ?''',
+                (f'Trainer process {previous_pid} is already running', utc_now(), row['id'])
             )
             return
 
@@ -306,14 +333,18 @@ class TrainerService:
         job_dir.mkdir(parents=True, exist_ok=True)
         config_path = job_dir / '.job_config.json'
         config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
-        log_path = job_dir / 'log.txt'
-        if log_path.exists():
-            logs_dir = job_dir / 'logs'
-            logs_dir.mkdir(exist_ok=True)
-            suffix = 0
-            while (logs_dir / f'{suffix}_log.txt').exists():
-                suffix += 1
-            log_path.replace(logs_dir / f'{suffix}_log.txt')
+        # Windows does not permit renaming log.txt while an inherited stdout
+        # handle (or a log viewer) has it open. A unique file per launch avoids
+        # that lock entirely and also preserves every previous run.
+        logs_dir = job_dir / 'logs'
+        logs_dir.mkdir(exist_ok=True)
+        suffix = 0
+        while (logs_dir / f'{suffix}_log.txt').exists():
+            suffix += 1
+        log_path = logs_dir / f'{suffix}_log.txt'
+        (job_dir / '.active_log').write_text(
+            str(log_path.relative_to(job_dir)), encoding='utf-8'
+        )
 
         environment = os.environ.copy()
         environment.update({
@@ -326,6 +357,16 @@ class TrainerService:
         hf_token = self.get_setting('HF_TOKEN') or os.environ.get('HF_TOKEN', '')
         if hf_token:
             environment['HF_TOKEN'] = hf_token
+
+        # Claim the database row before the child is allowed to start writing
+        # progress.  Previously Popen happened first, so a fast child could
+        # publish "Loading model" and then have that useful status overwritten
+        # by our later "Starting trainer..." update.
+        connection.execute(
+            '''UPDATE "Job" SET status = 'running', stop = 0, pid = NULL,
+               info = 'Starting trainer...', updated_at = ? WHERE id = ?''',
+            (utc_now(), row['id'])
+        )
 
         log_handle = open(log_path, 'a', encoding='utf-8')
         kwargs = {
@@ -356,8 +397,7 @@ class TrainerService:
 
         (job_dir / 'pid.txt').write_text(str(process.pid), encoding='utf-8')
         connection.execute(
-            '''UPDATE "Job" SET status = 'running', stop = 0, pid = ?,
-               info = 'Starting trainer...', updated_at = ? WHERE id = ?''',
+            '''UPDATE "Job" SET pid = ?, updated_at = ? WHERE id = ?''',
             (process.pid, utc_now(), row['id'])
         )
 
@@ -436,18 +476,11 @@ class TrainerService:
         dataset_dir = self._resolve_dataset(name)
         target_files = self._image_files(dataset_dir / 'img')
         target_stems = {path.stem for path in target_files}
-        alpha_count = 0
-        opaque_background_count = 0
-        unreadable_alpha = []
-        for path in target_files:
-            try:
-                with Image.open(path) as image:
-                    if 'A' in image.getbands() or 'transparency' in image.info:
-                        alpha_count += 1
-                    else:
-                        opaque_background_count += 1
-            except OSError:
-                unreadable_alpha.append(path.name)
+        # Dataset inspection is deliberately metadata-only. Saving, opening,
+        # and queueing a job must never decode thousands of source images.
+        # PNG/WebP are treated as alpha-capable; actual pixels are consumed
+        # only by the trainer when a sample is requested.
+        alpha_count = sum(path.suffix.lower() in {'.png', '.webp'} for path in target_files)
         controls = []
         warnings = []
         for index in range(1, 4):
@@ -467,7 +500,11 @@ class TrainerService:
             })
             if missing:
                 warnings.append(f'Control{index}: {len(missing)} target files have no matching control')
-        caption_count = sum((dataset_dir / 'img' / f'{stem}.txt').is_file() for stem in target_stems)
+        caption_stems = {
+            path.stem for path in (dataset_dir / 'img').iterdir()
+            if path.is_file() and path.suffix.lower() == '.txt'
+        }
+        caption_count = len(target_stems & caption_stems)
         if not target_stems:
             warnings.append('Dataset has no target images')
         if not controls:
@@ -476,14 +513,14 @@ class TrainerService:
             warnings.append(f'{len(target_stems) - caption_count} target files have no caption')
         if target_files and alpha_count < len(target_files):
             warnings.append(f'{len(target_files) - alpha_count} target files have no alpha channel')
-        if unreadable_alpha:
-            warnings.append(f'{len(unreadable_alpha)} target files could not be inspected')
         return {
             'name': name,
             'targetPath': str(dataset_dir / 'img'),
             'targetCount': len(target_stems),
             'alphaCount': alpha_count,
-            'opaqueBackgroundCount': opaque_background_count,
+            'chromaImageCount': alpha_count,
+            'meaningfulAlphaCount': alpha_count,
+            'opaqueBackgroundCount': len(target_files),
             'captionCount': caption_count,
             'controls': controls,
             'warnings': warnings,
@@ -491,10 +528,11 @@ class TrainerService:
             'transparentValid': bool(target_stems and alpha_count == len(target_files)),
             'backgroundValid': bool(
                 target_files
-                and opaque_background_count == len(target_files)
-                and not unreadable_alpha
             ),
             'vaeValid': bool(len(target_files) >= 2 and alpha_count == len(target_files)),
+            'chromakeyValid': bool(
+                alpha_count >= 2
+            ),
         }
 
     @staticmethod
@@ -661,6 +699,40 @@ class TrainerService:
         if not isinstance(filename, str) or Path(filename).name != filename:
             raise TrainerValidationError('Invalid validation image filename')
         return self.resolve_validation_image(str(self.validation_images_dir / filename))
+
+    def save_chromakey_validation_image(self, upload):
+        original_name = Path(getattr(upload, 'filename', '') or '').name
+        extension = Path(original_name).suffix.lower()
+        if not original_name or extension not in IMAGE_EXTENSIONS:
+            raise TrainerValidationError('ChromaKey validation image must be PNG, JPG or WebP')
+        destination = self.chromakey_validation_images_dir / f'{uuid.uuid4().hex}{extension}'
+        try:
+            upload.save(destination)
+            with Image.open(destination) as image:
+                image.verify()
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink()
+            raise TrainerValidationError('Uploaded ChromaKey validation image is invalid') from exc
+        return destination.resolve()
+
+    def resolve_chromakey_validation_image(self, value):
+        if not isinstance(value, str) or not value.strip():
+            raise TrainerValidationError('Upload a ChromaKey validation image')
+        candidate = Path(value.strip()).resolve()
+        root = self.chromakey_validation_images_dir.resolve()
+        if candidate == root or root not in candidate.parents or not candidate.is_file():
+            raise TrainerValidationError('ChromaKey validation image is outside the upload directory')
+        if candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise TrainerValidationError('Unsupported ChromaKey validation image type')
+        return candidate
+
+    def chromakey_validation_image_preview(self, filename):
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise TrainerValidationError('Invalid ChromaKey validation image filename')
+        return self.resolve_chromakey_validation_image(
+            str(self.chromakey_validation_images_dir / filename)
+        )
 
     def _black_sample_control(self, width, height):
         width = clamp_number(width, 64, 4096, 1024, integer=True)
@@ -895,7 +967,10 @@ class TrainerService:
         if preset not in TRAINING_PRESETS:
             raise TrainerValidationError('Unsupported training preset')
         model_key = payload.get('model')
-        if model_key not in EDIT_MODELS:
+        if preset == CHROMAKEY_PRESET:
+            if model_key != CHROMAKEY_MODEL_KEY:
+                raise TrainerValidationError('Unsupported ChromaKey model')
+        elif model_key not in EDIT_MODELS:
             raise TrainerValidationError('Unsupported edit model')
         if preset == 'qwen_rgba_vae' and model_key != 'qwen_image_edit_2511':
             raise TrainerValidationError('Qwen RGBA VAE training requires the Qwen model family')
@@ -925,8 +1000,104 @@ class TrainerService:
                 raise TrainerValidationError(
                     f'RGBA VAE training needs at least two alpha-channel images: {dataset_name}'
                 )
+            if preset == CHROMAKEY_PRESET and not inspection['chromakeyValid']:
+                raise TrainerValidationError(
+                    f'ChromaKey training needs at least two RGBA images with meaningful alpha: {dataset_name}'
+                )
             inspections.append(inspection)
         return name, model_key, gpu_ids, inspections, preset
+
+    @staticmethod
+    def _normalize_chromakey_resolutions(values):
+        if not isinstance(values, list):
+            return [512]
+        normalized = []
+        for value in values:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed in CHROMAKEY_RESOLUTION_OPTIONS and parsed not in normalized:
+                normalized.append(parsed)
+        return sorted(normalized) or [512]
+
+    def _build_chromakey_config(self, payload, name, model_key, gpu_ids, inspections):
+        if payload.get('advancedProcess'):
+            raise TrainerValidationError('Advanced overrides are not supported for CleanMatte')
+        steps = clamp_number(payload.get('chromaSteps'), 1, 10_000_000, 50000, integer=True)
+        def number(key, low, high, default, integer=False):
+            return clamp_number(payload.get(key), low, high, default, integer=integer)
+        raw_validation = payload.get('chromaValidationItems', [])
+        if not isinstance(raw_validation, list) or len(raw_validation) > 100:
+            raise TrainerValidationError('CleanMatte validation images must be a list of at most 100 items')
+        validation = []
+        for item in raw_validation:
+            if not isinstance(item, dict):
+                raise TrainerValidationError('Invalid CleanMatte validation image')
+            path = self.resolve_chromakey_validation_image(item.get('path'))
+            validation.append({'path': str(path), 'name': str(item.get('name') or path.name)[:255]})
+        augmentation = {
+            f'{colour}_chance': number(f'chroma{colour.title()}Chance', 0, 100, default)
+            for colour, default in [('green', 70), ('blue', 30), ('white', 0), ('black', 0)]
+        }
+        if sum(augmentation.values()) <= 0:
+            raise TrainerValidationError('At least one background colour chance must be above zero')
+        augmentation.update({
+            'noise_strength': number('chromaNoiseStrength', 0, 0.1, 0.01),
+            'jpeg_chance': number('chromaJpegChance', 0, 100, 20),
+            'spill_chance': number('chromaSpillChance', 0, 100, 35),
+        })
+        dtype = str(payload.get('chromaDtype', 'bf16')).lower()
+        if dtype not in {'bf16', 'fp16', 'fp32'}:
+            raise TrainerValidationError('Unsupported CleanMatte compute dtype')
+        datasets = [{**submitted, 'name': inspection['name']}
+                    for submitted, inspection in zip(payload['datasets'], inspections)]
+        process = {
+            'type': 'qdm_cleanmatte_trainer',
+            'training_folder': str(self.output_dir),
+            'sqlite_db_path': str(self.db_path),
+            'device': 'cuda',
+            'architecture': {'id': CHROMAKEY_MODEL_KEY, 'input_channels': 3, 'output': 'alpha'},
+            'datasets': [{'folder_path': item['targetPath'], 'recursive': False} for item in inspections],
+            'train': {
+                'steps': steps,
+                'clean_steps': number('chromaCleanSteps', 0, steps, min(10000, steps//5), True),
+                'warmup_steps': number('chromaWarmupSteps', 0, steps, min(1000, steps//10), True),
+                'resolutions': self._normalize_chromakey_resolutions(payload.get('chromaResolutions')),
+                'batch_size': number('chromaBatchSize', 1, 64, 4, True),
+                'megapixels_per_batch': number('chromaMegapixelsPerBatch', 0.25, 16, 1),
+                'gradient_accumulation': number('chromaGradientAccumulation', 1, 64, 3, True),
+                'lr': number('chromaLearningRate', 1e-8, 0.1, 4e-4),
+                'max_grad_norm': number('chromaMaxGradNorm', 0.01, 100, 1),
+                'dtype': dtype,
+                'seed': number('chromaSeed', 0, 2**31-1, 42, True),
+                'analytic_percent': number('chromaAnalyticPercent', 0, 50, 20),
+                'detail_percent': number('chromaDetailCropPercent', 0, 100, 70),
+            },
+            'augmentation': augmentation,
+            'loss': {
+                'alpha': number('chromaLossAlpha', 0.01, 100, 5),
+                'classification': number('chromaLossClassification', 0.01, 100, 1),
+                'gradient': number('chromaLossGradient', 0, 100, 0.5),
+                'consistency': number('chromaLossConsistency', 0, 100, 0.25),
+            },
+            'save': {'every': number('chromaSaveEvery', 1, steps, min(500, steps), True)},
+            'validation': {
+                'every': number('chromaValidateEvery', 1, steps, min(250, steps), True),
+                'images': [item['path'] for item in validation],
+                'max_side': number('chromaValidationMaxSide', 256, 8192, 4096, True),
+                'crop_size': 512,
+            },
+        }
+        config = {
+            'job': 'extension', 'config': {'name': name, 'process': [process]},
+            'meta': {'name': '[name]', 'version': '1.0', 'qdm': {
+                'modelKey': model_key, 'trainingPreset': CHROMAKEY_PRESET, 'gpuIds': gpu_ids,
+                'datasets': datasets, 'validationImages': validation, 'form': copy.deepcopy(payload),
+                'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
+            }},
+        }
+        return name, gpu_ids, config, inspections
 
     def _build_rgba_vae_config(self, payload, name, model_key, gpu_ids, inspections, preset):
         if payload.get('advancedProcess'):
@@ -1072,6 +1243,10 @@ class TrainerService:
 
     def build_job_config(self, payload):
         name, model_key, gpu_ids, inspections, preset = self.validate_payload(payload)
+        if preset == CHROMAKEY_PRESET:
+            return self._build_chromakey_config(
+                payload, name, model_key, gpu_ids, inspections
+            )
         model = EDIT_MODELS[model_key]
         if preset in VAE_TRAINING_PRESETS:
             return self._build_rgba_vae_config(
@@ -1632,8 +1807,15 @@ class TrainerService:
                     'name': name,
                     'inspected': False,
                     'targetPath': str(self.datasets_dir / name / 'img'),
-                    'targetCount': None,
+                    # Directory enumeration is cheap and prevents a real,
+                    # large dataset from looking empty while the asynchronous
+                    # alpha inspection is still running.
+                    'targetCount': len(self._image_files(self.datasets_dir / name / 'img')),
                     'alphaCount': None,
+                    'chromaImageCount': sum(
+                        path.suffix.lower() in {'.png', '.webp'}
+                        for path in self._image_files(self.datasets_dir / name / 'img')
+                    ),
                     'captionCount': None,
                     'controls': [],
                     'warnings': [],
@@ -1658,6 +1840,21 @@ class TrainerService:
                 else self.default_flux2_klein_rgba_vae()
             )
             models.append(item)
+        models.append({
+            'key': CHROMAKEY_MODEL_KEY,
+            'label': 'QDM CleanMatte — Alpha First',
+            'kind': 'chromakey',
+            'modelPath': '',
+            'license': 'Project model',
+            'gated': False,
+            'gateUrl': None,
+            'defaultQtype': '',
+            'noiseScheduler': 'supervised',
+            'allowUnloadTextEncoder': False,
+            'accuracyRecoveryAdapters': {},
+            'defaultSampleLoraPath': '',
+            'defaultRgbaVaePath': '',
+        })
         return models
 
     def active_dataset_names(self):
@@ -1693,6 +1890,8 @@ class TrainerService:
                 ready = inspection['transparentValid']
             elif preset in VAE_TRAINING_PRESETS:
                 ready = inspection['vaeValid']
+            elif preset == CHROMAKEY_PRESET:
+                ready = inspection['chromakeyValid']
             if not ready:
                 raise TrainerValidationError(f"Dataset is not ready: {item['name']}")
             if preset == 'transparent_lora' and item.get('rgbaControlMode', 'edit') == 'edit':
@@ -1763,7 +1962,41 @@ class TrainerService:
 
     def job_log_path(self, job_id):
         row = self._get_job_row(job_id)
-        return self.output_dir / row['name'] / 'log.txt'
+        job_dir = (self.output_dir / row['name']).resolve()
+        pointer = job_dir / '.active_log'
+        if pointer.is_file():
+            try:
+                relative = Path(pointer.read_text(encoding='utf-8').strip())
+                candidate = (job_dir / relative).resolve()
+                if (
+                    candidate != job_dir
+                    and job_dir in candidate.parents
+                    and candidate.suffix.lower() == '.txt'
+                ):
+                    return candidate
+            except OSError:
+                pass
+        return job_dir / 'log.txt'
+
+    def job_model_artifact(self, job_id):
+        row = self._get_job_row(job_id)
+        job_dir = (self.output_dir / row['name']).resolve()
+        manifest_path = job_dir / 'artifacts.json'
+        if not manifest_path.is_file():
+            raise FileNotFoundError('This job has no exported model yet')
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TrainerValidationError('The model artifact manifest is invalid') from exc
+        filename = manifest.get('primary')
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise TrainerValidationError('The model artifact filename is invalid')
+        candidate = (job_dir / filename).resolve()
+        if job_dir not in candidate.parents or candidate.suffix.lower() != '.safetensors':
+            raise TrainerValidationError('The model artifact path is invalid')
+        if not candidate.is_file():
+            raise FileNotFoundError('The exported model file is missing')
+        return candidate
 
     def read_log(self, job_id, max_bytes=200_000):
         path = self.job_log_path(job_id)
@@ -1778,6 +2011,11 @@ class TrainerService:
     def validation_results(self, job_id):
         row = self._get_job_row(job_id)
         config = json.loads(row['job_config'])
+        if config.get('config', {}).get('process', [{}])[0].get('type') == 'qdm_cleanmatte_trainer':
+            result_path = self.output_dir / row['name'] / 'cleanmatte_validation.json'
+            if not result_path.is_file():
+                return {'step': None, 'passed': None, 'items': []}
+            return json.loads(result_path.read_text(encoding='utf-8'))
         metrics_path = (self.output_dir / row['name'] / 'loss_log.db').resolve()
         if not metrics_path.is_file():
             return {'step': None, 'passed': None, 'items': []}
@@ -1856,6 +2094,18 @@ class TrainerService:
 
     @staticmethod
     def _sample_file_info(path):
+        chroma_match = re.fullmatch(
+            r'chroma_(\d+)_([0-9]+)(?:_(sheet))?', path.stem
+        )
+        if chroma_match:
+            base_index = int(chroma_match.group(2))
+            return {
+                'name': path.name,
+                'step': int(chroma_match.group(1)),
+                'sampleIndex': base_index * 2 + (1 if chroma_match.group(3) else 0),
+                'size': path.stat().st_size,
+                'modifiedAt': datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+            }
         match = re.search(r'_(\d+)_([0-9]+)$', path.stem)
         return {
             'name': path.name,
@@ -1893,7 +2143,12 @@ class TrainerService:
         config = json.loads(row['job_config'])
         process = config.get('config', {}).get('process', [{}])[0]
         sample_config, sample_items = self._sample_items(process)
-        sample_count = max(len(sample_items), 1)
+        if process.get('type') in {'qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'}:
+            validation_images = process.get('validation', {}).get('images', [])
+            extra = 2 if process.get('type') == 'qdm_cleanmatte_trainer' else 0
+            sample_count = max((len(validation_images) + extra) * 2, 1)
+        else:
+            sample_count = max(len(sample_items), 1)
         files = []
         if samples_dir.is_dir():
             files = sorted(
@@ -1925,6 +2180,7 @@ class TrainerService:
             'samples': samples,
             'sampleCount': sample_count,
             'isVae': process.get('type') in {'qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'},
+            'isChroma': process.get('type') in {'qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'},
         }
 
     def resolve_job_sample(self, job_id, filename, thumbnail=False):
@@ -2059,6 +2315,7 @@ def create_trainer_blueprint(service: TrainerService):
                 'transparent_lora': 'transparentValid',
                 'qwen_rgba_vae': 'vaeValid',
                 'flux2_rgba_vae': 'vaeValid',
+                CHROMAKEY_PRESET: 'chromakeyValid',
             }.get(preset, 'valid')
             return jsonify({
                 'datasets': inspections,
@@ -2146,6 +2403,32 @@ def create_trainer_blueprint(service: TrainerService):
         except Exception as exc:
             return handle_error(exc)
 
+    @blueprint.post('/api/trainer/chromakey-validation-images')
+    def upload_trainer_chromakey_validation_image():
+        try:
+            upload = request.files.get('file')
+            if upload is None:
+                uploads = request.files.getlist('files')
+                upload = uploads[0] if uploads else None
+            if upload is None:
+                raise TrainerValidationError('Choose a ChromaKey validation image')
+            path = service.save_chromakey_validation_image(upload)
+            return jsonify({
+                'path': str(path),
+                'previewUrl': f'/api/trainer/chromakey-validation-images/{path.name}',
+            }), 201
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/chromakey-validation-images/<filename>')
+    def preview_trainer_chromakey_validation_image(filename):
+        try:
+            return send_file(
+                service.chromakey_validation_image_preview(filename), conditional=True
+            )
+        except Exception as exc:
+            return handle_error(exc)
+
     @blueprint.post('/api/trainer/jobs/<job_id>/clone')
     def clone_trainer_job(job_id):
         try:
@@ -2178,6 +2461,16 @@ def create_trainer_blueprint(service: TrainerService):
     def sample_trainer_job_now(job_id):
         try:
             return jsonify({'job': service.request_runtime_action(job_id, 'sample')})
+        except Exception as exc:
+            return handle_error(exc)
+
+    @blueprint.get('/api/trainer/jobs/<job_id>/model')
+    def download_trainer_job_model(job_id):
+        try:
+            path = service.job_model_artifact(job_id)
+            return send_file(
+                path, as_attachment=True, download_name=path.name, conditional=True
+            )
         except Exception as exc:
             return handle_error(exc)
 

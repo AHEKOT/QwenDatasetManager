@@ -8,6 +8,7 @@ from typing import Literal, Optional
 import threading
 import time
 import signal
+from datetime import datetime, timezone
 from toolkit.basic import flush
 from toolkit.print import print_acc
 
@@ -114,6 +115,11 @@ class DiffusionTrainer(SDTrainer):
         conn = sqlite3.connect(self.sqlite_db_path, timeout=30.0)
         conn.isolation_level = None  # Enable autocommit mode
         return conn
+
+    @staticmethod
+    def _updated_at():
+        """Timestamp every runtime write so API clients can observe progress."""
+        return datetime.now(timezone.utc).isoformat()
 
     def _retry_db_operation(self, operation_func, max_retries=3, base_delay=2.0):
         """Retry a database operation with exponential backoff on lock errors."""
@@ -253,9 +259,9 @@ class DiffusionTrainer(SDTrainer):
                         value_to_insert = str(value)
 
                     # Use parameterized query for both the column name and value
-                    update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
+                    update_query = f"UPDATE Job SET {key} = ?, updated_at = ? WHERE id = ?"
                     cursor.execute(
-                        update_query, (value_to_insert, self.job_id))
+                        update_query, (value_to_insert, self._updated_at(), self.job_id))
                 finally:
                     cursor.execute("COMMIT")
 
@@ -282,13 +288,13 @@ class DiffusionTrainer(SDTrainer):
                 try:
                     if info is not None:
                         cursor.execute(
-                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                            (status, info, self.job_id)
+                            "UPDATE Job SET status = ?, info = ?, updated_at = ? WHERE id = ?",
+                            (status, info, self._updated_at(), self.job_id)
                         )
                     else:
                         cursor.execute(
-                            "UPDATE Job SET status = ? WHERE id = ?",
-                            (status, self.job_id)
+                            "UPDATE Job SET status = ?, updated_at = ? WHERE id = ?",
+                            (status, self._updated_at(), self.job_id)
                         )
                 finally:
                     cursor.execute("COMMIT")

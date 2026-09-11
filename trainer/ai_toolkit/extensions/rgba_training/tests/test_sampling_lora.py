@@ -13,7 +13,7 @@ from toolkit.sampling_lora import (
     build_sampling_lora_network,
     validate_sampling_lora_path,
 )
-from toolkit.lora_special import LoRAModule
+from toolkit.lora_special import FullModule, LoRAModule
 
 
 class _QwenModel:
@@ -143,11 +143,12 @@ class SamplingLoRAMetadataTests(unittest.TestCase):
             }, str(path))
 
             self.assertEqual(validate_sampling_lora_path(str(path)), str(path.resolve()))
-            dims, alphas, native = _sampling_lora_metadata(_QwenModel(), str(path))
+            dims, alphas, full_modules, native = _sampling_lora_metadata(_QwenModel(), str(path))
 
             key = "transformer$$transformer_blocks$$0$$attn$$to_q"
             self.assertEqual(dims[key], 4)
             self.assertEqual(alphas[key], 2.0)
+            self.assertEqual(full_modules, set())
             self.assertTrue(native)
 
     def test_flux_peft_layout_is_normalized_to_native_transformer_name(self):
@@ -158,12 +159,79 @@ class SamplingLoRAMetadataTests(unittest.TestCase):
                 "diffusion_model.double_blocks.0.img_attn.qkv.lora_B.weight": torch.zeros(16, 8),
             }, str(path))
 
-            dims, alphas, native = _sampling_lora_metadata(_FluxModel(), str(path))
+            dims, alphas, full_modules, native = _sampling_lora_metadata(_FluxModel(), str(path))
 
             key = "transformer$$double_blocks$$0$$img_attn$$qkv"
             self.assertEqual(dims[key], 8)
             self.assertEqual(alphas[key], 8.0)
+            self.assertEqual(full_modules, set())
             self.assertFalse(native)
+
+    def test_flux_full_weight_diffs_are_attached_and_loaded(self):
+        class _ScaleRMSNorm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.ones(8))
+
+            def forward(self, value):
+                return value * self.scale
+
+        class _NormContainer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.key_norm = _ScaleRMSNorm()
+
+        class _Attention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv = torch.nn.Linear(8, 8, bias=False)
+                self.norm = _NormContainer()
+
+        class _Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.img_attn = _Attention()
+
+        class _Transformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.double_blocks = torch.nn.ModuleList([_Block()])
+
+        class _BuildableFluxModel(_FluxModel):
+            torch_dtype = torch.float32
+            target_lora_modules = ["_Transformer"]
+            use_old_lokr_format = False
+
+        transformer = _Transformer()
+        down = torch.randn(4, 8)
+        up = torch.randn(8, 4)
+        norm_diff = torch.randn(8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "klein_with_norm_diff.safetensors"
+            save_file({
+                "diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight": down,
+                "diffusion_model.double_blocks.0.img_attn.qkv.lora_B.weight": up,
+                "diffusion_model.double_blocks.0.img_attn.norm.key_norm.diff": norm_diff,
+            }, str(path))
+            network = build_sampling_lora_network(
+                base_model=_BuildableFluxModel(),
+                transformer=transformer,
+                lora_path=str(path),
+                device=torch.device("cpu"),
+                use_layer_offloading=False,
+            )
+
+        self.assertEqual(len(network.unet_loras), 2)
+        full_module = next(
+            module for module in network.unet_loras if isinstance(module, FullModule)
+        )
+        self.assertEqual(full_module.parameter_name, "scale")
+        torch.testing.assert_close(full_module.diff, norm_diff)
+        value = torch.ones(1, 8)
+        with network:
+            actual = transformer.double_blocks[0].img_attn.norm.key_norm(value)
+        torch.testing.assert_close(actual, value * (1 + norm_diff))
 
 
 if __name__ == "__main__":

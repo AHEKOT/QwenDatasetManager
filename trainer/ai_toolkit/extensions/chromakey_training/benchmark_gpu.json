@@ -1,0 +1,33 @@
+{
+  "architecture": "qdm_keymatte_v4",
+  "trained_checkpoint": null,
+  "device": "NVIDIA GeForce RTX 5070 Ti",
+  "torch": "2.13.0+cu130",
+  "threads": 4,
+  "tile": 512,
+  "parameters": 539519,
+  "fp16_weights_mib": 1.0290508270263672,
+  "measurements": [
+    {
+      "size": "1280x720",
+      "median_ms": 61.25770000016928,
+      "min_ms": 44.79510000010123,
+      "max_ms": 62.441000000035274,
+      "peak_cuda_allocated_mib": 84.11181640625
+    },
+    {
+      "size": "1920x1080",
+      "median_ms": 55.26610000015353,
+      "min_ms": 54.87420000008569,
+      "max_ms": 56.954399999995076,
+      "peak_cuda_allocated_mib": 87.9296875
+    },
+    {
+      "size": "3840x2160",
+      "median_ms": 177.99779999995735,
+      "min_ms": 176.34989999987738,
+      "max_ms": 191.5687999999136,
+      "peak_cuda_allocated_mib": 85.85546875
+    }
+  ]
+}

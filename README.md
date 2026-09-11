@@ -13,7 +13,7 @@ A local web application for managing, reviewing, editing, and transforming Qwen 
 - ✏️ **Editing** - Paint/crop images and edit captions with synchronized controls
 - 🤖 **Auto Caption** - Generate preview and full-dataset captions with local GGUF vision-language models through llama.cpp
 - 🗑️ **Recoverable Deletion** - Move complete image/control/caption sets into a hidden `.trash` folder
-- 🚀 **CUDA Trainer** - Train LoRAs for Qwen Image Edit 2511 and FLUX.2 Klein Base 4B/9B from one or more managed datasets
+- 🚀 **CUDA Trainer** - Train LoRAs, RGBA VAEs, and the compact alpha-first QDM CleanMatte chromakey model from managed datasets
 
 ## Dataset Structure
 
@@ -119,6 +119,7 @@ The trainer supports:
 - Qwen Image Edit 2511
 - FLUX.2 Klein Base 4B
 - FLUX.2 Klein Base 9B (gated model; requires Hugging Face access and is subject to the FLUX non-commercial license)
+- QDM CleanMatte (82,287 parameters; semantic classification and native alpha refinement)
 
 Each selected dataset is passed to AI Toolkit as a separate dataset entry: `img/` is the target and every present `Control1/`, `Control2/`, and `Control3/` folder is a control-image source. Jobs, queue state, progress, and logs are stored under `trainer/`; model checkpoints are written to `trainer/output/`.
 
@@ -128,12 +129,38 @@ places a random opaque image from its `img/` folder behind each RGBA target;
 Generation mode creates a black Control1. Transparent modes do not use the
 target dataset's paired Control folders.
 
+CleanMatte trains clean alpha from RGBA sources. A small semantic classifier
+and native-resolution refiner identify background, opaque foreground, and
+mixed edge pixels. RGB corruption is introduced after a clean training phase;
+there are no foreground-RGB or despill training losses. Exact pixel duplicates
+are grouped before the source holdout is selected. Crops retain native detail;
+full-object examples are letterboxed without distorting their aspect ratio.
+
+Create a **new CleanMatte job** in the trainer model selector. Existing
+ChromaKey weights and optimizer states cannot initialize this architecture.
+The queue uses an independent runner and does not import the legacy trainer.
+The best alpha model is exported as safetensors; the latest optimizer state is
+saved separately. Validation sheets are lossless PNG and display alpha with
+colour correction disabled. Quantitative metrics are measurements, not an
+automatic claim that real-world quality is ready.
+
+The root [`ComfyUI-QDM-ChromaKey`](ComfyUI-QDM-ChromaKey/README.md) package now
+registers **QDM Load CleanMatte** and **QDM CleanMatte (alpha first)**. Copy the
+new checkpoint into `ComfyUI/models/cleanmatte/`. Inference preserves source
+resolution, checks all native pixels in tiles, and supports CPU. Optional
+screen subtraction/despill operates on a fixed alpha and defaults to off.
+
+The [CleanMatte implementation and training guide](trainer/ai_toolkit/extensions/cleanmatte_training/README.md)
+records the architecture, clean-label contract, training settings, checks and
+remaining quality limitations.
+
 The training screen mirrors the AI Toolkit LoRA Trainer settings that apply to
 these three edit architectures: the complete transformer/text-encoder
 quantization lists (including Qwen 2511 ARA), LoRA and LoKr, validation,
 sampling, schedulers, EMA, regularization, compilation and layer offloading.
-Every job also has a live **Samples** tab (labelled **VAE Validation** for RGBA
-VAE training) with per-step grouping, prompt/seed metadata, full-size
+Every job also has a live **Samples** tab (labelled **VAE Validation** or
+**Chroma Validation** for those specialized modes) with per-step grouping,
+prompt/seed metadata, full-size
 navigation, control-image switching, deletion and ZIP download. The viewer is
 ported from the locally modified AI Toolkit UI and preserves transparent PNG
 previews over a checkerboard instead of flattening alpha.

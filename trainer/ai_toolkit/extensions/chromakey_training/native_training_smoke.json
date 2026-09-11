@@ -1,0 +1,25 @@
+{
+  "purpose": "real-source native crop training smoke; not trained quality",
+  "source_count": 2,
+  "shape": [
+    2,
+    3,
+    512,
+    512
+  ],
+  "data_seconds": 3.211506399999962,
+  "step_seconds": [
+    1.0095289999999295,
+    0.05755959999987681,
+    0.05630280000013954,
+    0.05561549999993076,
+    0.05619410000008429
+  ],
+  "peak_cuda_allocated_mib": 791.2294921875,
+  "final_loss": 4.565490245819092,
+  "optimized_data_seconds_per_2_sources": [
+    0.3859937999995964,
+    0.23669280000012805,
+    0.250099500000033
+  ]
+}

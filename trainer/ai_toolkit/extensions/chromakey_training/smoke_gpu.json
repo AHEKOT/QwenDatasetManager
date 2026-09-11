@@ -1,0 +1,30 @@
+{
+  "purpose": "synthetic overfit sanity check, not held-out quality",
+  "steps": 200,
+  "elapsed_seconds": 21.765991499999927,
+  "peak_cuda_allocated_mib": 478.53564453125,
+  "before": {
+    "alpha_mae": 0.5077570676803589,
+    "alpha_mse": 0.26221731305122375,
+    "edge_mae": 0.4950440526008606,
+    "thin_mae": 0.1170862466096878,
+    "holes_mae": 0.49506664276123047,
+    "foreground_mae": 0.04134433716535568,
+    "despill_mae": 0.10533754527568817,
+    "composite_mae": 0.254691481590271,
+    "edge_composite_mae": 0.25039172172546387,
+    "selection_score": 1.9706833362579346
+  },
+  "after": {
+    "alpha_mae": 0.023726271465420723,
+    "alpha_mse": 0.004848519805818796,
+    "edge_mae": 0.051709581166505814,
+    "thin_mae": 0.0535709410905838,
+    "holes_mae": 0.005232212133705616,
+    "foreground_mae": 0.016680514439940453,
+    "despill_mae": 0.030834946781396866,
+    "composite_mae": 0.016887133941054344,
+    "edge_composite_mae": 0.03429228812456131,
+    "selection_score": 0.1993662416934967
+  }
+}

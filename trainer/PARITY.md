@@ -17,7 +17,8 @@ upstream entries:
   `flux2_klein_9b_rgba` for transparent-target LoRA training;
 - `qwen_rgba_vae_trainer` for Qwen four-channel VAE compatibility training;
 - `flux2_rgba_vae_trainer` for the shared FLUX.2 Klein 4B/9B native z=32
-  four-channel VAE.
+  four-channel VAE;
+- `qdm_cleanmatte_trainer` for the independent alpha-first CleanMatte network.
 
 ## Forwarded settings
 
@@ -68,6 +69,24 @@ upstream entries:
   a checkerboard. VAE round-trip sheets use the same live Samples folder and
   are labelled “VAE Validation” in the job view.
 | Advanced editor | full process JSON override with model architecture, CUDA device and managed dataset paths locked to the selected QDM job |
+
+## Local neural chromakey behavior
+
+- `run_cleanmatte.py` runs the independent `extensions/cleanmatte_training/`
+  engine without loading diffusion or legacy chromakey processes.
+- The GUI and backend expose the same alpha-only objectives, clean-phase
+  duration, RGB corruption, native/full crop ratio, pixel budget, precision,
+  accumulation, background weights, checkpoint and validation cadence.
+- The portable `ComfyUI-QDM-ChromaKey/cleanmatte/` runtime contains 82,287
+  parameters. It predicts native three-class labels and alpha coverage.
+  It has no trainable RGB branch. Optional inference despill cannot alter alpha.
+- Source RGBA content is hashed and deduplicated before the 10% holdout split.
+  Dataset changes invalidate resume. Targets are not denoised or auto-keyed.
+- Latest resume state and best validation export are separate atomic files.
+  Queue stop/save/sample controls are supported. Alpha validation metrics
+  appear in the existing results view without a fabricated PASS status.
+- Legacy job artifacts are retained. New jobs and the current ComfyUI nodes
+  accept only the explicit `qdm_cleanmatte_v1` architecture.
 
 ## Deliberate model-scoped behavior
 

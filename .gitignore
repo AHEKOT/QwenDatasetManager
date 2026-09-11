@@ -10,3 +10,6 @@ __pycache__
 trainer/.venv/
 trainer/output/
 trainer/trainer.db*
+
+# Local model weights and runtimes
+/models/

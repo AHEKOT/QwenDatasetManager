@@ -38,6 +38,9 @@ adapters are not part of this trainer integration.
 - `jobs/__init__.py` imports only `BaseJob` and `ExtensionJob`.
 - `extensions/rgba_training/` adds opt-in transparent LoRA architectures and a
   Qwen RGBA VAE process without changing the standard model entries;
+- `extensions/cleanmatte_training/` and `run_cleanmatte.py` implement the
+  independent alpha-first CleanMatte trainer. Legacy chromakey files are
+  retained but are not used by new jobs; diffusion trainers are unchanged;
 - the dataloader can preserve RGBA targets, sanitize hidden matte RGB, resize
   alpha safely, and create edit/generation controls;
 - sampling-only LoRAs use AI Toolkit's native adapter hooks and are inactive
@@ -48,5 +51,6 @@ adapters are not part of this trainer integration.
 - upstream `info.py` and `version.py` are retained because the shared metadata
   module imports them during every model backend startup.
 
-Training math, dataloading, quantization, model loading, LoRA creation,
-checkpoint saving and sampling remain upstream implementations.
+Diffusion training math, dataloading, quantization, model loading, LoRA
+creation, checkpoint saving and sampling remain upstream implementations. The
+QDM RGBA and chromakey extensions are intentionally local implementations.

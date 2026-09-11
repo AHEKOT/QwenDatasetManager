@@ -252,6 +252,55 @@
                             <p class="trainer-help">There is no diffusion sampling. A fixed holdout is encoded and decoded as RGBA; READY requires consecutive passes for visible RGB, alpha, alpha edge, composites, finite values, IoU and opaque-latent compatibility. “Sample now” runs this validation.</p>
                         </section>
 
+                        <section class="trainer-card trainer-wide-card trainer-chromakey-only hidden">
+                            <div class="trainer-card-heading"><span>CleanMatte — Alpha First</span><span class="trainer-card-badge">RGB → Alpha</span></div>
+                            <p class="trainer-help">Train a new model from scratch. Clean alpha is the only prediction target: background, solid foreground and mixed edges are supervised separately. RGB corruption starts only after the minimum clean phase and a holdout alpha-quality check. Despill is an optional inference step and never changes alpha. Existing ChromaKey checkpoints are incompatible.</p>
+                            <div class="trainer-training-grid">
+                                <label class="trainer-field" for="trainer-chroma-batch-size"><span>Maximum batch</span><input id="trainer-chroma-batch-size" type="number" min="1" max="64" step="1" value="4"></label>
+                                <label class="trainer-field" for="trainer-chroma-megapixels"><span>Activation budget (MP)</span><input id="trainer-chroma-megapixels" type="number" min="0.25" max="16" step="0.25" value="1"></label>
+                                <label class="trainer-field" for="trainer-chroma-gradient-accumulation"><span>Gradient accumulation</span><input id="trainer-chroma-gradient-accumulation" type="number" min="1" max="64" step="1" value="3"></label>
+                                <label class="trainer-field" for="trainer-chroma-steps"><span>Training steps</span><input id="trainer-chroma-steps" type="number" min="1" max="10000000" step="1" value="50000"></label>
+                                <label class="trainer-field" for="trainer-chroma-clean-steps"><span>Minimum clean RGB steps</span><input id="trainer-chroma-clean-steps" type="number" min="0" max="10000000" step="1" value="10000"></label>
+                                <label class="trainer-field" for="trainer-chroma-warmup"><span>Warmup steps</span><input id="trainer-chroma-warmup" type="number" min="0" max="100000" step="1" value="1000"></label>
+                                <label class="trainer-field" for="trainer-chroma-learning-rate"><span>Learning rate</span><input id="trainer-chroma-learning-rate" type="number" min="1e-08" max="0.1" step="1e-05" value="0.0004"></label>
+                                <label class="trainer-field" for="trainer-chroma-max-grad"><span>Gradient clipping</span><input id="trainer-chroma-max-grad" type="number" min="0.01" max="100" step="0.1" value="1"></label>
+                                <label class="trainer-field" for="trainer-chroma-seed"><span>Seed</span><input id="trainer-chroma-seed" type="number" min="0" max="2147483647" step="1" value="42"></label>
+                                <label class="trainer-field" for="trainer-chroma-save-every"><span>Save every (steps)</span><input id="trainer-chroma-save-every" type="number" min="1" max="100000" step="1" value="500"></label>
+                                <label class="trainer-field" for="trainer-chroma-validate-every"><span>Validate every (steps)</span><input id="trainer-chroma-validate-every" type="number" min="1" max="100000" step="1" value="250"></label>
+                                <label class="trainer-field" for="trainer-chroma-validation-max-side"><span>Visual validation maximum side</span><input id="trainer-chroma-validation-max-side" type="number" min="256" max="8192" step="256" value="4096"></label>
+                                <label class="trainer-field" for="trainer-chroma-analytic-percent"><span>Clean geometric examples %</span><input id="trainer-chroma-analytic-percent" type="number" min="0" max="50" step="1" value="20"></label>
+                                <label class="trainer-field" for="trainer-chroma-detail-crop"><span>Native detail crops %</span><input id="trainer-chroma-detail-crop" type="number" min="0" max="100" step="1" value="70"></label>
+                                <label class="trainer-field" for="trainer-chroma-loss-alpha"><span>Alpha loss</span><input id="trainer-chroma-loss-alpha" type="number" min="0.01" max="100" step="0.1" value="5"></label>
+                                <label class="trainer-field" for="trainer-chroma-loss-classification"><span>Classification loss</span><input id="trainer-chroma-loss-classification" type="number" min="0.01" max="100" step="0.1" value="1"></label>
+                                <label class="trainer-field" for="trainer-chroma-loss-gradient"><span>Target edge loss</span><input id="trainer-chroma-loss-gradient" type="number" min="0" max="100" step="0.1" value="0.5"></label>
+                                <label class="trainer-field" for="trainer-chroma-loss-consistency"><span>Background consistency loss</span><input id="trainer-chroma-loss-consistency" type="number" min="0" max="100" step="0.05" value="0.25"></label>
+                                <label class="trainer-field" for="trainer-chroma-green-chance"><span>Green backgrounds %</span><input id="trainer-chroma-green-chance" type="number" min="0" max="100" step="1" value="70"></label>
+                                <label class="trainer-field" for="trainer-chroma-blue-chance"><span>Blue backgrounds %</span><input id="trainer-chroma-blue-chance" type="number" min="0" max="100" step="1" value="30"></label>
+                                <label class="trainer-field" for="trainer-chroma-white-chance"><span>White backgrounds %</span><input id="trainer-chroma-white-chance" type="number" min="0" max="100" step="1" value="0"></label>
+                                <label class="trainer-field" for="trainer-chroma-black-chance"><span>Black backgrounds %</span><input id="trainer-chroma-black-chance" type="number" min="0" max="100" step="1" value="0"></label>
+                                <label class="trainer-field" for="trainer-chroma-noise-strength"><span>RGB noise strength</span><input id="trainer-chroma-noise-strength" type="number" min="0" max="0.1" step="0.005" value="0.01"></label>
+                                <label class="trainer-field" for="trainer-chroma-jpeg"><span>JPEG corruption %</span><input id="trainer-chroma-jpeg" type="number" min="0" max="100" step="1" value="20"></label>
+                                <label class="trainer-field" for="trainer-chroma-spill-chance"><span>RGB spill corruption %</span><input id="trainer-chroma-spill-chance" type="number" min="0" max="100" step="1" value="35"></label>
+                                <label class="trainer-field" for="trainer-chroma-dtype"><span>Compute precision</span><select id="trainer-chroma-dtype"><option value="bf16">BF16</option><option value="fp16">FP16</option><option value="fp32">FP32</option></select></label>
+                            </div>
+                            <p class="trainer-help">Crop sizes. Native crops preserve the original pixel scale; full-object examples provide context.</p>
+                            <div id="trainer-chroma-resolutions" class="trainer-toggle-row">
+                                <label><input type="checkbox" value="256"> 256</label>
+                                <label><input type="checkbox" value="384"> 384</label>
+                                <label><input type="checkbox" value="512" checked> 512</label>
+                                <label><input type="checkbox" value="768"> 768</label>
+                                <label><input type="checkbox" value="1024"> 1024</label>
+
+                            </div>
+                            <p class="trainer-help">A content-deduplicated holdout evaluates alpha with despill disabled. Green/blue screens are the default. White and black backgrounds are opt-in; matching foreground colours may be ambiguous. Use clean RGBA labels; noisy source alpha is never automatically treated as a clean contour. Latest resumable state and best alpha model are saved separately.</p>
+                        </section>
+                        <section class="trainer-card trainer-wide-card trainer-chromakey-only hidden">
+                            <div class="trainer-card-heading"><span>Visual validation images</span><button id="trainer-chroma-add-validation-btn" class="trainer-btn trainer-btn-secondary" type="button">Upload images</button></div>
+                            <input id="trainer-chroma-validation-files" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+                            <p class="trainer-help">Real inputs are used only for visual validation. Preview sheets show input and alpha without despill. Quantitative checks use separate RGBA sources.</p>
+                            <div id="trainer-chroma-validation-items" class="trainer-repeat-list"></div>
+                        </section>
+
                         <section class="trainer-card trainer-wide-card trainer-datasets-section">
                             <div class="trainer-card-heading trainer-datasets-heading">
                                 <div><span>Datasets</span><small id="trainer-dataset-summary">Select one or more managed datasets</small></div>
@@ -367,6 +416,7 @@
                             <p id="trainer-detail-model">Model</p>
                         </div>
                         <div class="trainer-header-actions">
+                            <a id="trainer-download-model" class="trainer-btn trainer-btn-secondary hidden" href="#">Download model</a>
                             <button id="trainer-save-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Save now</button>
                             <button id="trainer-sample-now-btn" class="trainer-btn trainer-btn-secondary hidden" type="button">Sample now</button>
                             <button id="trainer-edit-job-btn" class="trainer-btn trainer-btn-secondary" type="button">Edit</button>

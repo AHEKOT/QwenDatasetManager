@@ -13,6 +13,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.lora_special import (
     CONV_MODULES,
     LINEAR_MODULES,
+    FullModule,
     LoRAModule,
     LoRASpecialNetwork,
 )
@@ -78,6 +79,7 @@ def _sampling_lora_metadata(base_model, path: str):
         converted_keys = _converted_key_map(base_model, keys)
         modules_dim: dict[str, int] = {}
         modules_alpha: dict[str, float] = {}
+        full_modules: set[str] = set()
         qwen_native_layout = False
 
         for source_key in keys:
@@ -91,6 +93,18 @@ def _sampling_lora_metadata(base_model, path: str):
                 qwen_native_layout = qwen_native_layout or module_path.startswith(
                     "transformer_blocks."
                 )
+            elif converted_key.endswith(".diff"):
+                module_path = converted_key.removesuffix(".diff")
+                if module_path.startswith("transformer_blocks."):
+                    module_path = "transformer." + module_path
+                full_modules.add(module_path.replace(".", "$$"))
+                continue
+            elif converted_key.endswith(".diff_b"):
+                module_path = converted_key.removesuffix(".diff_b")
+                if module_path.startswith("transformer_blocks."):
+                    module_path = "transformer." + module_path
+                full_modules.add(module_path.replace(".", "$$"))
+                continue
             else:
                 continue
 
@@ -108,7 +122,7 @@ def _sampling_lora_metadata(base_model, path: str):
 
     if not modules_dim:
         raise ValueError(f"Sampling LoRA contains no transformer modules: {path}")
-    return modules_dim, modules_alpha, qwen_native_layout
+    return modules_dim, modules_alpha, full_modules, qwen_native_layout
 
 
 def _build_direct_sampling_modules(
@@ -116,7 +130,8 @@ def _build_direct_sampling_modules(
     transformer: torch.nn.Module,
     modules_dim: dict[str, int],
     modules_alpha: dict[str, float],
-) -> list[LoRAModule]:
+    full_modules: set[str],
+) -> list[torch.nn.Module]:
     """Build only checkpoint-listed adapters without inspecting model weights.
 
     The generic training-network constructor recursively checks every child and
@@ -153,6 +168,39 @@ def _build_direct_sampling_modules(
             use_bias=False,
             initialize_weights=False,
         ))
+    for lora_name in sorted(full_modules):
+        module_path = lora_name.replace("$$", ".")
+        if module_path.startswith("transformer."):
+            module_path = module_path.removeprefix("transformer.")
+        original = model_modules.get(module_path)
+        if original is None:
+            missing.append(module_path)
+            continue
+        parameter_name = "weight"
+        if not isinstance(getattr(original, parameter_name, None), torch.nn.Parameter):
+            direct_parameters = [
+                name for name, _parameter in original.named_parameters(recurse=False)
+            ]
+            if len(direct_parameters) == 1:
+                parameter_name = direct_parameters[0]
+            else:
+                unsupported.append(
+                    f"{module_path} ({original.__class__.__name__}, "
+                    f"parameters={direct_parameters})"
+                )
+                continue
+        if not isinstance(getattr(original, parameter_name, None), torch.nn.Parameter):
+            unsupported.append(
+                f"{module_path} ({original.__class__.__name__}, no parameter)"
+            )
+            continue
+        loras.append(FullModule(
+            lora_name,
+            original,
+            multiplier=1.0,
+            network=network,
+            parameter_name=parameter_name,
+        ))
     if missing:
         preview = ", ".join(missing[:5])
         raise ValueError(f"Sampling LoRA modules are absent from the model: {preview}")
@@ -177,11 +225,12 @@ def build_sampling_lora_network(
     inactive outside the sampling context and never participates in training.
     """
     stage_started = time.perf_counter()
-    modules_dim, modules_alpha, qwen_native_layout = _sampling_lora_metadata(
+    modules_dim, modules_alpha, full_modules, qwen_native_layout = _sampling_lora_metadata(
         base_model, lora_path
     )
     print(
-        f"Sampling LoRA metadata: {len(modules_dim)} modules in "
+        f"Sampling LoRA metadata: {len(modules_dim)} low-rank and "
+        f"{len(full_modules)} full-weight modules in "
         f"{time.perf_counter() - stage_started:.2f}s"
     )
     first_name = next(iter(modules_dim))
@@ -215,6 +264,7 @@ def build_sampling_lora_network(
         transformer,
         modules_dim,
         modules_alpha,
+        full_modules,
     )
     print(
         f"Created sampling LoRA for U-Net: {len(network.unet_loras)} modules "

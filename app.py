@@ -94,7 +94,8 @@ AUTO_CAPTION_ENGINE = AutoCaptionEngine()
 
 TRAINER_SERVICE = TrainerService(BASE_DIR, lambda: DATASETS_DIR)
 app.register_blueprint(create_trainer_blueprint(TRAINER_SERVICE))
-TRAINER_SERVICE.start_worker()
+if os.environ.get('QDM_DISABLE_TRAINER_WORKER', '').lower() not in {'1', 'true', 'yes'}:
+    TRAINER_SERVICE.start_worker()
 
 
 class InvalidPathError(ValueError):
@@ -176,9 +177,17 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def claim_datasets(names, owner_id):
+def claim_datasets(names, owner_id, trainer_sensitive_names=None):
     normalized = sorted({validate_dataset_name(name) for name in names if name})
-    trainer_conflicts = sorted(set(normalized) & TRAINER_SERVICE.active_dataset_names())
+    if trainer_sensitive_names is None:
+        trainer_sensitive = normalized
+    else:
+        trainer_sensitive = {
+            validate_dataset_name(name)
+            for name in trainer_sensitive_names
+            if name
+        }
+    trainer_conflicts = sorted(set(trainer_sensitive) & TRAINER_SERVICE.active_dataset_names())
     if trainer_conflicts:
         return trainer_conflicts
     with ACTIVE_DATASETS_LOCK:
@@ -321,7 +330,15 @@ def protect_api_requests():
                     if isinstance(value, str) and value.strip():
                         names.append(value.strip())
             owner_id = f'request-{uuid.uuid4().hex}'
-            conflicts = claim_datasets(names, owner_id)
+            trainer_sensitive_names = None
+            if request.endpoint == 'transfer_image' and isinstance(body, dict):
+                if body.get('operation', 'transfer') == 'copy':
+                    # Copying only reads the source (and optional linked source).
+                    # Keep the short-lived request claim for local operation
+                    # serialization, but only treat the destination as a
+                    # training-sensitive mutation target.
+                    trainer_sensitive_names = [body.get('targetFolder')]
+            conflicts = claim_datasets(names, owner_id, trainer_sensitive_names)
             if conflicts:
                 return jsonify({
                     'error': 'Dataset is busy with another operation',

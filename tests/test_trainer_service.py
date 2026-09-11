@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from flask import Flask
 from PIL import Image
@@ -708,6 +709,48 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(stopped['status'], 'stopped')
         self.assertEqual(len(self.service.list_jobs()), 1)
 
+    def test_pid_access_denied_means_process_is_still_alive(self):
+        with patch('trainer_service.os.kill', side_effect=PermissionError):
+            self.assertTrue(self.service._pid_alive(1234))
+
+    def test_launch_claims_job_before_spawn_and_does_not_overwrite_child_progress(self):
+        self.make_dataset()
+        job, _inspections = self.service.create_job(self.default_payload())
+        self.service.queue_job(job['id'])
+        self.service.venv_python.parent.mkdir(parents=True, exist_ok=True)
+        self.service.venv_python.touch()
+        self.service.vendor_root.mkdir(parents=True, exist_ok=True)
+        (self.service.vendor_root / 'run.py').touch()
+
+        class FakeProcess:
+            pid = 4321
+
+        with self.service.connect() as connection:
+            row = connection.execute(
+                'SELECT * FROM Job WHERE id = ?', (job['id'],)
+            ).fetchone()
+
+            def fake_popen(*_args, **_kwargs):
+                claimed = connection.execute(
+                    'SELECT status, info FROM Job WHERE id = ?', (job['id'],)
+                ).fetchone()
+                self.assertEqual((claimed['status'], claimed['info']), (
+                    'running', 'Starting trainer...'
+                ))
+                # Simulate the child publishing useful progress immediately.
+                connection.execute(
+                    "UPDATE Job SET info = 'Loading model' WHERE id = ?", (job['id'],)
+                )
+                return FakeProcess()
+
+            with patch('trainer_service.subprocess.Popen', side_effect=fake_popen):
+                self.service._launch_job(connection, row)
+
+        launched = self.service.get_job(job['id'])
+        self.assertEqual(launched['status'], 'running')
+        self.assertEqual(launched['pid'], 4321)
+        self.assertEqual(launched['info'], 'Loading model')
+
     def test_running_job_accepts_save_and_sample_requests(self):
         self.make_dataset()
         job, _inspections = self.service.create_job(self.default_payload())
@@ -1212,6 +1255,124 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(process['train']['steps'], 600)
         self.assertEqual(config['meta']['qdm']['trainingPreset'], 'flux2_rgba_vae')
         self.assertTrue(inspections[0]['vaeValid'])
+
+    def test_chromakey_preset_builds_independent_neural_extension_config(self):
+        root = self.make_rgba_dataset()
+        validation = Image.new('RGB', (37, 19), (0, 220, 20))
+        buffer = io.BytesIO()
+        validation.save(buffer, format='PNG')
+        buffer.seek(0)
+        path = self.service.save_chromakey_validation_image(
+            FileStorage(stream=buffer, filename='real-key.png', content_type='image/png')
+        )
+        payload = {
+            'name': 'anime_keymatte_v1',
+            'gpuIds': '0',
+            'trainingPreset': 'chromakey_tiny',
+            'model': 'qdm_cleanmatte_v1',
+            'datasets': [{'name': 'rgba'}],
+            'chromaResolutions': [384, 512, 768],
+            'chromaBatchSize': 32,
+            'chromaMegapixelsPerBatch': 8,
+            'chromaSteps': 900,
+            'chromaGreenChance': 55,
+            'chromaBlueChance': 25,
+            'chromaWhiteChance': 10,
+            'chromaBlackChance': 10,
+            'chromaDirtChance': 60,
+            'chromaSpillChance': 50,
+            'chromaValidationItems': [{'path': str(path), 'name': 'real-key.png'}],
+        }
+
+        _name, _gpu, config, inspections = self.service.build_job_config(payload)
+
+        process = config['config']['process'][0]
+        self.assertEqual(config['job'], 'extension')
+        self.assertEqual(process['type'], 'qdm_cleanmatte_trainer')
+        self.assertEqual(process['architecture']['input_channels'], 3)
+        self.assertEqual(process['architecture']['id'], 'qdm_cleanmatte_v1')
+        self.assertEqual(process['train']['gradient_accumulation'], 3)
+        self.assertEqual(set(process['loss']), {'alpha', 'classification', 'gradient', 'consistency'})
+        self.assertEqual(process['loss']['alpha'], 5)
+        self.assertEqual(process['architecture']['output'], 'alpha')
+        self.assertNotIn('foreground', process['loss'])
+        self.assertNotIn('despill', process['loss'])
+        self.assertNotIn('model', process)
+        self.assertNotIn('control_path', process['datasets'][0])
+        self.assertEqual(process['datasets'][0]['folder_path'], str((root / 'img').resolve()))
+        self.assertEqual(process['train']['resolutions'], [384, 512, 768])
+        self.assertEqual(process['train']['batch_size'], 32)
+        self.assertEqual(process['train']['megapixels_per_batch'], 8)
+        self.assertEqual(process['augmentation']['green_chance'], 55)
+        self.assertEqual(process['augmentation']['spill_chance'], 50)
+        self.assertEqual(process['validation']['images'], [str(path)])
+        self.assertTrue(inspections[0]['chromakeyValid'])
+
+    def test_chromakey_mode_is_in_real_model_selector_and_has_dedicated_gui(self):
+        models = self.service.model_options()
+        chroma = next(item for item in models if item['key'] == 'qdm_cleanmatte_v1')
+        self.assertEqual(chroma['kind'], 'chromakey')
+        javascript = (Path(__file__).parents[1] / 'static' / 'trainer.js').read_text(encoding='utf-8')
+        markup = (Path(__file__).parents[1] / 'static' / 'trainer.html').read_text(encoding='utf-8')
+        self.assertIn("trainingChoiceValue('chromakey_tiny', chroma.key)", javascript)
+        for element_id in (
+            'trainer-chroma-resolutions', 'trainer-chroma-batch-size',
+            'trainer-chroma-green-chance', 'trainer-chroma-clean-steps',
+            'trainer-chroma-spill-chance', 'trainer-chroma-validation-files',
+        ):
+            self.assertIn(f'id="{element_id}"', markup)
+
+    def test_cleanmatte_queue_uses_independent_runner(self):
+        self.make_rgba_dataset()
+        job, _ = self.service.create_job({
+            'name': 'cleanmatte_queue', 'gpuIds': '0', 'trainingPreset': 'chromakey_tiny',
+            'model': 'qdm_cleanmatte_v1', 'datasets': [{'name': 'rgba'}],
+        })
+        self.service.queue_job(job['id'])
+        self.service.venv_python.parent.mkdir(parents=True, exist_ok=True)
+        self.service.venv_python.touch()
+        self.service.vendor_root.mkdir(parents=True, exist_ok=True)
+        (self.service.vendor_root / 'run_cleanmatte.py').touch()
+        with self.service.connect() as connection:
+            row = connection.execute('SELECT * FROM Job WHERE id = ?', (job['id'],)).fetchone()
+            with patch('trainer_service.subprocess.Popen') as popen:
+                popen.return_value.pid = 123456
+                self.service._launch_job(connection, row)
+            self.assertEqual(Path(popen.call_args.args[0][2]).name, 'run_cleanmatte.py')
+        result_path = self.service.output_dir / job['name'] / 'cleanmatte_validation.json'
+        result_path.write_text(json.dumps({'step': 7, 'passed': None, 'items': [
+            {'name': 'native alpha', 'metrics': {'hole_leak': 0.1}}
+        ]}), encoding='utf-8')
+        result = self.service.validation_results(job['id'])
+        self.assertIsNone(result['passed'])
+        self.assertEqual(result['items'][0]['metrics']['hole_leak'], 0.1)
+
+    def test_cleanmatte_defaults_prioritize_chroma_and_reject_disabled_alpha_losses(self):
+        self.make_rgba_dataset()
+        payload = {'name': 'clean_defaults', 'gpuIds': '0', 'trainingPreset': 'chromakey_tiny',
+                   'model': 'qdm_cleanmatte_v1', 'datasets': [{'name': 'rgba'}],
+                   'chromaLossAlpha': 0, 'chromaLossClassification': 0,
+                   'chromaLossDespill': 100, 'chromaLossForeground': 100}
+        _, _, config, _ = self.service.build_job_config(payload)
+        process = config['config']['process'][0]
+        self.assertEqual(process['augmentation']['white_chance'], 0)
+        self.assertEqual(process['augmentation']['black_chance'], 0)
+        self.assertGreater(process['loss']['alpha'], 0)
+        self.assertGreater(process['loss']['classification'], 0)
+        self.assertNotIn('despill', process['loss'])
+        self.assertNotIn('foreground', process['loss'])
+
+    def test_chromakey_validation_outputs_share_step_and_have_distinct_indices(self):
+        cutout = self.project_root / 'chroma_000000250_3.png'
+        sheet = self.project_root / 'chroma_000000250_3_sheet.jpg'
+        cutout.write_bytes(b'cutout')
+        sheet.write_bytes(b'sheet')
+
+        cutout_info = self.service._sample_file_info(cutout)
+        sheet_info = self.service._sample_file_info(sheet)
+
+        self.assertEqual((cutout_info['step'], cutout_info['sampleIndex']), (250, 6))
+        self.assertEqual((sheet_info['step'], sheet_info['sampleIndex']), (250, 7))
 
 
 if __name__ == '__main__':

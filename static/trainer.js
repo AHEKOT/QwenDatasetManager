@@ -38,6 +38,7 @@
         selectedDatasets: [],
         samples: [],
         validationItems: [],
+        chromaValidationItems: [],
         selectedJobId: null,
         editingJobId: null,
         initialViewChosen: false,
@@ -139,6 +140,7 @@
     }
 
     const isVaePreset = preset => preset === 'qwen_rgba_vae' || preset === 'flux2_rgba_vae';
+    const isChromaPreset = preset => preset === 'chromakey_tiny';
 
     function setTrainingChoice(modelKey, preset = 'standard_lora') {
         const select = $('trainer-model');
@@ -166,10 +168,11 @@
     function renderModelOptions() {
         const modelSelect = $('trainer-model');
         const previous = selectedTrainingChoice();
-        const standardOptions = state.models.map(model =>
+        const editModels = state.models.filter(model => model.kind !== 'chromakey');
+        const standardOptions = editModels.map(model =>
             `<option value="${escapeHtml(trainingChoiceValue('standard_lora', model.key))}">${escapeHtml(model.label)}</option>`
         ).join('');
-        const transparentOptions = state.models.map(model =>
+        const transparentOptions = editModels.map(model =>
             `<option value="${escapeHtml(trainingChoiceValue('transparent_lora', model.key))}">${escapeHtml(model.label)} — Transparent RGBA LoRA</option>`
         ).join('');
         const qwen = state.models.find(model => model.key === 'qwen_image_edit_2511');
@@ -180,12 +183,17 @@
         const flux2VaeOption = klein
             ? `<option value="${escapeHtml(trainingChoiceValue('flux2_rgba_vae', klein.key))}">FLUX.2 Klein 4B / 9B — Train RGBA VAE</option>`
             : '';
+        const chroma = state.models.find(model => model.kind === 'chromakey');
+        const chromaOption = chroma
+            ? `<option value="${escapeHtml(trainingChoiceValue('chromakey_tiny', chroma.key))}">${escapeHtml(chroma.label)} — Clean alpha + native detail</option>`
+            : '';
         modelSelect.innerHTML = [
             `<optgroup label="Standard edit LoRA">${standardOptions}</optgroup>`,
             `<optgroup label="Transparent RGBA LoRA">${transparentOptions}</optgroup>`,
             (qwenVaeOption || flux2VaeOption)
                 ? `<optgroup label="VAE training">${qwenVaeOption}${flux2VaeOption}</optgroup>`
                 : '',
+            chromaOption ? `<optgroup label="Specialized models">${chromaOption}</optgroup>` : '',
         ].join('');
         setTrainingChoice(previous.modelKey, previous.preset);
         renderModelFields();
@@ -224,9 +232,10 @@
         const preset = selectedPreset();
         $('trainer-preset').value = preset;
         const isVae = isVaePreset(preset);
+        const isChroma = isChromaPreset(preset);
         const isTransparent = preset === 'transparent_lora';
         document.querySelectorAll('.trainer-lora-only').forEach(element =>
-            element.classList.toggle('hidden', isVae)
+            element.classList.toggle('hidden', isVae || isChroma)
         );
         document.querySelectorAll('.trainer-transparent-only').forEach(element =>
             element.classList.toggle('hidden', !isTransparent)
@@ -234,28 +243,40 @@
         document.querySelectorAll('.trainer-vae-only').forEach(element =>
             element.classList.toggle('hidden', !isVae)
         );
-        if (isVae) {
+        document.querySelectorAll('.trainer-chromakey-only').forEach(element =>
+            element.classList.toggle('hidden', !isChroma)
+        );
+        if (isVae || isChroma) {
             $('trainer-use-advanced-config').checked = false;
-            setVaeSourceDefaults(false);
+            if (isVae) setVaeSourceDefaults(false);
         }
-        $('trainer-editor-title').textContent = isVae
+        $('trainer-editor-title').textContent = isChroma
+            ? 'Configure CleanMatte alpha training'
+            : isVae
             ? (preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
             : (isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
-        $('trainer-editor-description').textContent = isVae
+        $('trainer-editor-description').textContent = isChroma
+            ? 'RGBA targets are composited onto configurable synthetic backgrounds without changing their aspect ratio. The model receives RGB only.'
+            : isVae
             ? 'RGBA targets are mapped from each selected dataset; captions and Control folders are not used.'
             : (isTransparent
                 ? 'Each dataset independently uses Edit with random real backgrounds or Generation with a black Control1.'
                 : 'Target images and Control1–3 are mapped directly from the selected datasets.');
         renderDatasetPicker();
         renderSelectedDatasets();
+        renderChromaValidationItems();
     }
 
     function renderModelFields(resetPath = false, resetAssets = false) {
         const model = selectedModel();
         if (!model) return;
-        if (resetPath || !$('trainer-model-path').value) $('trainer-model-path').value = model.modelPath;
         $('trainer-model-license').textContent = model.license;
         $('trainer-model-license').title = model.gated ? 'Gated Hugging Face model' : model.license;
+        if (model.kind === 'chromakey') {
+            $('trainer-model-gate').classList.add('hidden');
+            return;
+        }
+        if (resetPath || !$('trainer-model-path').value) $('trainer-model-path').value = model.modelPath;
         $('trainer-model-gate').classList.toggle('hidden', !model.gateUrl);
         $('trainer-model-gate').href = model.gateUrl || '#';
         $('trainer-noise-scheduler').value = model.noiseScheduler === 'flowmatch' ? 'FlowMatch' : model.noiseScheduler;
@@ -348,7 +369,9 @@
         const previous = select.value;
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
         const preset = selectedPreset();
-        const validityKey = preset === 'transparent_lora' ? 'transparentValid' : (isVaePreset(preset) ? 'vaeValid' : 'valid');
+        const validityKey = preset === 'transparent_lora'
+            ? 'transparentValid'
+            : (isVaePreset(preset) ? 'vaeValid' : (isChromaPreset(preset) ? 'chromakeyValid' : 'valid'));
         select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
             const ready = !dataset.inspected || Boolean(dataset[validityKey]);
             const details = dataset.inspected
@@ -372,7 +395,16 @@
                 renderDatasetPicker();
                 if (state.selectedDatasets.some(dataset => dataset.name === name)) renderSelectedDatasets();
             })
-            .catch(() => { /* retain the lightweight entry; save validation remains authoritative */ })
+            .catch(error => {
+                const index = state.datasets.findIndex(dataset => dataset.name === name);
+                if (index >= 0) {
+                    state.datasets[index] = {
+                        ...state.datasets[index],
+                        inspectionError: error.message || 'Dataset inspection failed',
+                    };
+                }
+                if (state.selectedDatasets.some(dataset => dataset.name === name)) renderSelectedDatasets();
+            })
             .finally(() => datasetInspectionRequests.delete(name));
         datasetInspectionRequests.set(name, requestValue);
         await requestValue;
@@ -464,7 +496,12 @@
             if (!selectedNames.has(item.dataset)) item.dataset = fallbackName;
         });
         if (!state.selectedDatasets.length) {
-            container.innerHTML = `<div class="trainer-empty-datasets"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg><strong>No datasets selected</strong><span>${selectedPreset() === 'transparent_lora' ? 'Choose an RGBA target dataset, then configure its mode and background source.' : 'Choose a dataset above. Target and control folders will be mapped automatically.'}</span></div>`;
+            const emptyHelp = selectedPreset() === 'transparent_lora'
+                ? 'Choose an RGBA target dataset, then configure its mode and background source.'
+                : (isChromaPreset(selectedPreset())
+                    ? 'Choose one or more RGBA datasets. Captions and Control folders are ignored.'
+                    : 'Choose a dataset above. Target and control folders will be mapped automatically.');
+            container.innerHTML = `<div class="trainer-empty-datasets"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg><strong>No datasets selected</strong><span>${emptyHelp}</span></div>`;
             $('trainer-dataset-summary').textContent = 'Select one or more managed datasets';
             renderDatasetPicker();
             renderSamples();
@@ -485,12 +522,18 @@
             };
             const metric = value => value === null ? '—' : value;
             const preset = selectedPreset();
-            const controls = preset === 'transparent_lora'
+            const controls = preset === 'transparent_lora' || isChromaPreset(preset)
                 ? '<span>Paired controls ignored</span>'
                 : dataset.controls.map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
-            const relevantWarnings = dataset.warnings.filter(warning =>
-                preset === 'standard_lora' || !warning.includes('no control images')
-            );
+            const inspectionWarnings = dataset.inspectionError
+                ? [`Inspection failed: ${dataset.inspectionError}`]
+                : [];
+            const relevantWarnings = [...dataset.warnings, ...inspectionWarnings].filter(warning => {
+                if (isChromaPreset(preset)) {
+                    return !warning.includes('no control images') && !warning.includes('no caption');
+                }
+                return preset === 'standard_lora' || !warning.includes('no control images');
+            });
             const warnings = relevantWarnings.length ? `<div class="trainer-dataset-warning">${escapeHtml(relevantWarnings.join(' · '))}</div>` : '';
             const rgbaMode = preset === 'transparent_lora'
                 ? `<section class="trainer-rgba-settings">
@@ -503,7 +546,9 @@
                         : `<div class="trainer-rgba-mode-note"><strong>Generation mode · alpha residual only</strong><span>The PNG supplies only its alpha mask and edges. RGB content is preserved from the frozen base model, caption dropout is disabled, and Control1 is solid black.</span></div>`}
                 </section>`
                 : '';
-            const datasetSettings = isVaePreset(preset)
+            const datasetSettings = isChromaPreset(preset)
+                ? `<div class="trainer-dataset-settings"><p class="trainer-help">All top-level PNG/WebP files participate in aspect-preserving neural matting training. No pixel pre-analysis, square resize, captions, prompts or Control folders are used.</p></div>`
+                : isVaePreset(preset)
                 ? `<div class="trainer-dataset-settings">
                     <div class="trainer-toggle-row trainer-resolution-row">
                         <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
@@ -525,17 +570,20 @@
                         <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}><span></span>Flip Y</label>
                     </div>
                 </div>`;
+            const datasetMetrics = isChromaPreset(preset)
+                ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.chromaImageCount ?? dataset.targetCount)}</strong><span>PNG/WebP images</span></div></div>`
+                : `<div class="trainer-dataset-metrics">
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.targetCount)}</strong><span>targets</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.captionCount)}</strong><span>captions</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(dataset.alphaCount)}</strong><span>alpha</span></div>
+                </div>`;
             return `<article class="trainer-dataset-card" data-dataset-card="${index}">
                 <div class="trainer-dataset-title">
                     <strong title="${escapeHtml(dataset.name)}">${escapeHtml(dataset.name)}</strong>
                     <span title="${escapeHtml(dataset.targetPath)}">…/Datasets/${escapeHtml(dataset.name)}/img</span>
                     <div class="trainer-dataset-paths"><span>Target · ${metric(dataset.targetCount)}</span>${controls}</div>
                 </div>
-                <div class="trainer-dataset-metrics">
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.targetCount)}</strong><span>targets</span></div>
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.captionCount)}</strong><span>captions</span></div>
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.alphaCount)}</strong><span>alpha</span></div>
-                </div>
+                ${datasetMetrics}
                 ${datasetSettings}
                 <div class="trainer-dataset-actions">
                     <button class="trainer-icon-btn" type="button" data-duplicate-dataset="${index}" aria-label="Duplicate ${escapeHtml(dataset.name)}" title="Duplicate dataset"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg></button>
@@ -782,6 +830,52 @@
         requestValue.send(body);
     }
 
+    function chromaValidationPreview(path) {
+        const filename = String(path || '').split(/[\\/]/).pop();
+        return filename ? `/api/trainer/chromakey-validation-images/${encodeURIComponent(filename)}` : '';
+    }
+
+    function renderChromaValidationItems() {
+        const container = $('trainer-chroma-validation-items');
+        if (!container) return;
+        if (!state.chromaValidationItems.length) {
+            container.innerHTML = '<div class="trainer-empty-datasets"><strong>No visual validation images</strong><span>Upload real chroma-background inputs to generate periodic RGB / cutout / alpha previews.</span></div>';
+            return;
+        }
+        container.innerHTML = state.chromaValidationItems.map((item, index) => `
+            <article class="trainer-repeat-card">
+                <div class="trainer-repeat-card-heading"><strong>${escapeHtml(item.name || `Validation image ${index + 1}`)}</strong><button class="trainer-icon-btn" type="button" data-remove-chroma-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+                <div class="trainer-validation-item-editor"><div class="trainer-sample-image-slot has-image"><img src="${escapeHtml(chromaValidationPreview(item.path))}" alt="${escapeHtml(item.name || 'ChromaKey validation image')}"></div><p class="trainer-help">Inference-only; never used for gradients.</p></div>
+            </article>`).join('');
+    }
+
+    async function uploadChromaValidationFiles(files) {
+        for (const file of files) {
+            const body = new FormData();
+            body.append('files', file);
+            try {
+                const response = await fetch('/api/trainer/chromakey-validation-images', { method: 'POST', body });
+                const result = await response.json();
+                if (!response.ok || !result.path) throw new Error(result.error || `Upload failed (${response.status})`);
+                state.chromaValidationItems.push({ path: result.path, name: file.name });
+                renderChromaValidationItems();
+            } catch (error) {
+                showToast(error.message, true);
+            }
+        }
+    }
+
+    function selectedChromaResolutions() {
+        return Array.from(document.querySelectorAll('#trainer-chroma-resolutions input:checked')).map(input => Number(input.value));
+    }
+
+    function setChromaResolutions(values) {
+        const selected = new Set((values || []).map(Number));
+        document.querySelectorAll('#trainer-chroma-resolutions input').forEach(input => {
+            input.checked = selected.has(Number(input.value));
+        });
+    }
+
     function updateRepeatedItem(input, collection, indexKey, fieldKey) {
         const item = collection[Number(input.dataset[indexKey])];
         if (!item) return;
@@ -908,6 +1002,34 @@
             vaeGradientCheckpointing: checked('trainer-vae-gradient-checkpointing'),
             vaeStopWhenReady: checked('trainer-vae-stop-ready'),
             vaeComfyExport: checked('trainer-vae-comfy-export'),
+            chromaBatchSize: numberValue('trainer-chroma-batch-size'),
+            chromaMegapixelsPerBatch: numberValue('trainer-chroma-megapixels'),
+            chromaGradientAccumulation: numberValue('trainer-chroma-gradient-accumulation'),
+            chromaSteps: numberValue('trainer-chroma-steps'),
+            chromaCleanSteps: numberValue('trainer-chroma-clean-steps'),
+            chromaWarmupSteps: numberValue('trainer-chroma-warmup'),
+            chromaLearningRate: numberValue('trainer-chroma-learning-rate'),
+            chromaMaxGradNorm: numberValue('trainer-chroma-max-grad'),
+            chromaSeed: numberValue('trainer-chroma-seed'),
+            chromaSaveEvery: numberValue('trainer-chroma-save-every'),
+            chromaValidateEvery: numberValue('trainer-chroma-validate-every'),
+            chromaValidationMaxSide: numberValue('trainer-chroma-validation-max-side'),
+            chromaAnalyticPercent: numberValue('trainer-chroma-analytic-percent'),
+            chromaDetailCropPercent: numberValue('trainer-chroma-detail-crop'),
+            chromaLossAlpha: numberValue('trainer-chroma-loss-alpha'),
+            chromaLossClassification: numberValue('trainer-chroma-loss-classification'),
+            chromaLossGradient: numberValue('trainer-chroma-loss-gradient'),
+            chromaLossConsistency: numberValue('trainer-chroma-loss-consistency'),
+            chromaGreenChance: numberValue('trainer-chroma-green-chance'),
+            chromaBlueChance: numberValue('trainer-chroma-blue-chance'),
+            chromaWhiteChance: numberValue('trainer-chroma-white-chance'),
+            chromaBlackChance: numberValue('trainer-chroma-black-chance'),
+            chromaNoiseStrength: numberValue('trainer-chroma-noise-strength'),
+            chromaJpegChance: numberValue('trainer-chroma-jpeg'),
+            chromaSpillChance: numberValue('trainer-chroma-spill-chance'),
+            chromaDtype: $('trainer-chroma-dtype').value,
+            chromaResolutions: selectedChromaResolutions(),
+            chromaValidationItems: state.chromaValidationItems.map(item => ({ ...item })),
         };
         if (includeAdvanced && checked('trainer-use-advanced-config') && $('trainer-advanced-config-json').value.trim()) {
             payload.advancedProcess = $('trainer-advanced-config-json').value.trim();
@@ -918,7 +1040,7 @@
     function validateForm(payload) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(payload.name)) return 'Training name must use letters, numbers, dots, underscores or hyphens.';
         if (isVaePreset(payload.trainingPreset) && !payload.sourceVaePath) return 'Enter the standard VAE repository or local source path.';
-        if (!isVaePreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
+        if (!isVaePreset(payload.trainingPreset) && !isChromaPreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
         if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
         if (payload.trainingPreset === 'transparent_lora') {
@@ -927,10 +1049,12 @@
             );
             if (missingBackground) return `Select a background dataset for ${missingBackground.name}.`;
         }
-        const noResolutions = isVaePreset(payload.trainingPreset) ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
+        if (isChromaPreset(payload.trainingPreset) && !payload.chromaResolutions.length) return 'Select at least one ChromaKey training resolution.';
+        if (isChromaPreset(payload.trainingPreset) && payload.chromaGreenChance + payload.chromaBlueChance + payload.chromaWhiteChance + payload.chromaBlackChance <= 0) return 'Set at least one background colour chance above zero.';
+        const noResolutions = (isVaePreset(payload.trainingPreset) || isChromaPreset(payload.trainingPreset)) ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
-        if (!payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
-        if (!payload.disableSampling) {
+        if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
+        if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling) {
             const sampleWithoutImage = payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
             if (sampleWithoutImage) return 'Add at least one image to edit for every sample.';
             const sampleWithoutInstruction = payload.samples.find(sample => [1, 2, 3].some(index => sampleControlPath(sample, index)) && !String(sample.prompt || '').trim());
@@ -959,11 +1083,23 @@
             const url = state.editingJobId ? `/api/trainer/jobs/${state.editingJobId}` : '/api/trainer/jobs';
             const method = state.editingJobId ? 'PUT' : 'POST';
             const result = await api(url, { method, body: JSON.stringify(payload) });
-            state.selectedJobId = result.job.id;
+            let savedJob = result.job;
+            (result.datasets || []).forEach(dataset => {
+                const inspected = { ...dataset, inspected: true };
+                const index = state.datasets.findIndex(item => item.name === dataset.name);
+                if (index >= 0) state.datasets[index] = inspected;
+                else state.datasets.push(inspected);
+            });
+            if (queueAfter) {
+                const queued = await api(`/api/trainer/jobs/${savedJob.id}/start`, { method: 'POST' });
+                savedJob = queued.job || savedJob;
+            }
+            const existingIndex = state.jobs.findIndex(job => job.id === savedJob.id);
+            if (existingIndex >= 0) state.jobs[existingIndex] = savedJob;
+            else state.jobs.unshift(savedJob);
+            state.selectedJobId = savedJob.id;
             state.editingJobId = null;
-            if (queueAfter) await api(`/api/trainer/jobs/${result.job.id}/start`, { method: 'POST' });
-            await refreshState();
-            showDetail(result.job.id);
+            showDetail(savedJob.id);
             showToast(queueAfter ? 'Job saved and added to the queue.' : 'Training job saved.');
         } catch (errorValue) {
             showFormError(errorValue.message);
@@ -1006,6 +1142,32 @@
             vaeResolution: 512, vaeTrainScope: 'full', vaeDtype: 'bf16', vaeAlphaLrMultiplier: 10,
             vaeWorkers: 2, vaeMaxGradNorm: 1, vaeValidateEvery: 250, vaeValidationMaxImages: 32,
             vaeRequiredPasses: 2, vaeGradientCheckpointing: true, vaeStopWhenReady: false, vaeComfyExport: true,
+            chromaBatchSize: 4,
+            chromaMegapixelsPerBatch: 1,
+            chromaGradientAccumulation: 3,
+            chromaSteps: 50000,
+            chromaCleanSteps: 10000,
+            chromaWarmupSteps: 1000,
+            chromaLearningRate: 0.0004,
+            chromaMaxGradNorm: 1,
+            chromaSeed: 42,
+            chromaSaveEvery: 500,
+            chromaValidateEvery: 250,
+            chromaValidationMaxSide: 4096,
+            chromaAnalyticPercent: 20,
+            chromaDetailCropPercent: 70,
+            chromaLossAlpha: 5,
+            chromaLossClassification: 1,
+            chromaLossGradient: 0.5,
+            chromaLossConsistency: 0.25,
+            chromaGreenChance: 70,
+            chromaBlueChance: 30,
+            chromaWhiteChance: 0,
+            chromaBlackChance: 0,
+            chromaNoiseStrength: 0.01,
+            chromaJpegChance: 20,
+            chromaSpillChance: 35,
+            chromaDtype: 'bf16', chromaResolutions: [512], chromaValidationItems: [],
         };
         const data = { ...defaults, ...payload };
         setInput('trainer-name', data.name);
@@ -1094,6 +1256,36 @@
         setInput('trainer-vae-gradient-checkpointing', data.vaeGradientCheckpointing);
         setInput('trainer-vae-stop-ready', data.vaeStopWhenReady);
         setInput('trainer-vae-comfy-export', data.vaeComfyExport);
+        const chromaInputs = {
+            'trainer-chroma-batch-size': data.chromaBatchSize,
+            'trainer-chroma-megapixels': data.chromaMegapixelsPerBatch,
+            'trainer-chroma-gradient-accumulation': data.chromaGradientAccumulation,
+            'trainer-chroma-steps': data.chromaSteps,
+            'trainer-chroma-clean-steps': data.chromaCleanSteps,
+            'trainer-chroma-warmup': data.chromaWarmupSteps,
+            'trainer-chroma-learning-rate': data.chromaLearningRate,
+            'trainer-chroma-max-grad': data.chromaMaxGradNorm,
+            'trainer-chroma-seed': data.chromaSeed,
+            'trainer-chroma-save-every': data.chromaSaveEvery,
+            'trainer-chroma-validate-every': data.chromaValidateEvery,
+            'trainer-chroma-validation-max-side': data.chromaValidationMaxSide,
+            'trainer-chroma-analytic-percent': data.chromaAnalyticPercent,
+            'trainer-chroma-detail-crop': data.chromaDetailCropPercent,
+            'trainer-chroma-loss-alpha': data.chromaLossAlpha,
+            'trainer-chroma-loss-classification': data.chromaLossClassification,
+            'trainer-chroma-loss-gradient': data.chromaLossGradient,
+            'trainer-chroma-loss-consistency': data.chromaLossConsistency,
+            'trainer-chroma-green-chance': data.chromaGreenChance,
+            'trainer-chroma-blue-chance': data.chromaBlueChance,
+            'trainer-chroma-white-chance': data.chromaWhiteChance,
+            'trainer-chroma-black-chance': data.chromaBlackChance,
+            'trainer-chroma-noise-strength': data.chromaNoiseStrength,
+            'trainer-chroma-jpeg': data.chromaJpegChance,
+            'trainer-chroma-spill-chance': data.chromaSpillChance,
+            'trainer-chroma-dtype': data.chromaDtype,
+        };
+        Object.entries(chromaInputs).forEach(([id, value]) => setInput(id, value));
+        setChromaResolutions(data.chromaResolutions);
         setInput('trainer-layer-offloading', data.layerOffloading);
         setInput('trainer-transformer-offload', Number(data.transformerOffload) * 100);
         setInput('trainer-text-offload', Number(data.textEncoderOffload) * 100);
@@ -1106,7 +1298,9 @@
         (data.datasets || []).forEach(dataset => addDataset(dataset.name, dataset, true));
         state.samples = (data.samples || []).map(sample => ({ ...sample }));
         state.validationItems = (data.validationItems || []).map(item => ({ ...item }));
+        state.chromaValidationItems = (data.chromaValidationItems || []).map(item => ({ ...item }));
         renderSelectedDatasets();
+        renderChromaValidationItems();
         renderConditionalOptions();
         renderPresetFields();
     }
@@ -1335,6 +1529,7 @@
         const process = job.config.config.process[0];
         const model = state.models.find(item => item.key === job.form?.model);
         const isVae = ['qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'].includes(process.type);
+        const isChroma = ['qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'].includes(process.type);
         const isFlux2Vae = process.type === 'flux2_rgba_vae_trainer';
         const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
         const modelLabel = isVae
@@ -1342,8 +1537,8 @@
             : (model?.label || process.model?.arch || 'Edit model');
         $('trainer-detail-name').textContent = job.name;
         $('trainer-detail-model').textContent = presetLabel || modelLabel;
-        $('trainer-samples-tab').textContent = isVae ? 'VAE Validation' : 'Samples';
-        $('trainer-samples-heading').textContent = isVae ? 'VAE validation images' : 'Training samples';
+        $('trainer-samples-tab').textContent = isVae ? 'VAE Validation' : (isChroma ? 'Chroma Validation' : 'Samples');
+        $('trainer-samples-heading').textContent = isVae ? 'VAE validation images' : (isChroma ? 'Neural ChromaKey validation previews' : 'Training samples');
         $('trainer-detail-kicker').textContent = job.status === 'running' ? 'Active training job' : 'Training job';
         $('trainer-detail-status').textContent = job.status;
         $('trainer-detail-status').dataset.status = job.status;
@@ -1353,7 +1548,16 @@
         $('trainer-detail-step').textContent = `${job.step || 0} / ${job.total_steps || process.train.steps} steps`;
         $('trainer-detail-speed').textContent = job.speed_string || 'Waiting';
         $('trainer-detail-gpu').textContent = `GPU ${job.gpu_ids}`;
-        const detailItems = isVae ? [
+        const detailItems = isChroma ? [
+            ['Model', process.architecture?.id === 'qdm_cleanmatte_v1' ? 'QDM CleanMatte' : (process.architecture?.id || 'Legacy KeyMatte')],
+            ['Datasets', (job.datasets || []).join(', ')],
+            ['Resolution areas', process.train.resolutions.join(', ')],
+            ['Maximum batch', process.train.batch_size],
+            ['Pixel budget', `${process.train.megapixels_per_batch} MP`],
+            ['Learning rate', process.train.lr],
+            ['Validation', `${process.validation.images.length} images · every ${process.validation.every} steps`],
+            ['Export', 'Safetensors + resumable trainer state'],
+        ] : isVae ? [
             ['Preset', isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE'],
             ['Datasets', (job.datasets || []).join(', ')],
             ['Scope', process.train.scope],
@@ -1377,9 +1581,11 @@
         const running = job.status === 'running';
         $('trainer-stop-job-btn').classList.toggle('hidden', !active);
         $('trainer-save-now-btn').classList.toggle('hidden', !running);
-        $('trainer-sample-now-btn').classList.toggle('hidden', !running || (!isVae && process.train.disable_sampling));
-        $('trainer-sample-now-btn').textContent = isVae ? 'Validate now' : 'Sample now';
+        $('trainer-sample-now-btn').classList.toggle('hidden', !running || (!isVae && !isChroma && process.train.disable_sampling));
+        $('trainer-sample-now-btn').textContent = (isVae || isChroma) ? 'Validate now' : 'Sample now';
         $('trainer-start-job-btn').classList.toggle('hidden', active);
+        $('trainer-download-model').classList.toggle('hidden', !isChroma || !(job.step > 0) || running);
+        $('trainer-download-model').href = `/api/trainer/jobs/${encodeURIComponent(job.id)}/model`;
         $('trainer-edit-job-btn').disabled = active;
         $('trainer-delete-job-btn').disabled = active;
         $('trainer-download-log').href = `/api/trainer/jobs/${job.id}/log/download`;
@@ -1517,15 +1723,16 @@
             return;
         }
         section.classList.remove('hidden');
-        const overall = result.passed ? 'PASS' : 'FAIL';
+        const measuredOnly = result.passed == null;
+        const overall = measuredOnly ? 'ALPHA METRICS — REVIEW REQUIRED' : (result.passed ? 'PASS' : 'FAIL');
         $('trainer-validation-results-summary').textContent = `Step ${Number(result.step).toLocaleString()} · overall ${overall}`;
         $('trainer-validation-results-items').innerHTML = result.items.map(item => {
             const passed = Boolean(item.passed);
-            const details = item.failedChecks === 'none'
+            const details = measuredOnly ? 'Measured with despill disabled. Inspect clean contours and native details.' : item.failedChecks === 'none'
                 ? 'All strict alpha thresholds passed.'
                 : (item.failedChecks || 'Validation result is incomplete.');
-            return `<article class="trainer-validation-result ${passed ? 'is-pass' : 'is-fail'}">
-                <div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><b>${passed ? 'PASS' : 'FAIL'}</b></div>
+            return `<article class="trainer-validation-result ${measuredOnly ? '' : (passed ? 'is-pass' : 'is-fail')}">
+                <div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><b>${measuredOnly ? 'MEASURED' : (passed ? 'PASS' : 'FAIL')}</b></div>
                 <p>${escapeHtml(details)}</p>
             </article>`;
         }).join('');
@@ -1579,7 +1786,7 @@
         if (!job) return;
         try {
             await api(`/api/trainer/jobs/${job.id}/${action}`, { method: 'POST' });
-            await refreshState();
+            await refreshJobsOnly();
             renderDetail(currentJob());
             showToast(action === 'start' ? 'Job added to the queue.' : 'Stop requested.');
         } catch (error) { showToast(error.message, true); }
@@ -1872,6 +2079,20 @@
             const file = event.dataTransfer?.files?.[0];
             const input = slot.querySelector('[data-validation-file]');
             if (file && input) uploadValidationImage(input, file);
+        });
+        $('trainer-chroma-add-validation-btn').addEventListener('click', () => {
+            $('trainer-chroma-validation-files').click();
+        });
+        $('trainer-chroma-validation-files').addEventListener('change', event => {
+            const files = Array.from(event.target.files || []);
+            if (files.length) uploadChromaValidationFiles(files);
+            event.target.value = '';
+        });
+        $('trainer-chroma-validation-items').addEventListener('click', event => {
+            const removeButton = event.target.closest('[data-remove-chroma-validation]');
+            if (!removeButton) return;
+            state.chromaValidationItems.splice(Number(removeButton.dataset.removeChromaValidation), 1);
+            renderChromaValidationItems();
         });
         form.addEventListener('submit', event => { event.preventDefault(); saveJob(false); });
         $('trainer-save-start-btn').addEventListener('click', () => saveJob(true));
