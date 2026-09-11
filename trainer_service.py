@@ -24,18 +24,21 @@ from pathlib import Path
 
 from flask import Blueprint, jsonify, request, send_file
 from PIL import Image
+from trainer_h3 import H3_KEYS, H3_ARCHES, H3_SOURCE_COMMIT, local_h3_defaults, VIDEO_EXTENSIONS, h3_models, with_h3_defaults, configure_h3, frame_count, validate_h3_process
 
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 ACTIVE_STATUSES = {'queued', 'running', 'stopping'}
 TRAINING_PRESETS = {
     'standard_lora': 'Standard edit LoRA',
     'transparent_lora': 'Transparent RGBA LoRA',
     'qwen_rgba_vae': 'Qwen RGBA VAE',
     'flux2_rgba_vae': 'FLUX.2 Klein RGBA VAE',
+    'h3_rgba_vae': 'MiniMax H3 RGBA VAE',
     'chromakey_tiny': 'QDM CleanMatte — Alpha First',
 }
-VAE_TRAINING_PRESETS = {'qwen_rgba_vae', 'flux2_rgba_vae'}
+VAE_TRAINING_PRESETS = {'qwen_rgba_vae', 'flux2_rgba_vae', 'h3_rgba_vae'}
 CHROMAKEY_PRESET = 'chromakey_tiny'
 CHROMAKEY_MODEL_KEY = 'qdm_cleanmatte_v1'
 CHROMAKEY_RESOLUTION_OPTIONS = {256, 320, 384, 448, 512, 640, 768, 896, 1024}
@@ -82,6 +85,7 @@ EDIT_MODELS = {
         'accuracyRecoveryAdapters': {},
     },
 }
+EDIT_MODELS.update(h3_models())
 DEFAULT_TURBO_LORA_FILENAMES = {
     'qwen_image_edit_2511': 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors',
     'flux2_klein_4b': 'klein4b_turbo_r128.safetensors',
@@ -155,6 +159,7 @@ class TrainerService:
         self._db_lock = threading.RLock()
         self._worker_started = False
         self._stop_event = threading.Event()
+        self._processes = {}
         self.root.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self.sample_images_dir.mkdir(exist_ok=True)
@@ -233,11 +238,53 @@ class TrainerService:
                 print(f'[Trainer] Queue worker error: {exc}')
 
     @staticmethod
-    def _pid_alive(pid):
+    def _windows_pid_alive(pid):
+        # A terminated process can retain its PID while another handle is open.
+        # Signal 0 does not reliably distinguish that state on Windows.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: PID does not exist
+                return False
+            if error == 5:  # Access denied: do not discard a possibly live runner
+                return True
+            raise ctypes.WinError(error)
+        try:
+            result = kernel.WaitForSingleObject(handle, 0)
+            if result == 0:  # WAIT_OBJECT_0: process has exited
+                return False
+            if result == 258:  # WAIT_TIMEOUT: still running
+                return True
+            raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.CloseHandle(handle)
+
+    def _pid_alive(self, pid):
         if not pid:
             return False
         try:
-            os.kill(int(pid), 0)
+            pid = int(pid)
+            if pid <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        process = self._processes.get(pid)
+        if process is not None:
+            return process.poll() is None
+        if os.name == 'nt':
+            return self._windows_pid_alive(pid)
+        try:
+            os.kill(pid, 0)
             return True
         except PermissionError:
             # Signal 0 can require more rights than the caller has on Windows.
@@ -264,7 +311,8 @@ class TrainerService:
     def _poll_running_jobs(self):
         with self._db_lock, self.connect() as connection:
             rows = connection.execute(
-                'SELECT id, pid, status FROM "Job" WHERE status IN (\'running\', \'stopping\')'
+                '''SELECT id, pid, status FROM "Job"
+                   WHERE pid IS NOT NULL OR status IN ('running', 'stopping')'''
             ).fetchall()
             for row in rows:
                 if not self._pid_alive(row['pid']):
@@ -274,6 +322,13 @@ class TrainerService:
                            WHERE id = ? AND status IN ('running', 'stopping')''',
                         ('Trainer process exited without a final status', utc_now(), row['id'])
                     )
+                    # Trainers publish completed/stopped/error before exiting.
+                    # Keep their final status and progress, but release the PID.
+                    connection.execute(
+                        'UPDATE "Job" SET pid = NULL WHERE id = ? AND pid = ?',
+                        (row['id'], row['pid'])
+                    )
+                    self._processes.pop(row['pid'], None)
 
     def _start_queued_jobs(self):
         with self._db_lock, self.connect() as connection:
@@ -354,6 +409,12 @@ class TrainerService:
             'IS_AI_TOOLKIT_UI': '1',
             'PYTHONUNBUFFERED': '1',
         })
+        if process_config.get('model', {}).get('arch') in H3_ARCHES:
+            environment['MODELS_PATH'] = (process_config['model'].get('models_path')
+                                          or os.environ.get('MODELS_PATH')
+                                          or str(self.project_root / 'models'))
+            if process_config['model'].get('model_kwargs', {}).get('local_files_only'):
+                environment.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
         hf_token = self.get_setting('HF_TOKEN') or os.environ.get('HF_TOKEN', '')
         if hf_token:
             environment['HF_TOKEN'] = hf_token
@@ -395,6 +456,7 @@ class TrainerService:
         finally:
             log_handle.close()
 
+        self._processes[process.pid] = process
         (job_dir / 'pid.txt').write_text(str(process.pid), encoding='utf-8')
         connection.execute(
             '''UPDATE "Job" SET pid = ?, updated_at = ? WHERE id = ?''',
@@ -472,9 +534,15 @@ class TrainerService:
             key=lambda path: path.name.lower(),
         )
 
-    def inspect_dataset(self, name):
+    @staticmethod
+    def _media_files(folder):
+        return sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS),
+                      key=lambda p: p.name.lower()) if folder.is_dir() else []
+
+    def inspect_dataset(self, name, media=False):
         dataset_dir = self._resolve_dataset(name)
-        target_files = self._image_files(dataset_dir / 'img')
+        media_files = self._media_files(dataset_dir / 'img')
+        target_files = media_files if media else self._image_files(dataset_dir / 'img')
         target_stems = {path.stem for path in target_files}
         # Dataset inspection is deliberately metadata-only. Saving, opening,
         # and queueing a job must never decode thousands of source images.
@@ -485,7 +553,7 @@ class TrainerService:
         warnings = []
         for index in range(1, 4):
             folder = dataset_dir / f'Control{index}'
-            stems = self._image_stems(folder)
+            stems = {p.stem for p in self._media_files(folder)} if media else self._image_stems(folder)
             if not stems:
                 continue
             missing = sorted(target_stems - stems)
@@ -517,6 +585,15 @@ class TrainerService:
             'name': name,
             'targetPath': str(dataset_dir / 'img'),
             'targetCount': len(target_stems),
+            'mediaTargetCount': len(media_files),
+            'mediaCaptionCount': sum(p.with_suffix('.txt').is_file() for p in media_files),
+            'mediaControls': [
+                {'name': f'Control{i}', 'path': str(dataset_dir / f'Control{i}'), 'count': len(files)}
+                for i in range(1, 4)
+                if (files := self._media_files(dataset_dir / f'Control{i}'))
+            ],
+            'videoCount': sum(p.suffix.lower() in VIDEO_EXTENSIONS for p in media_files),
+            'minimaxValid': bool(media_files),
             'alphaCount': alpha_count,
             'chromaImageCount': alpha_count,
             'meaningfulAlphaCount': alpha_count,
@@ -526,6 +603,7 @@ class TrainerService:
             'warnings': warnings,
             'valid': bool(target_stems and controls),
             'transparentValid': bool(target_stems and alpha_count == len(target_files)),
+            'transparentPairedValid': bool(target_stems and controls and all(c['missing'] == 0 for c in controls)),
             'backgroundValid': bool(
                 target_files
             ),
@@ -628,13 +706,16 @@ class TrainerService:
     def save_sample_image(self, upload):
         original_name = Path(getattr(upload, 'filename', '') or '').name
         extension = Path(original_name).suffix.lower()
-        if not original_name or extension not in IMAGE_EXTENSIONS:
-            raise TrainerValidationError('Sample image must be PNG, JPG, JPEG or WebP')
+        if not original_name or extension not in MEDIA_EXTENSIONS:
+            raise TrainerValidationError('Sample must be an image or video')
         destination = self.sample_images_dir / f'{uuid.uuid4().hex}{extension}'
         try:
             upload.save(destination)
-            with Image.open(destination) as image:
-                image.verify()
+            if extension in IMAGE_EXTENSIONS:
+                with Image.open(destination) as image:
+                    image.verify()
+            elif not destination.stat().st_size:
+                raise ValueError('Empty video')
         except Exception as exc:
             if destination.exists():
                 destination.unlink()
@@ -648,8 +729,8 @@ class TrainerService:
         root = self.sample_images_dir.resolve()
         if candidate == root or root not in candidate.parents or not candidate.is_file():
             raise TrainerValidationError('Sample image is outside the trainer upload directory')
-        if candidate.suffix.lower() not in IMAGE_EXTENSIONS:
-            raise TrainerValidationError('Unsupported sample image type')
+        if candidate.suffix.lower() not in MEDIA_EXTENSIONS:
+            raise TrainerValidationError('Unsupported sample media type')
         return candidate
 
     def sample_image_preview(self, filename):
@@ -660,20 +741,13 @@ class TrainerService:
     def save_validation_image(self, upload):
         original_name = Path(getattr(upload, 'filename', '') or '').name
         extension = Path(original_name).suffix.lower()
-        if not original_name or extension not in {'.png', '.webp'}:
-            raise TrainerValidationError('Validation target must be an RGBA PNG or WebP image')
+        if not original_name or extension not in IMAGE_EXTENSIONS:
+            raise TrainerValidationError('Validation target must be an image')
         destination = self.validation_images_dir / f'{uuid.uuid4().hex}{extension}'
         try:
             upload.save(destination)
             with Image.open(destination) as image:
                 image.load()
-                if 'A' not in image.getbands() and 'transparency' not in image.info:
-                    raise TrainerValidationError('Validation target must contain an alpha channel')
-                alpha_min, alpha_max = image.convert('RGBA').getchannel('A').getextrema()
-                if alpha_min > 1 or alpha_max <= 1:
-                    raise TrainerValidationError(
-                        'Validation target must contain both visible and transparent pixels'
-                    )
         except TrainerValidationError:
             if destination.exists():
                 destination.unlink()
@@ -691,7 +765,7 @@ class TrainerService:
         root = self.validation_images_dir.resolve()
         if candidate == root or root not in candidate.parents or not candidate.is_file():
             raise TrainerValidationError('Validation image is outside the trainer upload directory')
-        if candidate.suffix.lower() not in {'.png', '.webp'}:
+        if candidate.suffix.lower() not in IMAGE_EXTENSIONS:
             raise TrainerValidationError('Unsupported validation target type')
         return candidate
 
@@ -708,8 +782,11 @@ class TrainerService:
         destination = self.chromakey_validation_images_dir / f'{uuid.uuid4().hex}{extension}'
         try:
             upload.save(destination)
-            with Image.open(destination) as image:
-                image.verify()
+            if extension in IMAGE_EXTENSIONS:
+                with Image.open(destination) as image:
+                    image.verify()
+            elif not destination.stat().st_size:
+                raise ValueError('Empty video')
         except Exception as exc:
             if destination.exists():
                 destination.unlink()
@@ -758,9 +835,11 @@ class TrainerService:
                 value = raw.get(f'ctrlImg{control_index}') or raw.get(f'ctrl_img_{control_index}')
                 if value:
                     explicit_controls[f'ctrl_img_{control_index}'] = str(self.resolve_sample_image(value))
-            if explicit_controls:
+            if explicit_controls or (payload.get('model') in H3_KEYS and not raw.get('image')):
                 prompt = str(raw.get('prompt', '')).strip() or 'Edit the reference image'
                 sample = {'prompt': prompt, **explicit_controls}
+                if payload.get('model') in H3_KEYS and raw.get('numFrames') not in (None, ''):
+                    sample['num_frames'] = frame_count(raw['numFrames'], 'Sample', TrainerValidationError)
                 for key in ('width', 'height', 'seed'):
                     value = raw.get(key)
                     if value not in (None, ''):
@@ -779,6 +858,8 @@ class TrainerService:
                     or 'Generate an isolated RGBA image with a transparent background',
                     'ctrl_img_1': str(self._black_sample_control(width, height)),
                 }
+                if payload.get('model') in H3_KEYS and raw.get('numFrames') not in (None, ''):
+                    sample['num_frames'] = frame_count(raw['numFrames'], 'Sample', TrainerValidationError)
                 for key in ('width', 'height', 'seed'):
                     value = raw.get(key)
                     if value not in (None, ''):
@@ -867,8 +948,10 @@ class TrainerService:
                 prompt = str(dataset_config.get('default_caption', '')).strip()
             item = {'image_path': str(target), 'prompt': prompt}
             if transparent:
+                validation_mode = (str(raw.get('mode', raw.get('rgbaControlMode', 'generation')))
+                                   if uploaded_target else dataset_config.get('rgba_control_mode', 'edit'))
                 with Image.open(target) as image:
-                    if 'A' not in image.getbands() and 'transparency' not in image.info:
+                    if validation_mode != 'paired' and 'A' not in image.getbands() and 'transparency' not in image.info:
                         raise TrainerValidationError(
                             f'Transparent validation target has no alpha channel: {target.name}'
                         )
@@ -877,7 +960,7 @@ class TrainerService:
                     payload.get('rgbaAlphaThreshold'), 0, 1, 1 / 255
                 )
                 threshold_u8 = round(alpha_threshold * 255)
-                if alpha_min > threshold_u8 or alpha_max <= threshold_u8:
+                if validation_mode != 'paired' and (alpha_min > threshold_u8 or alpha_max <= threshold_u8):
                     raise TrainerValidationError(
                         'Transparent validation target must contain both visible and '
                         f'transparent pixels: {target.name}'
@@ -903,10 +986,32 @@ class TrainerService:
                         payload.get('rgbaEdgeWidth'), 0, 128, 3
                     ),
                 })
-                if item['rgba_control_mode'] not in {'edit', 'generation'}:
+                if item['rgba_control_mode'] not in {'edit', 'generation', 'paired'}:
                     raise TrainerValidationError(
-                        'Validation mode must be edit or generation'
+                        'Validation mode must be edit, generation or paired'
                     )
+                if item['rgba_control_mode'] == 'paired':
+                    if payload.get('model') != 'qwen_image_edit_2511':
+                        raise TrainerValidationError('Paired RGBA validation requires QIE2511')
+                    controls = []
+                    for index in range(1, 4):
+                        value = raw.get(f'ctrlImg{index}') or raw.get(f'ctrl_img_{index}')
+                        if value:
+                            control = self.resolve_sample_image(value)
+                            if control.suffix.lower() not in IMAGE_EXTENSIONS:
+                                raise TrainerValidationError('QIE validation controls must be images')
+                            controls.append(str(control))
+                    if not controls and not uploaded_target:
+                        for folder in dataset_config.get('control_path', []):
+                            matches = [p for p in self._image_files(Path(folder)) if p.stem == target.stem]
+                            if not matches:
+                                raise TrainerValidationError(f'Validation target has no matching control in {folder}')
+                            controls.append(str(matches[0]))
+                    if not controls:
+                        raise TrainerValidationError('Upload at least one input Control for paired RGBA validation')
+                    if not prompt:
+                        raise TrainerValidationError('Paired RGBA validation requires an edit instruction')
+                    item['control_paths'] = controls
             items.append(item)
         raw_sigmas = payload.get('validationSigmas', [0.5])
         if not isinstance(raw_sigmas, list):
@@ -967,6 +1072,8 @@ class TrainerService:
         if preset not in TRAINING_PRESETS:
             raise TrainerValidationError('Unsupported training preset')
         model_key = payload.get('model')
+        if preset == 'h3_rgba_vae' and model_key not in H3_KEYS:
+            raise TrainerValidationError('H3 RGBA VAE training requires the H3 model family')
         if preset == CHROMAKEY_PRESET:
             if model_key != CHROMAKEY_MODEL_KEY:
                 raise TrainerValidationError('Unsupported ChromaKey model')
@@ -989,13 +1096,22 @@ class TrainerService:
             if not isinstance(dataset, dict):
                 raise TrainerValidationError('Invalid dataset configuration')
             dataset_name = dataset.get('name')
-            inspection = self.inspect_dataset(dataset_name)
-            if preset == 'standard_lora' and not inspection['valid']:
+            inspection = self.inspect_dataset(dataset_name, media=model_key in H3_KEYS and preset == 'standard_lora')
+            if model_key in H3_KEYS and not inspection['minimaxValid']:
+                raise TrainerValidationError(f'Dataset has no images or videos: {dataset_name}')
+            if preset == 'standard_lora' and model_key not in H3_KEYS and not inspection['valid']:
                 raise TrainerValidationError(f'Dataset is not ready for edit training: {dataset_name}')
-            if preset == 'transparent_lora' and not inspection['transparentValid']:
+            if model_key in H3_KEYS and preset != 'standard_lora' and inspection['videoCount']:
+                raise TrainerValidationError('H3 RGBA training requires PNG/WebP images with alpha, not video targets')
+            if preset == 'transparent_lora' and dataset.get('rgbaControlMode') != 'paired' and not inspection['transparentValid']:
                 raise TrainerValidationError(
                     f'Every target image must contain an alpha channel: {dataset_name}'
                 )
+            if preset == 'transparent_lora' and dataset.get('rgbaControlMode') == 'paired':
+                if model_key != 'qwen_image_edit_2511':
+                    raise TrainerValidationError('Paired RGBA editing currently requires QIE2511')
+                if not inspection['transparentPairedValid']:
+                    raise TrainerValidationError(f'Paired RGBA editing requires matching Control images for every target: {dataset_name}')
             if preset in VAE_TRAINING_PRESETS and not inspection['vaeValid']:
                 raise TrainerValidationError(
                     f'RGBA VAE training needs at least two alpha-channel images: {dataset_name}'
@@ -1136,10 +1252,12 @@ class TrainerService:
             normalized_datasets.append({**submitted, 'name': inspection['name']})
 
         is_flux2 = preset == 'flux2_rgba_vae'
-        default_source = 'ai-toolkit/flux2_vae' if is_flux2 else 'Qwen/Qwen-Image-Edit-2511'
-        default_subfolder = '' if is_flux2 else 'vae'
+        is_h3 = preset == 'h3_rgba_vae'
+        default_source = (str(self.project_root / 'models' / 'vae' / 'minimax_h3_video_vae_fp16.safetensors') if is_h3 else
+                          'ai-toolkit/flux2_vae' if is_flux2 else 'Qwen/Qwen-Image-Edit-2511')
+        default_subfolder = '' if is_flux2 or is_h3 else 'vae'
         process = {
-            'type': 'flux2_rgba_vae_trainer' if is_flux2 else 'qwen_rgba_vae_trainer',
+            'type': 'h3_rgba_vae_trainer' if is_h3 else 'flux2_rgba_vae_trainer' if is_flux2 else 'qwen_rgba_vae_trainer',
             'training_folder': str(self.output_dir),
             'sqlite_db_path': str(self.db_path),
             'device': 'cuda',
@@ -1148,7 +1266,7 @@ class TrainerService:
                     payload.get('sourceVaePath', default_source)
                 ).strip() or default_source,
                 'subfolder': str(payload.get('sourceVaeSubfolder', default_subfolder)).strip(),
-                **({'filename': 'ae.safetensors'} if is_flux2 else {}),
+                **({'filename': 'minimax_h3_video_vae_fp16.safetensors'} if is_h3 else {'filename': 'ae.safetensors'} if is_flux2 else {}),
                 'local_files_only': bool(payload.get('sourceVaeLocalOnly', False)),
             },
             'datasets': dataset_configs,
@@ -1223,6 +1341,12 @@ class TrainerService:
                 'sample_steps': 0,
             },
         }
+        if is_h3:
+            if process['train']['resolution'] % 32:
+                raise TrainerValidationError('H3 VAE resolution must be divisible by 32')
+            source_path = process['source_vae']['name_or_path']
+            if source_path == default_source or Path(source_path).is_absolute():
+                process['source_vae']['name_or_path'] = self._validate_local_asset(source_path, 'Original H3 RGB VAE')
         config = {
             'job': 'extension',
             'config': {'name': name, 'process': [process]},
@@ -1235,13 +1359,14 @@ class TrainerService:
                     'gpuIds': gpu_ids,
                     'datasets': normalized_datasets,
                     'form': copy.deepcopy(payload),
-                    'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
+                    'upstreamCommit': H3_SOURCE_COMMIT if model_key in H3_KEYS else '8a912564ce60047ea44d0f3a98becf3f168d3094',
                 },
             },
         }
         return name, gpu_ids, config, inspections
 
     def build_job_config(self, payload):
+        payload = with_h3_defaults(payload, self.project_root)
         name, model_key, gpu_ids, inspections, preset = self.validate_payload(payload)
         if preset == CHROMAKEY_PRESET:
             return self._build_chromakey_config(
@@ -1318,14 +1443,16 @@ class TrainerService:
             }
             if transparent:
                 rgba_control_mode = str(submitted.get('rgbaControlMode', 'edit')).lower()
-                if rgba_control_mode not in {'edit', 'generation'}:
-                    raise TrainerValidationError('RGBA dataset mode must be edit or generation')
-                edge_mode = str(payload.get('rgbaEdgeCorrection', 'matte_despill'))
+                if model_key == 'minimax_h3_ref2va' and payload.get('distillationMethod') == 'dopsd':
+                    rgba_control_mode = 'generation'
+                if rgba_control_mode not in {'edit', 'generation', 'paired'}:
+                    raise TrainerValidationError('RGBA dataset mode must be edit, generation or paired')
+                edge_mode = str(payload.get('rgbaEdgeCorrection', 'none' if rgba_control_mode == 'paired' else 'matte_despill'))
                 if edge_mode not in {'none', 'nearest_opaque', 'matte_despill'}:
                     raise TrainerValidationError('Unsupported RGBA edge cleanup mode')
                 dataset_config.update({
                     'pixel_channels': 'rgba',
-                    'rgba_require_alpha': True,
+                    'rgba_require_alpha': rgba_control_mode != 'paired',
                     'rgba_alpha_threshold': clamp_number(
                         payload.get('rgbaAlphaThreshold'), 0, 1, 1 / 255
                     ),
@@ -1334,8 +1461,10 @@ class TrainerService:
                     'rgba_edge_matte_color': [0, 255, 0],
                     'rgba_edge_width': clamp_number(payload.get('rgbaEdgeWidth'), 0.1, 128, 3),
                 })
-                dataset_config.pop('control_path', None)
-                dataset_config['rgba_generate_control'] = True
+                if rgba_control_mode != 'paired':
+                    dataset_config.pop('control_path', None)
+                dataset_config['rgba_generate_control'] = rgba_control_mode != 'paired'
+                dataset_config['load_image_when_caching_latents'] = True
                 dataset_config['rgba_control_mode'] = rgba_control_mode
                 dataset_config['rgba_dynamic_control_text_cache_safe'] = (
                     model_key in {'flux2_klein_4b', 'flux2_klein_9b'}
@@ -1346,7 +1475,7 @@ class TrainerService:
                     # the alpha mask. Dropping it would train an unrelated
                     # unconditional mask and encourage content drift.
                     dataset_config['caption_dropout_rate'] = 0.0
-                else:
+                elif rgba_control_mode == 'edit':
                     background_dataset_name = str(
                         submitted.get('rgbaBackgroundDataset', '')
                     ).strip()
@@ -1367,7 +1496,7 @@ class TrainerService:
                 **submitted,
                 'name': inspection['name'],
                 'resolutions': resolutions,
-                **({'rgbaControlMode': str(submitted.get('rgbaControlMode', 'edit')).lower()} if transparent else {}),
+                **({'rgbaControlMode': rgba_control_mode} if transparent else {}),
                 **({'rgbaBackgroundDataset': background_dataset_name} if transparent else {}),
             })
 
@@ -1566,10 +1695,13 @@ class TrainerService:
                     'gpuIds': gpu_ids,
                     'datasets': normalized_datasets,
                     'form': normalized_form,
-                    'upstreamCommit': '8a912564ce60047ea44d0f3a98becf3f168d3094',
+                    'upstreamCommit': H3_SOURCE_COMMIT if model_key in H3_KEYS else '8a912564ce60047ea44d0f3a98becf3f168d3094',
                 },
             },
         }
+        if model_key in H3_KEYS:
+            configure_h3(config['config']['process'][0], payload, TrainerValidationError, clamp_number, self._validate_local_asset)
+            normalized_form['cacheTextEmbeddings'] = train_config['cache_text_embeddings']
         advanced_process = payload.get('advancedProcess')
         if advanced_process:
             if isinstance(advanced_process, str):
@@ -1635,6 +1767,8 @@ class TrainerService:
             else:
                 advanced_model.pop('sample_lora_path', None)
             config['config']['process'][0] = advanced_process
+        if model_key in H3_KEYS:
+            validate_h3_process(config['config']['process'][0], TrainerValidationError)
         return name, gpu_ids, config, inspections
 
     def create_job(self, payload):
@@ -1839,6 +1973,10 @@ class TrainerService:
                 if key == 'qwen_image_edit_2511'
                 else self.default_flux2_klein_rgba_vae()
             )
+            if key in H3_KEYS:
+                item['defaultRgbaVaePath'] = str(self.project_root / 'models' / 'vae' / 'minimax_h3_rgba_vae.safetensors')
+                item['defaults'] = local_h3_defaults(key, self.project_root)
+                item['defaultSourceVaePath'] = str(self.project_root / 'models' / 'vae' / 'minimax_h3_video_vae_fp16.safetensors')
             models.append(item)
         models.append({
             'key': CHROMAKEY_MODEL_KEY,
@@ -1886,8 +2024,10 @@ class TrainerService:
         for item in qdm_meta.get('datasets', []):
             inspection = self.inspect_dataset(item['name'])
             ready = inspection['valid']
+            if qdm_meta.get('modelKey') in H3_KEYS and preset == 'standard_lora':
+                ready = inspection['minimaxValid']
             if preset == 'transparent_lora':
-                ready = inspection['transparentValid']
+                ready = inspection['transparentPairedValid' if item.get('rgbaControlMode') == 'paired' else 'transparentValid']
             elif preset in VAE_TRAINING_PRESETS:
                 ready = inspection['vaeValid']
             elif preset == CHROMAKEY_PRESET:
@@ -2154,7 +2294,7 @@ class TrainerService:
             files = sorted(
                 (
                     path for path in samples_dir.iterdir()
-                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+                    if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
                 ),
                 key=lambda path: path.name.lower(),
             )
@@ -2174,12 +2314,15 @@ class TrainerService:
                 'prompt': str(item.get('prompt', '')),
                 'seed': seed,
                 'controlCount': len(self._sample_controls(item)),
+                'mediaType': 'video' if path.suffix.lower() in VIDEO_EXTENSIONS else 'image',
+                'audioFile': path.with_suffix('.wav').name if path.suffix.lower() == '.png' and path.with_suffix('.wav').is_file() else None,
+                'controlMediaTypes': ['video' if Path(c).suffix.lower() in VIDEO_EXTENSIONS else 'image' for c in self._sample_controls(item)],
             })
             samples.append(info)
         return {
             'samples': samples,
             'sampleCount': sample_count,
-            'isVae': process.get('type') in {'qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'},
+            'isVae': process.get('type') in {'qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer', 'h3_rgba_vae_trainer'},
             'isChroma': process.get('type') in {'qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'},
         }
 
@@ -2188,7 +2331,8 @@ class TrainerService:
         if not isinstance(filename, str) or Path(filename).name != filename:
             raise TrainerValidationError('Invalid sample filename')
         candidate = (samples_dir / filename).resolve()
-        if samples_dir not in candidate.parents or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+        is_audio_sidecar = candidate.suffix.lower() == '.wav' and candidate.with_suffix('.png').is_file()
+        if samples_dir not in candidate.parents or (candidate.suffix.lower() not in MEDIA_EXTENSIONS and not is_audio_sidecar):
             raise TrainerValidationError('Unsupported sample image')
         if not candidate.is_file():
             raise FileNotFoundError('Validation image not found')
@@ -2214,7 +2358,7 @@ class TrainerService:
         allowed_roots = (self.sample_images_dir.resolve(), self.datasets_dir.resolve())
         if not any(candidate != root and root in candidate.parents for root in allowed_roots):
             raise TrainerValidationError('Control image is outside managed trainer directories')
-        if not candidate.is_file() or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+        if not candidate.is_file() or candidate.suffix.lower() not in MEDIA_EXTENSIONS:
             raise FileNotFoundError('Control image not found')
         return candidate
 
@@ -2222,6 +2366,10 @@ class TrainerService:
         path = self.resolve_job_sample(job_id, filename)
         samples_dir = path.parent
         path.unlink()
+        if path.suffix.lower() == '.png':
+            audio = path.with_suffix('.wav')
+            if audio.is_file():
+                audio.unlink()
         caption = path.with_suffix('.txt')
         if caption.is_file():
             caption.unlink()
@@ -2237,7 +2385,7 @@ class TrainerService:
             raise FileNotFoundError('No validation images have been generated')
         files = sorted(
             path for path in samples_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
         )
         if not files:
             raise FileNotFoundError('No validation images have been generated')
@@ -2247,6 +2395,9 @@ class TrainerService:
             with zipfile.ZipFile(temporary_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                 for path in files:
                     archive.write(path, arcname=f'samples/{path.name}')
+                    audio = path.with_suffix('.wav')
+                    if path.suffix.lower() == '.png' and audio.is_file():
+                        archive.write(audio, arcname=f'samples/{audio.name}')
             os.replace(temporary_path, archive_path)
         finally:
             if temporary_path.exists():
@@ -2308,18 +2459,26 @@ def create_trainer_blueprint(service: TrainerService):
     def trainer_preflight():
         try:
             payload = request.get_json() or {}
-            inspections = [service.inspect_dataset(name) for name in payload.get('datasets', [])]
+            is_h3 = payload.get('model') in H3_KEYS
+            inspections = [service.inspect_dataset(name, media=is_h3 and payload.get('trainingPreset', 'standard_lora') == 'standard_lora') for name in payload.get('datasets', [])]
             preset = payload.get('trainingPreset', 'standard_lora')
             validity_key = {
                 'standard_lora': 'valid',
                 'transparent_lora': 'transparentValid',
                 'qwen_rgba_vae': 'vaeValid',
                 'flux2_rgba_vae': 'vaeValid',
+                'h3_rgba_vae': 'vaeValid',
                 CHROMAKEY_PRESET: 'chromakeyValid',
             }.get(preset, 'valid')
+            if is_h3 and preset == 'standard_lora':
+                validity_key = 'minimaxValid'
+            modes = payload.get('datasetModes', {})
             return jsonify({
                 'datasets': inspections,
-                'valid': bool(inspections) and all(item[validity_key] for item in inspections),
+                'valid': bool(inspections) and all(item[
+                    'transparentPairedValid' if preset == 'transparent_lora' and modes.get(item['name']) == 'paired'
+                    else validity_key
+                ] for item in inspections),
             })
         except Exception as exc:
             return handle_error(exc)

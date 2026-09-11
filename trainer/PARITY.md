@@ -9,6 +9,9 @@ Trainer) Simple UI for these architecture entries:
 - `qwen_image_edit_plus:2511`
 - `flux2_klein_4b`
 - `flux2_klein_9b`
+- `minimax_h3` and `minimax_h3_ref2va` from local source commit
+  `3e1cb5f67f7bebe6ac74e3da5105d18fb3c1dd5a`; the complete H3 field/dependency
+  audit and RGBA behavior are in [H3.md](H3.md).
 
 QDM additionally exposes opt-in local presets that do not replace those
 upstream entries:
@@ -19,6 +22,8 @@ upstream entries:
 - `flux2_rgba_vae_trainer` for the shared FLUX.2 Klein 4B/9B native z=32
   four-channel VAE;
 - `qdm_cleanmatte_trainer` for the independent alpha-first CleanMatte network.
+- `minimax_h3_rgba`, `minimax_h3_ref2va_rgba`, and `h3_rgba_vae_trainer` for
+  native H3 RGBA latent training and the shared 24-channel RGBA video VAE.
 
 ## Forwarded settings
 

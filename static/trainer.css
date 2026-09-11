@@ -803,3 +803,7 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* H3 video previews use the same media bounds as image samples. */
+.trainer-generated-sample video, .trainer-sample-image-picker video { width: 100%; height: 100%; object-fit: contain; }
+#trainer-sample-viewer-video { max-width: 100%; max-height: 80vh; transform: scale(var(--sample-zoom, 1)); }

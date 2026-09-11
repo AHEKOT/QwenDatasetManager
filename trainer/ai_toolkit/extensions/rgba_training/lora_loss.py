@@ -136,6 +136,8 @@ class RGBALoRALossMixin:
                 )
                 for chunk in predicted_clean.split(1, dim=0)
             ], dim=0)
+            if decoded.ndim == 5 and decoded.shape[2] == 1:
+                decoded = decoded.squeeze(2)
             if decoded.ndim != 4 or decoded.shape[1] != 4:
                 raise ValueError("RGBA validation requires a four-channel VAE decode")
             predicted_alpha = (decoded[:, 3:4].float() + 1.0) * 0.5
@@ -147,6 +149,8 @@ class RGBALoRALossMixin:
                 )
                 for chunk in target_clean.split(1, dim=0)
             ], dim=0)
+            if decoded_target.ndim == 5 and decoded_target.shape[2] == 1:
+                decoded_target = decoded_target.squeeze(2)
             represented_alpha = (decoded_target[:, 3:4].float() + 1.0) * 0.5
 
         actual_alpha = F.interpolate(

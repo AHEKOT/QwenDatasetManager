@@ -7,6 +7,7 @@ import math
 import os
 import random
 from collections import OrderedDict, deque
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
@@ -23,6 +24,7 @@ from toolkit.basic import flush, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
+from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt
@@ -330,6 +332,8 @@ class CaptionProcessingDTOMixin:
             self.caption_short: str = None
             # caption with the trigger word replaced by the diff output preservation class
             self.caption_dop: str = None
+            # D-OPSD teacher caption (trigger word replaced by <Picture 1>/<Video 1>)
+            self.caption_dopsd: str = None
 
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
@@ -384,6 +388,19 @@ class CaptionProcessingDTOMixin:
                 self.caption_dop = self.caption.replace(
                     self.trigger_word, self.dataset_config.diff_output_preservation_class
                 )
+        if getattr(self, 'dopsd_self_ref', False):
+            # trigger word -> the self-reference token, or the token prepended
+            # when there is no trigger word
+            if self.trigger_word is not None:
+                self.caption_dopsd = self.caption.replace(
+                    self.trigger_word, self.get_dopsd_ref_token()
+                )
+            else:
+                self.caption_dopsd = f"{self.get_dopsd_ref_token()} {self.caption}".strip()
+
+    def get_dopsd_ref_token(self: 'FileItemDTO') -> str:
+        # the item is always the only reference in D-OPSD mode
+        return "<Video 1>" if self.is_video else "<Picture 1>"
 
     def get_caption(
             self: 'FileItemDTO',
@@ -1831,14 +1848,26 @@ def _waveform_from_int16(waveform: torch.Tensor, dtype: torch.dtype = torch.floa
     return (waveform.to(torch.float32) / 32767.0).to(dtype)
 
 
+def _dto_extras_from_state_dict(state_dict) -> dict:
+    """Extra latent streams in a cache file: legacy named keys written by
+    older versions plus the generic dto.<name> keys new caches write."""
+    extras = {}
+    if 'audio_latent' in state_dict:
+        extras['audio'] = state_dict['audio_latent']
+    for k, v in state_dict.items():
+        if k.startswith(DISK_PREFIX):
+            extras[k[len(DISK_PREFIX):]] = v
+    return extras
+
+
 class LatentCachingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
+        # a plain tensor, or a DTO carrying extra streams (audio rows, ...)
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
-        self._cached_audio_latent: Union[torch.Tensor, None] = None
         self._cached_tensor_uint8: Union[torch.Tensor, None] = None
         self._cached_waveform_int16: Union[torch.Tensor, None] = None
         self._cached_waveform_sample_rate: Union[int, None] = None
@@ -1930,17 +1959,14 @@ class LatentCachingFileItemDTOMixin:
                 # we are caching on disk, don't save in memory
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
-                self._cached_audio_latent = None
                 self._cached_tensor_uint8 = None
                 self._cached_waveform_int16 = None
                 self._cached_waveform_sample_rate = None
             else:
-                # move it back to cpu
+                # move it back to cpu (a DTO carries its extras along)
                 self._encoded_latent = self._encoded_latent.to('cpu')
                 if self._cached_first_frame_latent is not None:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
-                if self._cached_audio_latent is not None:
-                    self._cached_audio_latent = self._cached_audio_latent.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1960,8 +1986,9 @@ class LatentCachingFileItemDTOMixin:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
                 if self._cached_first_frame_latent.dtype == torch.uint8:
                     self._cached_first_frame_latent = _latent_from_uint8(self._cached_first_frame_latent)
-            if 'audio_latent' in state_dict:
-                self._cached_audio_latent = state_dict['audio_latent']
+            extras = _dto_extras_from_state_dict(state_dict)
+            if extras:
+                self._encoded_latent = DTO(self._encoded_latent, **extras)
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
             if 'tensor' in state_dict:
@@ -2076,14 +2103,15 @@ class LatentCachingMixin:
                 if cached_latent.dtype == torch.uint8:
                     # pixel-space latents cached as uint8
                     cached_latent = _latent_from_uint8(cached_latent)
+                extras = _dto_extras_from_state_dict(state_dict)
+                if extras:
+                    cached_latent = DTO(cached_latent, **extras)
                 file_item._encoded_latent = cached_latent.to('cpu', dtype=self.sd.torch_dtype)
                 if 'first_frame_latent' in state_dict:
                     cached_first_frame = state_dict['first_frame_latent']
                     if cached_first_frame.dtype == torch.uint8:
                         cached_first_frame = _latent_from_uint8(cached_first_frame)
                     file_item._cached_first_frame_latent = cached_first_frame.to('cpu', dtype=self.sd.torch_dtype)
-                if 'audio_latent' in state_dict:
-                    file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
                 if 'tensor' in state_dict:
                     file_item._cached_tensor_uint8 = state_dict['tensor']
                 if 'waveform' in state_dict:
@@ -2119,12 +2147,19 @@ class LatentCachingMixin:
                         file_item._cached_waveform_sample_rate = sample_rate
             try:
                 imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                latent = self.sd.encode_images(imgs).squeeze(0)
+                latent = self.sd.encode_images(imgs)
+                # a model can return a DTO carrying extra streams alongside the latent
+                latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
                 if to_disk:
+                    main_latent = latent.tensor if isinstance(latent, DTO) else latent
                     if cache_uint8:
-                        state_dict['latent'] = _latent_to_uint8(latent).cpu()
+                        state_dict['latent'] = _latent_to_uint8(main_latent).cpu()
                     else:
-                        state_dict['latent'] = latent.clone().detach().cpu()
+                        state_dict['latent'] = main_latent.clone().detach().cpu()
+                    if isinstance(latent, DTO):
+                        for k, v in latent.extras.items():
+                            if torch.is_tensor(v):
+                                state_dict[f'{DISK_PREFIX}{k}'] = v.clone().detach().cpu()
             except Exception as e:
                 print_acc(f"Error processing image: {file_item.path}")
                 print_acc(f"Error: {str(e)}")
@@ -2163,12 +2198,12 @@ class LatentCachingMixin:
                 save_file(state_dict, latent_path, metadata=meta)
 
             if to_memory:
-                # keep it in memory
+                # keep it in memory; audio rides inside the latent DTO
+                if audio_latent is not None:
+                    latent = DTO(latent, audio=audio_latent)
                 file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
                 if first_frame_latent is not None:
                     file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
-                if audio_latent is not None:
-                    file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
 
             del imgs
             del latent
@@ -2194,13 +2229,18 @@ class TextEmbeddingFileItemDTOMixin:
         self._blank_text_embedding_path: Union[str, None] = None
         # DOP embeds for dropout steps (dropout caption with trigger replaced by class)
         self._dop_blank_text_embedding_path: Union[str, None] = None
+        # D-OPSD teacher embeds (caption with trigger replaced by the self-reference
+        # token, encoded WITH the item's own image/video as the vision reference)
+        self.dopsd_prompt_embeds: Union[PromptEmbeds, None] = None
+        self._dopsd_text_embedding_path: Union[str, None] = None
+        self._dopsd_blank_text_embedding_path: Union[str, None] = None
         self._loaded_text_embedding_path: Union[str, None] = None
         self._caption_was_dropped = False
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
         # make sure the caption is loaded here
         # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
@@ -2210,6 +2250,12 @@ class TextEmbeddingFileItemDTOMixin:
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
         ])
+        if not text_only and self.text_embedding_space_version.startswith('minimax_h3'):
+            item['h3_vision_resolution_v1'] = self.dataset_config.text_embedding_resolution
+        if dopsd_self_ref:
+            # teacher embeds carry the item's own media as the vision reference
+            item["dopsd_self_ref"] = True
+            return item
         # dropout embeds are encoded as plain text, keep control conditioning
         # out of their cache key
         if text_only:
@@ -2249,11 +2295,11 @@ class TextEmbeddingFileItemDTOMixin:
             item["first_frame_in_te"] = True
         return item
 
-    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False):
+    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
         # we store text embeddings in a folder in same path as image called _text_embedding_cache
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
-        hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override, text_only=text_only)
+        hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override, text_only=text_only, dopsd_self_ref=dopsd_self_ref)
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
         hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
@@ -2314,6 +2360,35 @@ class TextEmbeddingFileItemDTOMixin:
 
         return self._dop_blank_text_embedding_path
 
+    def get_dopsd_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        if self._dopsd_text_embedding_path is not None and not recalculate:
+            return self._dopsd_text_embedding_path
+        # make sure the caption is loaded so caption_dopsd is built
+        if self.caption is None:
+            self.load_caption()
+        self._dopsd_text_embedding_path = self._build_text_embedding_path(
+            caption_override=self.caption_dopsd, dopsd_self_ref=True
+        )
+        return self._dopsd_text_embedding_path
+
+    def get_dopsd_dropout_caption(self: 'FileItemDTO'):
+        # dropout caption with the trigger word swapped for the self-reference token
+        dropout_caption = self.get_dropout_caption()
+        if self.trigger_word is not None:
+            return dropout_caption.replace(
+                self.trigger_word, self.get_dopsd_ref_token()
+            )
+        return f"{self.get_dopsd_ref_token()} {dropout_caption}".strip()
+
+    def get_dopsd_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        if self._dopsd_blank_text_embedding_path is not None and not recalculate:
+            return self._dopsd_blank_text_embedding_path
+        # unlike DOP, dropout embeds keep the vision reference
+        self._dopsd_blank_text_embedding_path = self._build_text_embedding_path(
+            caption_override=self.get_dopsd_dropout_caption(), dopsd_self_ref=True
+        )
+        return self._dopsd_blank_text_embedding_path
+
     def get_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         if self._blank_text_embedding_path is not None and not recalculate:
             return self._blank_text_embedding_path
@@ -2334,6 +2409,8 @@ class TextEmbeddingFileItemDTOMixin:
             self.prompt_embeds = None
         if self.dop_prompt_embeds is not None:
             self.dop_prompt_embeds = None
+        if self.dopsd_prompt_embeds is not None:
+            self.dopsd_prompt_embeds = None
 
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
@@ -2363,6 +2440,12 @@ class TextEmbeddingFileItemDTOMixin:
                 self.dop_prompt_embeds = self.prompt_embeds
             else:
                 self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
+        if getattr(self, 'dopsd_self_ref', False) and self.dopsd_prompt_embeds is None:
+            if self._caption_was_dropped:
+                dopsd_path = self.get_dopsd_blank_text_embedding_path()
+            else:
+                dopsd_path = self.get_dopsd_text_embedding_path()
+            self.dopsd_prompt_embeds = PromptEmbeds.load(dopsd_path)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -2372,7 +2455,8 @@ class TextEmbeddingCachingMixin:
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
     def cache_text_embeddings(self: 'AiToolkitDataset'):
-        with accelerator.main_process_first():
+        context = getattr(self.sd, 'text_embedding_dataset_context', None)
+        with accelerator.main_process_first(), (context(self.dataset_config) if context else nullcontext()):
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
             
@@ -2439,6 +2523,9 @@ class TextEmbeddingCachingMixin:
                             try:
                                 img = Image.open(control_path_list[i]).convert("RGB")
                                 img = exif_transpose(img)
+                                prepare_image = getattr(self.sd, 'prepare_text_encoder_image', None)
+                                if prepare_image is not None:
+                                    img = prepare_image(img)
                                 # convert to 0 to 1 tensor
                                 img = (
                                     TF.to_tensor(img)
@@ -2511,6 +2598,50 @@ class TextEmbeddingCachingMixin:
                     else:
                         for path, caption in encode_targets:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
+                            prompt_embeds.save(path)
+                            del prompt_embeds
+                if getattr(file_item, 'dopsd_self_ref', False):
+                    # D-OPSD teacher embeds encode with the item's own media as the reference
+                    control_video_paths = getattr(file_item, 'control_video_paths', None) or []
+                    if file_item.control_path is not None or len(control_video_paths) > 0:
+                        raise ValueError(
+                            "D-OPSD self-reference training cannot be combined with "
+                            "control images/videos: the item itself must be the only "
+                            f"reference. Offending item: {file_item.path}"
+                        )
+                    dopsd_targets = [(
+                        file_item.get_dopsd_text_embedding_path(recalculate=True),
+                        file_item.caption_dopsd,
+                    )]
+                    if self.dataset_config.caption_dropout_rate > 0:
+                        dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
+                        if dopsd_blank_path != dopsd_targets[0][0]:
+                            dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
+                    dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
+                    if len(dopsd_targets) > 0:
+                        if not did_move:
+                            self.sd.set_device_state_preset('cache_text_encoder')
+                            did_move = True
+                        if file_item.is_video:
+                            # own path rides through the video-ref presentation
+                            ctrl_img = [file_item.path]
+                            self.sd._ref_video_dataset_config = self.dataset_config
+                        else:
+                            # own bucketed pixels as the reference image
+                            file_item.load_and_process_image(self.transform, only_load_latents=True)
+                            img = file_item.tensor  # (C, H, W) in [-1, 1]
+                            ctrl_img = [
+                                ((img + 1.0) / 2.0)
+                                .clamp(0, 1)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            ]
+                            # release the cached latent/pixels the load pulled in
+                            file_item.cleanup()
+                        if not self.sd.has_multiple_control_images:
+                            ctrl_img = ctrl_img[0]
+                        for path, caption in dopsd_targets:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
                             prompt_embeds.save(path)
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True

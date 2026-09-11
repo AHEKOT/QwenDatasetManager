@@ -188,11 +188,15 @@ class AlphaBoundaryGuard:
         self.vae = vae
         self.zero_dc_alpha_encoder = bool(zero_dc_alpha_encoder)
         self.encoder_weight = vae.encoder.conv_in.weight
-        self.decoder_weight = vae.decoder.conv_out.weight
-        self.decoder_bias = vae.decoder.conv_out.bias
+        boundary = getattr(vae.decoder, "conv_out", None)
+        if boundary is None:
+            boundary = vae.decoder.proj_out
+        self.decoder_weight = boundary.weight
+        self.decoder_bias = boundary.bias
+        self.decoder_alpha_start = self.decoder_weight.shape[0] * 3 // 4
         self.encoder_rgb = self.encoder_weight[:, :3].detach().clone()
-        self.decoder_rgb = self.decoder_weight[:3].detach().clone()
-        self.decoder_rgb_bias = self.decoder_bias[:3].detach().clone()
+        self.decoder_rgb = self.decoder_weight[:self.decoder_alpha_start].detach().clone()
+        self.decoder_rgb_bias = self.decoder_bias[:self.decoder_alpha_start].detach().clone()
 
         vae.requires_grad_(False)
         self.encoder_weight.requires_grad_(True)
@@ -202,9 +206,9 @@ class AlphaBoundaryGuard:
         encoder_mask = torch.zeros_like(self.encoder_weight)
         encoder_mask[:, 3:4] = 1
         decoder_mask = torch.zeros_like(self.decoder_weight)
-        decoder_mask[3:4] = 1
+        decoder_mask[self.decoder_alpha_start:] = 1
         bias_mask = torch.zeros_like(self.decoder_bias)
-        bias_mask[3:4] = 1
+        bias_mask[self.decoder_alpha_start:] = 1
         self._hooks = [
             self.encoder_weight.register_hook(lambda grad: grad * encoder_mask),
             self.decoder_weight.register_hook(lambda grad: grad * decoder_mask),
@@ -222,8 +226,8 @@ class AlphaBoundaryGuard:
     @torch.no_grad()
     def restore_rgb(self) -> None:
         self.encoder_weight[:, :3].copy_(self.encoder_rgb)
-        self.decoder_weight[:3].copy_(self.decoder_rgb)
-        self.decoder_bias[:3].copy_(self.decoder_rgb_bias)
+        self.decoder_weight[:self.decoder_alpha_start].copy_(self.decoder_rgb)
+        self.decoder_bias[:self.decoder_alpha_start].copy_(self.decoder_rgb_bias)
         if self.zero_dc_alpha_encoder:
             # A spatially constant alpha plane (fully opaque input) should not
             # shift the standard RGB latent. Keep every temporal kernel slice
@@ -242,8 +246,12 @@ class FullRGBAVAEFineTune:
             raise ValueError("train.alpha_lr_multiplier must be greater than zero")
         vae.requires_grad_(True)
         self.encoder_weight = vae.encoder.conv_in.weight
-        self.decoder_weight = vae.decoder.conv_out.weight
-        self.decoder_bias = vae.decoder.conv_out.bias
+        boundary = getattr(vae.decoder, "conv_out", None)
+        if boundary is None:
+            boundary = vae.decoder.proj_out
+        self.decoder_weight = boundary.weight
+        self.decoder_bias = boundary.bias
+        self.decoder_alpha_start = self.decoder_weight.shape[0] * 3 // 4
         self._alpha_before_step: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     @property
@@ -256,8 +264,8 @@ class FullRGBAVAEFineTune:
             return
         self._alpha_before_step = (
             self.encoder_weight[:, 3:4].detach().clone(),
-            self.decoder_weight[3:4].detach().clone(),
-            self.decoder_bias[3:4].detach().clone(),
+            self.decoder_weight[self.decoder_alpha_start:].detach().clone(),
+            self.decoder_bias[self.decoder_alpha_start:].detach().clone(),
         )
 
     @torch.no_grad()
@@ -267,7 +275,7 @@ class FullRGBAVAEFineTune:
         if self._alpha_before_step is None:
             return
         for parameter, before in zip(
-            (self.encoder_weight[:, 3:4], self.decoder_weight[3:4], self.decoder_bias[3:4]),
+            (self.encoder_weight[:, 3:4], self.decoder_weight[self.decoder_alpha_start:], self.decoder_bias[self.decoder_alpha_start:]),
             self._alpha_before_step,
         ):
             parameter.copy_(before + (parameter - before) * self.alpha_lr_multiplier)
@@ -675,7 +683,7 @@ class QwenRGBAVAETrainProcess(BaseTrainProcess):
             "checks": checks,
             "meaning": (
                 "ready means the fixed validation split passed RGBA reconstruction, edge, composite, "
-                "finite-value, and standard-Qwen opaque-latent compatibility gates"
+                "finite-value, and original RGB VAE opaque-latent compatibility gates"
             ),
         }
         self.latest_report = report
@@ -815,7 +823,7 @@ class QwenRGBAVAETrainProcess(BaseTrainProcess):
                 alpha_lr_multiplier=self.alpha_lr_multiplier,
             )
             self.print(
-                "RGBA VAE training scope: full model (Qwen-Image-Layered/AlphaVAE strategy), "
+                "RGBA VAE training scope: full model with paired RGB/RGBA reconstruction, "
                 f"alpha LR multiplier={self.alpha_lr_multiplier:g}"
             )
         else:
@@ -859,12 +867,12 @@ class QwenRGBAVAETrainProcess(BaseTrainProcess):
                     else 0.0
                 )
                 decoder_alpha_grad = (
-                    self.guard.decoder_weight.grad[3:4].detach().float().norm().item()
+                    self.guard.decoder_weight.grad[self.guard.decoder_alpha_start:].detach().float().norm().item()
                     if self.guard.decoder_weight.grad is not None
                     else 0.0
                 )
                 alpha_bias_grad = (
-                    self.guard.decoder_bias.grad[3:4].detach().float().norm().item()
+                    self.guard.decoder_bias.grad[self.guard.decoder_alpha_start:].detach().float().norm().item()
                     if self.guard.decoder_bias.grad is not None
                     else 0.0
                 )
@@ -884,7 +892,7 @@ class QwenRGBAVAETrainProcess(BaseTrainProcess):
                     " ".join(
                         [f"loss={total.detach().float().item():.3e}"]
                         + [f"{name}={value.detach().float().item():.2e}" for name, value in losses.items()]
-                        + [f"alpha_bias={self.vae.decoder.conv_out.bias[3].detach().float().item():.5f}"]
+                        + [f"alpha_bias={self.guard.decoder_bias[self.guard.decoder_alpha_start:].detach().float().mean().item():.5f}"]
                         + [
                             f"grad_enc_a={encoder_alpha_grad:.2e}",
                             f"grad_dec_a={decoder_alpha_grad:.2e}",

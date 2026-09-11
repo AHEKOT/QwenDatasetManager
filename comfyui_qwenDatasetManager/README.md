@@ -48,6 +48,8 @@ ComfyUI custom nodes for saving/loading Qwen datasets and merging Qwen LoRAs.
 
 6. **Batch handling**: Every target in the input batch is saved. Control batches must contain either one reusable image or the same number of images as the target batch.
 
+7. **Independent image sizes**: Target and control images are saved at their own input dimensions, preserving RGB/RGBA channels. Controls can differ in size from the target and from each other.
+
 Dataset names are single folder names and cannot escape ComfyUI's output directory.
 
 ### Example Usage
@@ -67,6 +69,8 @@ The node will automatically:
 ## Node: Qwen Dataset Loader
 
 Loads a dataset in Manual, List, or deterministic Random mode. Controls are matched by basename even when their extensions differ from the target. Missing controls become black images; controls with different dimensions are padded to the target size.
+
+Target and control images preserve transparency as four-channel RGBA tensors, including transparent palette PNGs. Images without alpha remain RGB. Padding around RGBA controls is transparent. Qwen Dataset Saver preserves the alpha channel when saving these tensors as PNG.
 
 ## Nodes: Qwen LoRA Merge / Save
 

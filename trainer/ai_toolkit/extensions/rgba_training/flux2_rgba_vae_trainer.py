@@ -73,6 +73,10 @@ def expand_flux2_vae_state_dict_to_rgba(
 class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
     """RGBA VAE trainer shared by FLUX.2 Klein 4B and 9B (native z=32 VAE)."""
 
+    family = "flux2_klein"
+    checkpoint_suffix = "flux2"
+    checkpoint_filename = "ae.safetensors"
+
     def __init__(self, process_id, job, config):
         super().__init__(process_id, job, config)
         self.source_filename = str(
@@ -83,8 +87,8 @@ class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
         root = Path(self.save_root)
         candidates = [
             path
-            for path in root.glob(f"{self.job.name}_step_*_flux2")
-            if path.is_dir() and (path / "ae.safetensors").is_file()
+            for path in root.glob(f"{self.job.name}_step_*_{self.checkpoint_suffix}")
+            if path.is_dir() and (path / self.checkpoint_filename).is_file()
         ]
         return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -146,7 +150,7 @@ class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
         checkpoint = self._latest_checkpoint()
         if checkpoint:
             self.print(f"Resuming FLUX.2 RGBA VAE from {checkpoint}")
-            state = load_file(str(checkpoint / "ae.safetensors"), device="cpu")
+            state = load_file(str(checkpoint / self.checkpoint_filename), device="cpu")
             params = flux2_autoencoder_params(state)
             if params.in_channels != 4 or params.out_ch != 4 or params.z_channels != 32:
                 raise ValueError("resume checkpoint is not a four-channel FLUX.2 z=32 VAE")
@@ -174,7 +178,7 @@ class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
             return
         state_path = checkpoint / "trainer_state.pt"
         if not state_path.is_file():
-            match = re.search(r"_step_(\d+)_flux2$", checkpoint.name)
+            match = re.search(rf"_step_(\d+)_{self.checkpoint_suffix}$", checkpoint.name)
             self.step_num = int(match.group(1)) if match else 0
             return
         state = torch.load(state_path, map_location="cpu", weights_only=False)
@@ -243,21 +247,21 @@ class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
         }
 
     def save(self, optimizer: torch.optim.Optimizer, step: int) -> Path:
-        checkpoint = Path(self.save_root) / f"{self.job.name}_step_{step:09d}_flux2"
+        checkpoint = Path(self.save_root) / f"{self.job.name}_step_{step:09d}_{self.checkpoint_suffix}"
         checkpoint.mkdir(parents=True, exist_ok=True)
         save_file(
             self._serializable_state(self.vae, torch.float32),
-            str(checkpoint / "ae.safetensors"),
-            metadata={"step": str(step), "family": "flux2_klein", "channels": "rgba"},
+            str(checkpoint / self.checkpoint_filename),
+            metadata={"step": str(step), "family": self.family, "channels": "rgba"},
         )
         if self.export_comfy_vae:
             comfy_path = checkpoint / f"{self.job.name}_step_{step:09d}_ComfyUI_bf16.safetensors"
             save_file(
                 self._serializable_state(self.vae, torch.bfloat16),
                 str(comfy_path),
-                metadata={"step": str(step), "family": "flux2_klein", "channels": "rgba"},
+                metadata={"step": str(step), "family": self.family, "channels": "rgba"},
             )
-            self.print(f"Saved native FLUX.2 ComfyUI RGBA VAE to {comfy_path}")
+            self.print(f"Saved native {self.family} ComfyUI RGBA VAE to {comfy_path}")
         torch.save(
             {
                 "step": int(step),
@@ -273,12 +277,12 @@ class Flux2RGBAVAETrainProcess(QwenRGBAVAETrainProcess):
         checkpoints = sorted(
             (
                 path
-                for path in Path(self.save_root).glob(f"{self.job.name}_step_*_flux2")
+                for path in Path(self.save_root).glob(f"{self.job.name}_step_*_{self.checkpoint_suffix}")
                 if path.is_dir()
             ),
             key=lambda path: path.stat().st_mtime,
         )
         for old in checkpoints[:-self.max_saves]:
             shutil.rmtree(old)
-        self.print(f"Saved FLUX.2 RGBA VAE checkpoint to {checkpoint}")
+        self.print(f"Saved {self.family} RGBA VAE checkpoint to {checkpoint}")
         return checkpoint

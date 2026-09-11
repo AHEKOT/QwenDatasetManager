@@ -1654,6 +1654,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if supports_rgba:
                 rgba_mode = item.rgba_control_mode or 'generation'
                 background = None
+                paired_controls = None
+                if rgba_mode == 'paired':
+                    paired_controls = []
+                    for control_path in item.control_paths:
+                        with Image.open(control_path) as reference:
+                            paired_controls.append(ImageOps.exif_transpose(reference).copy())
                 if rgba_mode == 'edit':
                     background_root = item.rgba_control_background_path
                     if background_root:
@@ -1681,6 +1687,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     target_size,
                     control_mode=rgba_mode,
                     background_image=background,
+                    control_images=paired_controls,
                     alpha_threshold=item.rgba_alpha_threshold,
                     hidden_rgb_color=item.rgba_hidden_rgb_color,
                     edge_color_correction=item.rgba_edge_color_correction,
@@ -1690,6 +1697,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             else:
                 img = img.convert('RGB').resize(target_size, Image.BICUBIC)
                 tensor = transforms.ToTensor()(img) * 2.0 - 1.0
+            if getattr(self.sd, 'supports_rgba_video_loss', False) and (
+                rgba_mode == 'generation' or getattr(self.sd, 'dopsd', False)
+            ):
+                control = None
             image_list.append(tensor)
             control_list.append(control)
             rgba_mode_list.append(rgba_mode)
@@ -1714,8 +1725,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for prompt, control in zip(prompt_list, control_list):
                 prompt_kwargs = {}
                 if self.sd.encode_control_in_text_embeddings and control is not None:
-                    prompt_kwargs['control_images'] = control.unsqueeze(0).to(
-                        device, dtype=dtype
+                    prompt_kwargs['control_images'] = (
+                        [c.unsqueeze(0).to(device, dtype=dtype) for c in control]
+                        if isinstance(control, list) else control.unsqueeze(0).to(device, dtype=dtype)
                     )
                 embeds_list.append(
                     self.sd.encode_prompt([prompt], **prompt_kwargs)
@@ -1819,14 +1831,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 batch_embeds = concat_prompt_embeds([embeds_cpu.clone().to(device, dtype=dtype)] * len(sigmas))
                 validation_batch = None
                 if control_cpu is not None:
-                    batch_control = torch.cat(
-                        [control_cpu.unsqueeze(0)] * len(sigmas), dim=0
-                    )
+                    paired_controls = isinstance(control_cpu, list)
+                    batch_control = None if paired_controls else torch.cat(
+                        [control_cpu.unsqueeze(0)] * len(sigmas), dim=0)
                     validation_batch = SimpleNamespace(
+                        num_frames=1, file_items=[], audio_latents=None,
                         control_tensor=batch_control,
-                        control_tensor_list=None,
+                        control_tensor_list=[control_cpu] * len(sigmas) if paired_controls else None,
                         dataset_config=SimpleNamespace(
-                            rgba_generate_control=True,
+                            do_audio=False, do_i2v=False,
+                            rgba_generate_control=rgba_mode != 'paired',
                             rgba_control_mode=rgba_mode,
                         ),
                     )
@@ -2464,6 +2478,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         ### HOOk ###
         self.before_dataset_load()
+        if getattr(self.sd, 'require_pixel_tensor_cache', False):
+            # model needs pixel tensors at train time even with cached latents;
+            # storing them changes the latent cache key (first run re-caches)
+            for ds_list in [self.datasets, self.datasets_reg]:
+                if ds_list is None:
+                    continue
+                for ds in ds_list:
+                    if not (ds.cache_latents or ds.cache_latents_to_disk):
+                        # live-loading datasets already have pixels on the batch
+                        continue
+                    if not ds.cache_tensors_to_disk:
+                        print_acc(
+                            f"Model requires cached pixel tensors: forcing "
+                            f"cache_tensors_to_disk on dataset {ds.folder_path}"
+                        )
+                        ds.cache_tensors_to_disk = True
         # load datasets if passed in the root process
         if self.datasets is not None:
             self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)

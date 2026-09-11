@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qwen Dataset Manager — Trainer</title>
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="stylesheet" href="/static/trainer.css?v=20">
+    <link rel="stylesheet" href="/static/trainer.css?v=21">
 </head>
 
 <body class="trainer-page" data-independent-validation-uploads="<!--TRAINER_VALIDATION_UPLOADS-->">
@@ -125,6 +125,13 @@
                                 </div>
                             </section>
 
+                            <section id="trainer-h3-card" class="trainer-card hidden">
+                                <div class="trainer-card-heading"><span>MiniMax H3</span></div>
+                                <p class="trainer-help">The training adapter stays active only during training. Contrastive Guidance + adapter is the default. D-OPSD uses the target as the teacher's reference and trains a reference-free student. Ref2VA controls are subject/style references; ordinary H3 uses first-frame I2V. Sampling uses guidance 1.</p>
+                                <div id="trainer-h3-fields" class="trainer-fields"></div>
+                                <p class="trainer-help">Local weights are reused from diffusion_models/, text_encoders/, vae/ and loras/ under Models folder, including nested folders. Overrides select individual files. Missing files download there unless Local files only is enabled. For fully offline loading, supply the original tokenizer/processor/text_encoder config folders too.</p>
+                            </section>
+
                             <section class="trainer-card trainer-lora-only">
                                 <div class="trainer-card-heading"><span>Quantize / compile</span></div>
                                 <div class="trainer-fields">
@@ -218,7 +225,7 @@
                                 <label class="trainer-field" for="trainer-rgba-lora-alpha-loss"><span>Alpha consistency strength</span><input id="trainer-rgba-lora-alpha-loss" type="number" min="0" step="0.1" value="1"></label>
                                 <label class="trainer-field" for="trainer-rgba-lora-edge-loss"><span>Alpha edge consistency</span><input id="trainer-rgba-lora-edge-loss" type="number" min="0" step="0.1" value="0.5"></label>
                             </div>
-                            <p class="trainer-help">A calibrated fixed latent probe gently reinforces the VAE's shared alpha direction while the standard diffusion MSE remains primary. It performs no extra transformer forward and no VAE decode. Recommended starting values: alpha 1, edges 0.5, learning rate 0.00001.</p>
+                            <p id="trainer-rgba-loss-help" class="trainer-help">A calibrated fixed latent probe gently reinforces the VAE's shared alpha direction while the standard diffusion MSE remains primary. It performs no extra transformer forward and no VAE decode. Recommended starting values: alpha 1, edges 0.5, learning rate 0.00001.</p>
                         </section>
 
                         <section class="trainer-card trainer-wide-card trainer-vae-only hidden">
@@ -536,6 +543,7 @@
                 <button id="trainer-sample-prev" class="trainer-sample-nav trainer-sample-nav-left" type="button" aria-label="Previous sample">←</button>
                 <div id="trainer-sample-viewport" class="trainer-sample-viewport">
                     <img id="trainer-sample-viewer-image" alt="Generated validation sample">
+                    <video id="trainer-sample-viewer-video" class="hidden" controls playsinline preload="metadata"></video>
                 </div>
                 <button id="trainer-sample-next" class="trainer-sample-nav trainer-sample-nav-right" type="button" aria-label="Next sample">→</button>
                 <button id="trainer-sample-next-step" class="trainer-sample-nav trainer-sample-nav-down" type="button" aria-label="Next validation step">↓</button>
@@ -555,7 +563,8 @@
     <div id="trainer-toast" class="trainer-toast hidden" role="status" aria-live="polite"></div>
     <script id="trainer-bootstrap" type="application/json"><!--TRAINER_BOOTSTRAP--></script>
     <script src="/static/ui-dialog.js?v=1"></script>
-    <script src="/static/trainer.js?v=27"></script>
+    <script src="/static/trainer_h3.js?v=1"></script>
+    <script src="/static/trainer.js?v=31"></script>
 </body>
 
 </html>

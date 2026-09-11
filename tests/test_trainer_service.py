@@ -1,10 +1,13 @@
 import io
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from flask import Flask
 from PIL import Image
@@ -710,8 +713,91 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(len(self.service.list_jobs()), 1)
 
     def test_pid_access_denied_means_process_is_still_alive(self):
-        with patch('trainer_service.os.kill', side_effect=PermissionError):
+        with patch('trainer_service.os.name', 'posix'), patch('trainer_service.os.kill', side_effect=PermissionError):
             self.assertTrue(self.service._pid_alive(1234))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process handle semantics')
+    def test_windows_detects_exit_while_popen_still_holds_process_handle(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'])
+        try:
+            process.wait(timeout=10)
+            self.assertFalse(self.service._windows_pid_alive(process.pid))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process handle semantics')
+    def test_windows_identifies_current_process_as_alive(self):
+        self.assertTrue(self.service._windows_pid_alive(os.getpid()))
+
+    def test_completed_process_releases_pid_without_losing_final_status(self):
+        self.make_dataset()
+        job, _ = self.service.create_job(self.default_payload())
+        for status in ('completed', 'stopped', 'error', 'queued'):
+            with self.subTest(status=status):
+                with self.service.connect() as connection:
+                    connection.execute(
+                        "UPDATE Job SET status = ?, pid = 4321, step = 42, info = 'Final message' WHERE id = ?",
+                        (status, job['id']))
+                self.service._processes[4321] = Mock(poll=Mock(return_value=0))
+                with patch.object(self.service, '_windows_pid_alive', return_value=True):
+                    self.service._poll_running_jobs()
+                result = self.service.get_job(job['id'])
+                self.assertIsNone(result['pid'])
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['step'], 42)
+                self.assertEqual(result['info'], 'Final message')
+                self.assertNotIn(4321, self.service._processes)
+
+    def test_final_status_does_not_release_a_runner_still_exiting(self):
+        self.make_dataset()
+        job, _ = self.service.create_job(self.default_payload())
+        with self.service.connect() as connection:
+            connection.execute("UPDATE Job SET status = 'completed', pid = 4321 WHERE id = ?", (job['id'],))
+        self.service._processes[4321] = Mock(poll=Mock(return_value=None))
+        self.service._poll_running_jobs()
+        self.assertEqual(self.service.get_job(job['id'])['pid'], 4321)
+
+    def test_exited_runner_without_final_status_becomes_error(self):
+        self.make_dataset()
+        job, _ = self.service.create_job(self.default_payload())
+        with self.service.connect() as connection:
+            connection.execute("UPDATE Job SET status = 'running', pid = 4321 WHERE id = ?", (job['id'],))
+        self.service._processes[4321] = Mock(poll=Mock(return_value=1))
+        self.service._poll_running_jobs()
+        result = self.service.get_job(job['id'])
+        self.assertEqual(result['status'], 'error')
+        self.assertIsNone(result['pid'])
+
+    def test_same_job_can_launch_twice_after_real_child_exits(self):
+        self.make_dataset()
+        job, _ = self.service.create_job(self.default_payload())
+        self.service.venv_python = Path(sys.executable)
+        self.service.vendor_root.mkdir(parents=True)
+        (self.service.vendor_root / 'run.py').write_text(
+            "import json, os, sqlite3, sys\n"
+            "config = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "db = config['config']['process'][0]['sqlite_db_path']\n"
+            "with sqlite3.connect(db, timeout=10) as connection:\n"
+            "    connection.execute(\"UPDATE Job SET status='completed', info='Finished' WHERE id=?\", (os.environ['AITK_JOB_ID'],))\n",
+            encoding='utf-8')
+        for _ in range(2):
+            self.service.queue_job(job['id'])
+            self.service._start_queued_jobs()
+            pid = self.service.get_job(job['id'])['pid']
+            child = self.service._processes[pid]
+            try:
+                self.assertEqual(child.wait(timeout=10), 0)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+            self.service._poll_running_jobs()
+            result = self.service.get_job(job['id'])
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['info'], 'Finished')
+            self.assertIsNone(result['pid'])
 
     def test_launch_claims_job_before_spawn_and_does_not_overwrite_child_progress(self):
         self.make_dataset()

@@ -57,6 +57,11 @@
     };
 
     const $ = id => document.getElementById(id);
+    const h3 = window.QdmH3;
+    h3.mount();
+    const isH3 = () => h3.isH3(selectedModel()?.key);
+    const isQieJoint = () => selectedModel()?.key === 'qwen_image_edit_2511' && selectedPreset() === 'transparent_lora';
+    const isVideoPath = path => /\.(mp4|avi|mov|webm|mkv|wmv|m4v|flv)$/i.test(path || '');
     const independentValidationUploads = document.body.dataset.independentValidationUploads === 'true';
     const editorView = $('trainer-editor-view');
     const detailView = $('trainer-detail-view');
@@ -139,7 +144,7 @@
         return selectedTrainingChoice().preset;
     }
 
-    const isVaePreset = preset => preset === 'qwen_rgba_vae' || preset === 'flux2_rgba_vae';
+    const isVaePreset = preset => ['qwen_rgba_vae', 'flux2_rgba_vae', 'h3_rgba_vae'].includes(preset);
     const isChromaPreset = preset => preset === 'chromakey_tiny';
 
     function setTrainingChoice(modelKey, preset = 'standard_lora') {
@@ -172,8 +177,8 @@
         const standardOptions = editModels.map(model =>
             `<option value="${escapeHtml(trainingChoiceValue('standard_lora', model.key))}">${escapeHtml(model.label)}</option>`
         ).join('');
-        const transparentOptions = editModels.map(model =>
-            `<option value="${escapeHtml(trainingChoiceValue('transparent_lora', model.key))}">${escapeHtml(model.label)} — Transparent RGBA LoRA</option>`
+        const transparentOptions = editModels.filter(model => model.transparentArch).map(model =>
+            `<option value="${escapeHtml(trainingChoiceValue('transparent_lora', model.key))}">${escapeHtml(model.label)} — ${model.key === 'qwen_image_edit_2511' ? 'Edit RGB / RGBA LoRA' : 'Transparent RGBA LoRA'}</option>`
         ).join('');
         const qwen = state.models.find(model => model.key === 'qwen_image_edit_2511');
         const qwenVaeOption = qwen
@@ -183,15 +188,17 @@
         const flux2VaeOption = klein
             ? `<option value="${escapeHtml(trainingChoiceValue('flux2_rgba_vae', klein.key))}">FLUX.2 Klein 4B / 9B — Train RGBA VAE</option>`
             : '';
+        const h3Model = state.models.find(model => model.key === 'minimax_h3');
+        const h3VaeOption = h3Model ? `<option value="${escapeHtml(trainingChoiceValue('h3_rgba_vae', h3Model.key))}">MiniMax H3 / Ref2VA — Train RGBA VAE</option>` : '';
         const chroma = state.models.find(model => model.kind === 'chromakey');
         const chromaOption = chroma
             ? `<option value="${escapeHtml(trainingChoiceValue('chromakey_tiny', chroma.key))}">${escapeHtml(chroma.label)} — Clean alpha + native detail</option>`
             : '';
         modelSelect.innerHTML = [
             `<optgroup label="Standard edit LoRA">${standardOptions}</optgroup>`,
-            `<optgroup label="Transparent RGBA LoRA">${transparentOptions}</optgroup>`,
-            (qwenVaeOption || flux2VaeOption)
-                ? `<optgroup label="VAE training">${qwenVaeOption}${flux2VaeOption}</optgroup>`
+            `<optgroup label="Edit / RGBA LoRA">${transparentOptions}</optgroup>`,
+            (qwenVaeOption || flux2VaeOption || h3VaeOption)
+                ? `<optgroup label="VAE training">${qwenVaeOption}${flux2VaeOption}${h3VaeOption}</optgroup>`
                 : '',
             chromaOption ? `<optgroup label="Specialized models">${chromaOption}</optgroup>` : '',
         ].join('');
@@ -208,19 +215,20 @@
         const preset = selectedPreset();
         if (!isVaePreset(preset)) return;
         const isFlux2 = preset === 'flux2_rgba_vae';
+        const isH3Vae = preset === 'h3_rgba_vae';
         const path = $('trainer-source-vae-path');
         const subfolder = $('trainer-source-vae-subfolder');
         const knownPaths = ['Qwen/Qwen-Image-Edit-2511', 'ai-toolkit/flux2_vae'];
         if (force || !path.value.trim() || knownPaths.includes(path.value.trim())) {
-            path.value = isFlux2 ? 'ai-toolkit/flux2_vae' : 'Qwen/Qwen-Image-Edit-2511';
+            path.value = isH3Vae ? selectedModel().defaultSourceVaePath : isFlux2 ? 'ai-toolkit/flux2_vae' : 'Qwen/Qwen-Image-Edit-2511';
         }
         if (force || !subfolder.value.trim() || subfolder.value.trim() === 'vae') {
-            subfolder.value = isFlux2 ? '' : 'vae';
+            subfolder.value = isFlux2 || isH3Vae ? '' : 'vae';
         }
-        $('trainer-vae-heading').textContent = isFlux2
+        $('trainer-vae-heading').textContent = isH3Vae ? 'MiniMax H3 RGBA VAE training' : isFlux2
             ? 'FLUX.2 Klein RGBA VAE training'
             : 'Qwen RGBA VAE training';
-        $('trainer-source-vae-path-label').textContent = isFlux2
+        $('trainer-source-vae-path-label').textContent = isH3Vae ? 'Original local H3 RGB video VAE (.safetensors)' : isFlux2
             ? 'Standard FLUX.2 VAE repository / local file'
             : 'Standard Qwen model / path';
         $('trainer-source-vae-subfolder-label').textContent = isFlux2
@@ -253,15 +261,21 @@
         $('trainer-editor-title').textContent = isChroma
             ? 'Configure CleanMatte alpha training'
             : isVae
-            ? (preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
-            : (isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
+            ? (preset === 'h3_rgba_vae' ? 'Configure MiniMax H3 RGBA VAE training' : preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
+            : (isQieJoint() ? 'Configure QIE2511 edit training (RGB / RGBA)' : isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
         $('trainer-editor-description').textContent = isChroma
             ? 'RGBA targets are composited onto configurable synthetic backgrounds without changing their aspect ratio. The model receives RGB only.'
             : isVae
             ? 'RGBA targets are mapped from each selected dataset; captions and Control folders are not used.'
             : (isTransparent
-                ? 'Each dataset independently uses Edit with random real backgrounds or Generation with a black Control1.'
+                ? (isQieJoint() ? 'Train edits from Control1–3 and caption instructions against the complete target. RGB, RGBA and mixed datasets are supported; missing alpha means fully opaque. Uses the compatible RGBA VAE.' : isH3() ? 'Single RGBA image targets. Edit uses opaque composites; Generation uses captions. Select a trained H3 RGBA VAE. Video samples are lossless APNG, with audio in a WAV sidecar.' : 'Each dataset independently uses Edit with random real backgrounds or Generation with a black Control1.')
                 : 'Target images and Control1–3 are mapped directly from the selected datasets.');
+        $('trainer-rgba-loss-help').textContent = isH3()
+            ? 'H3 uses RGBA latent flow loss plus differentiable VAE alpha and edge reconstruction. The auxiliary loss decodes the predicted clean image and uses extra VAE memory. Set both strengths to 0 for latent flow loss only.'
+            : isQieJoint() ? 'The complete latent diffusion loss trains RGB edits and alpha together. Alpha-only filtering is disabled. Extra alpha/edge losses apply only when a compatible calibrated probe is loaded.' : "A calibrated fixed latent probe reinforces the VAE alpha direction. Recommended starting values: alpha 1, edges 0.5, learning rate 0.00001.";
+        $('trainer-independent-validation-help').textContent = isQieJoint()
+            ? 'Upload held-out RGB or RGBA targets with their real input Controls and edit instructions. These files are not used for training. Full validation loss and alpha metrics are reported separately.'
+            : 'Upload an independent RGBA target set here. These files are not used for training. Alpha PASS/FAIL uses the worst selected sigma.';
         renderDatasetPicker();
         renderSelectedDatasets();
         renderChromaValidationItems();
@@ -270,6 +284,7 @@
     function renderModelFields(resetPath = false, resetAssets = false) {
         const model = selectedModel();
         if (!model) return;
+        h3.render(isVaePreset(selectedPreset()) ? '' : model.key);
         $('trainer-model-license').textContent = model.license;
         $('trainer-model-license').title = model.gated ? 'Gated Hugging Face model' : model.license;
         if (model.kind === 'chromakey') {
@@ -307,7 +322,7 @@
         qtype.value = allowed.has(previous) ? previous : model.defaultQtype;
 
         const qtypeTe = $('trainer-qtype-te');
-        const previousTe = qtypeTe.value || model.defaultQtype;
+        const previousTe = qtypeTe.value || model.defaultQtypeTextEncoder || model.defaultQtype;
         qtypeTe.innerHTML = standardOptions;
         qtypeTe.value = state.qtypes.includes(previousTe) ? previousTe : model.defaultQtype;
     }
@@ -354,7 +369,8 @@
         }
         jobsList.innerHTML = jobs.map(job => {
             const model = state.models.find(item => item.key === job.form?.model);
-            const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
+            const presetLabel = job.form?.model === 'qwen_image_edit_2511' && job.form?.trainingPreset === 'transparent_lora'
+            ? 'Edit RGB / RGBA LoRA' : state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
             return `<button class="trainer-job-item${job.id === state.selectedJobId ? ' is-selected' : ''}" type="button" data-job-id="${escapeHtml(job.id)}">
                 <span class="trainer-job-item-top"><strong>${escapeHtml(job.name)}</strong><span class="trainer-mini-status" data-status="${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></span>
                 <span class="trainer-job-item-meta"><span>${escapeHtml(presetLabel || model?.label || job.config?.config?.process?.[0]?.model?.arch || 'Training')}</span><span>${escapeHtml(job.step)} / ${escapeHtml(job.total_steps)}</span></span>
@@ -369,13 +385,13 @@
         const previous = select.value;
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
         const preset = selectedPreset();
-        const validityKey = preset === 'transparent_lora'
+        const validityKey = isQieJoint() ? 'minimaxValid' : isH3() && preset === 'standard_lora' ? 'minimaxValid' : preset === 'transparent_lora'
             ? 'transparentValid'
             : (isVaePreset(preset) ? 'vaeValid' : (isChromaPreset(preset) ? 'chromakeyValid' : 'valid'));
         select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
             const ready = !dataset.inspected || Boolean(dataset[validityKey]);
             const details = dataset.inspected
-                ? ` · ${dataset.targetCount} targets · ${dataset.alphaCount || 0} alpha · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`
+                ? ` · ${isH3() ? dataset.mediaTargetCount : dataset.targetCount} targets · ${isH3() ? (dataset.videoCount || 0) + ' video' : (dataset.alphaCount || 0) + ' alpha'} · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`
                 : '';
             return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)}${details}</option>`;
         }).join('');
@@ -424,17 +440,18 @@
         if (!inspection || (!allowDuplicate && state.selectedDatasets.some(dataset => dataset.name === name))) return;
         state.selectedDatasets.push({
             name,
+            ...(isH3() ? { ...h3.datasetDefaults, ...settings } : {}),
             repeats: Number(settings.repeats ?? 1),
             weight: Number(settings.weight ?? 1),
             captionDropout: Number(settings.captionDropout ?? 0.05),
             defaultCaption: settings.defaultCaption || '',
             captionExtension: settings.captionExtension || 'txt',
             resolutions: Array.isArray(settings.resolutions) ? settings.resolutions.map(Number) : [512, 768, 1024],
-            cacheLatents: Boolean(settings.cacheLatents),
+            cacheLatents: Boolean(settings.cacheLatents ?? isH3()),
             isRegularization: Boolean(settings.isRegularization),
             flipX: Boolean(settings.flipX),
             flipY: Boolean(settings.flipY),
-            rgbaControlMode: settings.rgbaControlMode || 'edit',
+            rgbaControlMode: settings.rgbaControlMode || (isQieJoint() ? 'paired' : 'edit'),
             rgbaBackgroundDataset: settings.rgbaBackgroundDataset || '',
         });
         renderSelectedDatasets();
@@ -462,8 +479,9 @@
         const dynamicTextCacheSafe = ['flux2_klein_4b', 'flux2_klein_9b'].includes(
             selectedTrainingChoice().modelKey
         );
-        const cacheRequired = isTransparent && dynamicTextCacheSafe;
-        const cacheUnsafe = dynamicBackgrounds && !dynamicTextCacheSafe;
+        const dopsd = isH3() && $('h3-distillationMethod').value === 'dopsd';
+        const cacheRequired = (isTransparent && dynamicTextCacheSafe) || dopsd;
+        const cacheUnsafe = dynamicBackgrounds && !dynamicTextCacheSafe && !dopsd;
         const input = $('trainer-cache-text');
         const wrap = $('trainer-cache-text-wrap');
         const unloadInput = $('trainer-unload-text');
@@ -473,12 +491,13 @@
             unloadInput.checked = true;
         } else if (cacheUnsafe) {
             input.checked = false;
+            if (isH3()) unloadInput.checked = false;
         }
         input.disabled = cacheUnsafe || cacheRequired;
         unloadInput.disabled = cacheRequired;
         wrap.classList.toggle('is-disabled', cacheUnsafe || cacheRequired);
         unloadWrap.classList.toggle('is-disabled', cacheRequired);
-        wrap.title = cacheRequired
+        wrap.title = dopsd ? 'D-OPSD caches student and teacher captions plus target pixels.' : cacheRequired
             ? 'Klein RGBA training caches captions once and keeps the text encoder unloaded.'
             : (cacheUnsafe
             ? 'Random background controls are generated on every training sample and cannot use cached text embeddings.'
@@ -522,13 +541,15 @@
             };
             const metric = value => value === null ? '—' : value;
             const preset = selectedPreset();
-            const controls = preset === 'transparent_lora' || isChromaPreset(preset)
+            const controls = (preset === 'transparent_lora' && settings.rgbaControlMode !== 'paired') || isChromaPreset(preset)
                 ? '<span>Paired controls ignored</span>'
-                : dataset.controls.map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
+                : (isH3() ? (dataset.mediaControls || dataset.controls) : dataset.controls).map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
             const inspectionWarnings = dataset.inspectionError
                 ? [`Inspection failed: ${dataset.inspectionError}`]
                 : [];
             const relevantWarnings = [...dataset.warnings, ...inspectionWarnings].filter(warning => {
+                if (isQieJoint() && settings.rgbaControlMode === 'paired') return !warning.includes('no alpha channel');
+                if (isH3()) return !warning.includes('no control images') && !warning.includes('no alpha channel') && !(dataset.videoCount && warning.includes('no target images'));
                 if (isChromaPreset(preset)) {
                     return !warning.includes('no control images') && !warning.includes('no caption');
                 }
@@ -538,12 +559,13 @@
             const rgbaMode = preset === 'transparent_lora'
                 ? `<section class="trainer-rgba-settings">
                     <div class="trainer-field"><span>RGBA training mode</span><div class="trainer-mode-toggle" role="radiogroup" aria-label="RGBA training mode for ${escapeHtml(dataset.name)}">
-                        <label><input type="radio" name="rgba-mode-${index}" value="edit" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'edit' ? ' checked' : ''}><span>Edit</span></label>
+                        ${isQieJoint() ? `<label><input type="radio" name="rgba-mode-${index}" value="paired" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'paired' ? ' checked' : ''}><span>Paired edit · RGB / RGBA</span></label>` : ''}
+                        <label><input type="radio" name="rgba-mode-${index}" value="edit" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'edit' ? ' checked' : ''}><span>${isQieJoint() ? 'Automatic background removal' : 'Edit'}</span></label>
                         <label><input type="radio" name="rgba-mode-${index}" value="generation" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'generation' ? ' checked' : ''}><span>Generation</span></label>
                     </div></div>
-                    ${settings.rgbaControlMode === 'edit'
+                    ${settings.rgbaControlMode === 'paired' ? `<div class="trainer-rgba-mode-note"><strong>Edit and alpha trained together</strong><span>Control1–3 supply the real inputs; img supplies the RGB or RGBA result. Matching filenames and caption instructions define the edit. No synthetic background is used.</span></div>` : settings.rgbaControlMode === 'edit'
                         ? `<label class="trainer-field trainer-background-dataset-field"><span>Background dataset <small>required</small></span><select data-dataset-field="rgbaBackgroundDataset" data-dataset-index="${index}">${backgroundDatasetOptions(settings.rgbaBackgroundDataset)}</select><small>A random opaque image from its img folder is placed behind the RGBA target on every training sample.</small></label>`
-                        : `<div class="trainer-rgba-mode-note"><strong>Generation mode · alpha residual only</strong><span>The PNG supplies only its alpha mask and edges. RGB content is preserved from the frozen base model, caption dropout is disabled, and Control1 is solid black.</span></div>`}
+                        : isH3() || isQieJoint() ? `<div class="trainer-rgba-mode-note"><strong>Generation from captions</strong><span>Train the complete RGBA latent target. Paired control folders are ignored in this mode.</span></div>` : `<div class="trainer-rgba-mode-note"><strong>Generation mode · alpha residual only</strong><span>The PNG supplies only its alpha mask and edges. RGB content is preserved from the frozen base model, caption dropout is disabled, and Control1 is solid black.</span></div>`}
                 </section>`
                 : '';
             const datasetSettings = isChromaPreset(preset)
@@ -562,6 +584,7 @@
                     <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
                     <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
                     ${rgbaMode}
+                    ${selectedPreset() === 'standard_lora' ? h3.datasetFields(settings, index, selectedModel()?.key, escapeHtml, dataset.mediaControls || dataset.controls) : ''}
                     <div class="trainer-resolution-row"><span>Resolutions</span>${[256, 512, 768, 1024, 1280, 1328, 1536, 2048].map(value => resolutionChip(index, value, settings.resolutions.includes(value))).join('')}</div>
                     <div class="trainer-toggle-row trainer-resolution-row">
                         <label class="trainer-switch"><input data-dataset-field="cacheLatents" data-dataset-index="${index}" type="checkbox"${settings.cacheLatents ? ' checked' : ''}><span></span>Cache latents</label>
@@ -573,9 +596,9 @@
             const datasetMetrics = isChromaPreset(preset)
                 ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.chromaImageCount ?? dataset.targetCount)}</strong><span>PNG/WebP images</span></div></div>`
                 : `<div class="trainer-dataset-metrics">
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.targetCount)}</strong><span>targets</span></div>
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.captionCount)}</strong><span>captions</span></div>
-                    <div class="trainer-dataset-metric"><strong>${metric(dataset.alphaCount)}</strong><span>alpha</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(isH3() ? dataset.mediaTargetCount : dataset.targetCount)}</strong><span>targets</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(isH3() ? dataset.mediaCaptionCount : dataset.captionCount)}</strong><span>captions</span></div>
+                    <div class="trainer-dataset-metric"><strong>${isQieJoint() && settings.rgbaControlMode === 'paired' ? 'RGB / RGBA' : metric(dataset.alphaCount)}</strong><span>${isQieJoint() && settings.rgbaControlMode === 'paired' ? 'target format' : 'alpha'}</span></div>
                 </div>`;
             return `<article class="trainer-dataset-card" data-dataset-card="${index}">
                 <div class="trainer-dataset-title">
@@ -608,7 +631,12 @@
         const field = input.dataset.datasetField;
         const dataset = state.selectedDatasets[index];
         if (!dataset) return;
-        if (field === 'resolution') {
+        if (field === 'controls') {
+            const available = state.datasets.find(item => item.name === dataset.name);
+            const controls = new Set(dataset.controls ?? (available.mediaControls || available.controls).map(c => c.name));
+            input.checked ? controls.add(input.value) : controls.delete(input.value);
+            dataset.controls = [...controls];
+        } else if (field === 'resolution') {
             const value = Number(input.value);
             const resolutions = new Set(dataset.resolutions);
             input.checked ? resolutions.add(value) : resolutions.delete(value);
@@ -641,12 +669,12 @@
         const addLabel = controlIndex === 1 ? 'Add Image 1' : `Add Additional Image ${controlIndex}`;
         const preview = sampleImagePreviewUrl(path);
         const previewContent = path
-            ? `<img src="${escapeHtml(preview)}" alt="Image to edit ${controlIndex}">`
+            ? (isVideoPath(path) ? `<video src="${escapeHtml(preview)}" muted preload="metadata"></video>` : `<img src="${escapeHtml(preview)}" alt="Reference ${controlIndex}">`)
             : `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>${escapeHtml(addLabel)}</strong><span>Click or drop</span>`;
         return `<div class="trainer-sample-image-slot${path ? ' has-image' : ''}" data-sample-image-slot="${sampleIndex}-${controlIndex}">
             <button class="trainer-sample-image-picker" type="button" data-pick-sample-image="${sampleIndex}-${controlIndex}" aria-label="${path ? 'Replace' : 'Add'} image to edit ${controlIndex}">${previewContent}</button>
             ${path ? `<button class="trainer-sample-image-clear" type="button" data-clear-sample-image="${sampleIndex}-${controlIndex}" aria-label="Clear image to edit ${controlIndex}" title="Clear image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>` : ''}
-            <input class="hidden" type="file" accept="image/png,image/jpeg,image/webp" data-sample-file="${sampleIndex}-${controlIndex}" tabindex="-1">
+            <input class="hidden" type="file" accept="image/png,image/jpeg,image/webp${isH3() ? ',video/*' : ''}" data-sample-file="${sampleIndex}-${controlIndex}" tabindex="-1">
             <div class="trainer-sample-upload-overlay hidden" aria-live="polite"><div class="trainer-sample-upload-track"><span></span></div><small>Uploading… <b>0%</b></small></div>
         </div>`;
     }
@@ -658,7 +686,7 @@
             <button class="trainer-icon-btn trainer-sample-remove" type="button" data-remove-sample="${index}" aria-label="Remove sample ${index + 1}" title="Remove sample"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
             <div class="trainer-sample-editor">
                 <div class="trainer-sample-fields">
-                    <label class="trainer-field trainer-sample-instruction"><span>Edit instruction</span><input data-sample-field="prompt" data-sample-index="${index}" type="text" value="${escapeHtml(sample.prompt || '')}" placeholder="Describe the edit" required></label>
+                    <label class="trainer-field trainer-sample-instruction"><span>${isH3() ? 'Prompt' : 'Edit instruction'}</span><input data-sample-field="prompt" data-sample-index="${index}" type="text" value="${escapeHtml(sample.prompt || '')}" placeholder="${isH3() ? 'Describe the scene and audio' : 'Describe the edit'}" required></label>
                     <div class="trainer-sample-parameters">
                         <label class="trainer-field"><span>Width</span><input data-sample-field="width" data-sample-index="${index}" type="text" inputmode="numeric" value="${escapeHtml(sample.width ?? '')}" placeholder="${escapeHtml($('trainer-sample-width').value)} (default)"></label>
                         <label class="trainer-field"><span>Height</span><input data-sample-field="height" data-sample-index="${index}" type="text" inputmode="numeric" value="${escapeHtml(sample.height ?? '')}" placeholder="${escapeHtml($('trainer-sample-height').value)} (default)"></label>
@@ -666,7 +694,7 @@
                         <label class="trainer-field"><span>LoRA scale</span><input data-sample-field="networkMultiplier" data-sample-index="${index}" type="text" inputmode="decimal" value="${escapeHtml(sample.networkMultiplier ?? sample.network_multiplier ?? '')}" placeholder="1.0 (default)"></label>
                     </div>
                 </div>
-                <fieldset class="trainer-sample-images"><legend>Images to edit</legend><div>${[1, 2, 3].map(controlIndex => renderSampleImageSlot(sample, index, controlIndex)).join('')}</div></fieldset>
+                <fieldset class="trainer-sample-images"><legend>${isH3() ? 'Optional references (image / video)' : 'Images to edit'}</legend><div>${[1, 2, 3].map(controlIndex => renderSampleImageSlot(sample, index, controlIndex)).join('')}</div></fieldset>
             </div>
         </article>`).join('');
     }
@@ -694,7 +722,8 @@
         const [sampleIndexText, controlIndexText] = input.dataset.sampleFile.split('-');
         const sampleIndex = Number(sampleIndexText);
         const controlIndex = Number(controlIndexText);
-        const sample = state.samples[sampleIndex];
+        const validationControl = Boolean(input.closest('#trainer-validation-items'));
+        const sample = (validationControl ? state.validationItems : state.samples)[sampleIndex];
         if (!sample) return;
         const slot = input.closest('.trainer-sample-image-slot');
         const overlay = slot.querySelector('.trainer-sample-upload-overlay');
@@ -719,7 +748,8 @@
             }
             sample[`ctrlImg${controlIndex}`] = result.path;
             delete sample[`ctrl_img_${controlIndex}`];
-            renderSamplesPreservingPlace(`[data-pick-sample-image="${sampleIndex}-${controlIndex}"]`);
+            if (validationControl) renderValidationItemsPreservingPlace();
+            else renderSamplesPreservingPlace(`[data-pick-sample-image="${sampleIndex}-${controlIndex}"]`);
         });
         requestValue.addEventListener('error', () => {
             overlay.classList.add('hidden');
@@ -744,11 +774,11 @@
         const preview = validationImagePreviewUrl(path);
         const previewContent = path
             ? `<img src="${escapeHtml(preview)}" alt="RGBA validation target ${index + 1}">`
-            : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>Upload RGBA target</strong><span>PNG or WebP · click or drop</span>`;
+            : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>Upload RGB / RGBA target</strong><span>PNG, JPEG or WebP · click or drop</span>`;
         return `<div class="trainer-sample-image-slot trainer-validation-image-slot${path ? ' has-image' : ''}" data-validation-image-slot="${index}">
             <button class="trainer-sample-image-picker" type="button" data-pick-validation-image="${index}" aria-label="${path ? 'Replace' : 'Upload'} RGBA validation target">${previewContent}</button>
             ${path ? `<button class="trainer-sample-image-clear" type="button" data-clear-validation-image="${index}" aria-label="Clear validation target" title="Clear image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>` : ''}
-            <input class="hidden" type="file" accept="image/png,image/webp" data-validation-file="${index}" tabindex="-1">
+            <input class="hidden" type="file" accept="image/png,image/jpeg,image/webp" data-validation-file="${index}" tabindex="-1">
             <div class="trainer-sample-upload-overlay hidden" aria-live="polite"><div class="trainer-sample-upload-track"><span></span></div><small>Uploading… <b>0%</b></small></div>
         </div>`;
     }
@@ -771,9 +801,10 @@
             <div class="trainer-validation-item-editor">
                 ${renderValidationImageSlot(item, index)}
                 <div class="trainer-repeat-grid trainer-validation-item-grid">
-                    ${selectedPreset() === 'transparent_lora' ? `<label class="trainer-field"><span>Validation mode</span><select data-validation-field="mode" data-validation-index="${index}"><option value="generation"${(item.mode || 'generation') === 'generation' ? ' selected' : ''}>Generation · black control</option><option value="edit"${item.mode === 'edit' ? ' selected' : ''}>Edit · automatic opaque control</option></select></label>` : ''}
+                    ${selectedPreset() === 'transparent_lora' ? `<label class="trainer-field"><span>Validation mode</span><select data-validation-field="mode" data-validation-index="${index}">${isQieJoint() ? `<option value="paired"${item.mode === 'paired' ? ' selected' : ''}>Paired edit · RGB / RGBA</option>` : ''}<option value="generation"${(item.mode || 'generation') === 'generation' ? ' selected' : ''}>${isH3() ? 'Generation from captions' : 'Generation · black control'}</option><option value="edit"${item.mode === 'edit' ? ' selected' : ''}>Edit · automatic opaque control</option></select></label>` : ''}
+                    ${item.mode === 'paired' ? `<fieldset class="trainer-sample-images"><legend>Input Controls (required)</legend><div>${[1, 2, 3].map(controlIndex => renderSampleImageSlot(item, index, controlIndex)).join('')}</div></fieldset>` : ''}
                     <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}" placeholder="Optional validation prompt"></label>
-                    <p>PASS/FAIL is calculated against this image’s alpha channel at every selected sigma; the worst result decides the image status.</p>
+                    <p>${item.mode === 'paired' ? 'Full latent loss measures the edit result. Alpha metrics are reported separately; RGB targets have opaque alpha. Check sample images for instruction following.' : 'PASS/FAIL is calculated against this image’s alpha channel at every selected sigma; the worst result decides the image status.'}</p>
                 </div>
             </div>
         </article>`).join('');
@@ -1031,6 +1062,7 @@
             chromaResolutions: selectedChromaResolutions(),
             chromaValidationItems: state.chromaValidationItems.map(item => ({ ...item })),
         };
+        if (isH3()) Object.assign(payload, h3.collect());
         if (includeAdvanced && checked('trainer-use-advanced-config') && $('trainer-advanced-config-json').value.trim()) {
             payload.advancedProcess = $('trainer-advanced-config-json').value.trim();
         }
@@ -1043,11 +1075,13 @@
         if (!isVaePreset(payload.trainingPreset) && !isChromaPreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
         if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
-        if (payload.trainingPreset === 'transparent_lora') {
+        if (payload.trainingPreset === 'transparent_lora' && !(payload.model === 'minimax_h3_ref2va' && payload.distillationMethod === 'dopsd')) {
             const missingBackground = payload.datasets.find(dataset =>
                 dataset.rgbaControlMode === 'edit' && !dataset.rgbaBackgroundDataset
             );
             if (missingBackground) return `Select a background dataset for ${missingBackground.name}.`;
+            // Pair completeness is checked against current files by the save API.
+            // A missing/stale inspection field must never block saving locally.
         }
         if (isChromaPreset(payload.trainingPreset) && !payload.chromaResolutions.length) return 'Select at least one ChromaKey training resolution.';
         if (isChromaPreset(payload.trainingPreset) && payload.chromaGreenChance + payload.chromaBlueChance + payload.chromaWhiteChance + payload.chromaBlackChance <= 0) return 'Set at least one background colour chance above zero.';
@@ -1055,7 +1089,7 @@
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
         if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
         if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling) {
-            const sampleWithoutImage = payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
+            const sampleWithoutImage = h3.isH3(payload.model) || payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
             if (sampleWithoutImage) return 'Add at least one image to edit for every sample.';
             const sampleWithoutInstruction = payload.samples.find(sample => [1, 2, 3].some(index => sampleControlPath(sample, index)) && !String(sample.prompt || '').trim());
             if (sampleWithoutInstruction) return 'Enter an edit instruction for every sample.';
@@ -1065,7 +1099,10 @@
             const missingValidationTarget = payload.validationItems.find(item =>
                 !validationTargetPath(item) && !(item.dataset && item.image)
             );
-            if (missingValidationTarget) return 'Upload an RGBA target for every validation image.';
+            if (missingValidationTarget) return 'Upload a target for every validation image.';
+            const missingPair = payload.validationItems.find(item => item.mode === 'paired'
+                && (![1, 2, 3].some(index => sampleControlPath(item, index)) || !String(item.prompt || '').trim()));
+            if (missingPair) return 'Paired validation requires input Controls and an edit instruction.';
         }
         if (payload.advancedProcess) {
             try { JSON.parse(payload.advancedProcess); } catch (error) { return `Advanced process JSON is invalid: ${error.message}`; }
@@ -1169,7 +1206,8 @@
             chromaSpillChance: 35,
             chromaDtype: 'bf16', chromaResolutions: [512], chromaValidationItems: [],
         };
-        const data = { ...defaults, ...payload };
+        const data = { ...defaults, ...(state.models.find(model => model.key === payload.model)?.defaults || {}), ...payload };
+        h3.populate(data);
         setInput('trainer-name', data.name);
         setInput('trainer-gpu', data.gpuIds);
         setInput('trainer-preset', data.trainingPreset);
@@ -1382,9 +1420,12 @@
                 ${row.map(sample => `
                     <figure class="trainer-generated-sample">
                         <button type="button" data-generated-sample="${escapeHtml(sample.name)}" aria-label="Open ${escapeHtml(sample.name)}">
-                            <img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Validation step ${sample.step}, sample ${sample.sampleIndex + 1}" loading="lazy">
+                            ${sample.mediaType === 'video'
+                                ? `<video src="${generatedSampleUrl(job.id, sample.name)}" muted preload="metadata"></video>`
+                                : `<img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Validation step ${sample.step}, sample ${sample.sampleIndex + 1}" loading="lazy">`}
                         </button>
                         <figcaption><span>Step ${sample.step.toLocaleString()}</span><span>Sample ${sample.sampleIndex + 1}</span></figcaption>
+                        ${sample.audioFile ? `<audio controls preload="none" src="${generatedSampleUrl(job.id, sample.audioFile)}"></audio>` : ''}
                     </figure>
                 `).join('')}
             </div>
@@ -1438,7 +1479,13 @@
             ? generatedSampleUrl(job.id, sample.name)
             : `/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${controlIndex}`;
         $('trainer-sample-viewer-title').textContent = sample.name;
-        $('trainer-sample-viewer-image').src = imageUrl;
+        const video = $('trainer-sample-viewer-video');
+        const showVideo = (controlIndex === null ? sample.mediaType : sample.controlMediaTypes?.[controlIndex]) === 'video';
+        video.pause();
+        video.classList.toggle('hidden', !showVideo);
+        $('trainer-sample-viewer-image').classList.toggle('hidden', showVideo);
+        if (showVideo) video.src = imageUrl;
+        else { video.removeAttribute('src'); $('trainer-sample-viewer-image').src = imageUrl; }
         $('trainer-sample-viewer-image').alt = controlIndex === null
             ? `Generated validation sample ${sample.name}`
             : `Control image ${controlIndex + 1} for ${sample.name}`;
@@ -1452,11 +1499,11 @@
         if (sample.controlCount > 0) {
             controls.innerHTML = `
                 <button class="trainer-sample-control ${controlIndex === null ? 'is-active' : ''}" type="button" data-viewer-control="main" title="Generated image">
-                    <img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Generated image">
+                    ${sample.mediaType === 'video' ? '<span>Video</span>' : `<img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Generated image">`}
                 </button>
                 ${Array.from({ length: sample.controlCount }, (_, control) => `
                     <button class="trainer-sample-control ${controlIndex === control ? 'is-active' : ''}" type="button" data-viewer-control="${control}" title="Control image ${control + 1}">
-                        <img src="/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${control}" alt="Control ${control + 1}">
+                        ${sample.controlMediaTypes?.[control] === 'video' ? `<span>Video ${control + 1}</span>` : `<img src="/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${control}" alt="Control ${control + 1}">`}
                     </button>
                 `).join('')}
             `;
@@ -1487,6 +1534,7 @@
         const viewer = $('trainer-sample-viewer');
         if (!viewer) return;
         viewer.classList.add('hidden');
+        $('trainer-sample-viewer-video').pause();
         state.selectedGeneratedSample = null;
         state.selectedSampleControl = null;
         document.body.style.overflow = '';
@@ -1528,12 +1576,14 @@
         if (!job) return;
         const process = job.config.config.process[0];
         const model = state.models.find(item => item.key === job.form?.model);
-        const isVae = ['qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer'].includes(process.type);
+        const isVae = ['qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer', 'h3_rgba_vae_trainer'].includes(process.type);
         const isChroma = ['qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'].includes(process.type);
         const isFlux2Vae = process.type === 'flux2_rgba_vae_trainer';
-        const presetLabel = state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
+        const vaeLabel = process.type === 'h3_rgba_vae_trainer' ? 'MiniMax H3 RGBA VAE' : isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE';
+        const presetLabel = job.form?.model === 'qwen_image_edit_2511' && job.form?.trainingPreset === 'transparent_lora'
+            ? 'Edit RGB / RGBA LoRA' : state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
         const modelLabel = isVae
-            ? (isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE')
+            ? vaeLabel
             : (model?.label || process.model?.arch || 'Edit model');
         $('trainer-detail-name').textContent = job.name;
         $('trainer-detail-model').textContent = presetLabel || modelLabel;
@@ -1558,13 +1608,14 @@
             ['Validation', `${process.validation.images.length} images · every ${process.validation.every} steps`],
             ['Export', 'Safetensors + resumable trainer state'],
         ] : isVae ? [
-            ['Preset', isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE'],
+            ['Preset', vaeLabel],
             ['Datasets', (job.datasets || []).join(', ')],
             ['Scope', process.train.scope],
             ['Resolution', process.train.resolution],
             ['Learning rate', process.train.lr],
             ['Validation', `every ${process.validation.every} steps`],
-            ['Deployment', isFlux2Vae
+            ['Deployment', process.type === 'h3_rgba_vae_trainer'
+                ? (process.save.comfy_export ? 'Native H3 + QDM ComfyUI loader' : 'Native H3') : isFlux2Vae
                 ? (process.save.comfy_export ? 'Native FLUX.2 + ComfyUI' : 'Native FLUX.2')
                 : (process.save.comfy_export ? 'Diffusers + ComfyUI' : 'Diffusers')],
         ] : [
@@ -1907,7 +1958,33 @@
                 setVaeSourceDefaults(true);
             }
             renderModelFields(true, true);
+            if (isQieJoint()) {
+                $('trainer-rgba-edge-correction').value = 'none';
+                state.selectedDatasets.forEach(ds => { ds.rgbaControlMode = 'paired'; });
+            } else {
+                state.selectedDatasets.forEach(ds => { if (ds.rgbaControlMode === 'paired') ds.rgbaControlMode = 'edit'; });
+            }
+            if (isH3()) {
+                const defaults = { ...selectedModel().defaults, ...(selectedPreset() === 'transparent_lora' ? { sampleFrames: 1, h3SampleAudio: false } : {}) };
+                h3.populate(defaults);
+                Object.entries(h3.common).forEach(([key, id]) => setInput(id, defaults[key]));
+                state.selectedDatasets.forEach(ds => Object.assign(ds, h3.datasetDefaults, { cacheLatents: true }));
+            }
+            renderConditionalOptions();
             renderPresetFields();
+        });
+        $('h3-distillationMethod').addEventListener('change', () => {
+            const method = $('h3-distillationMethod').value;
+            $('trainer-guidance-loss').checked = ['both', 'cg'].includes(method);
+            if (method === 'dopsd') $('trainer-cache-text').checked = true;
+            syncRgbaCacheState();
+            renderSelectedDatasets();
+            renderConditionalOptions();
+        });
+        $('trainer-guidance-loss').addEventListener('change', () => {
+            if (!isH3()) return;
+            const adapter = ['ta', 'both'].includes($('h3-distillationMethod').value);
+            $('h3-distillationMethod').value = $('trainer-guidance-loss').checked ? (adapter ? 'both' : 'cg') : (adapter ? 'ta' : 'none');
         });
         $('trainer-network-type').addEventListener('change', renderConditionalOptions);
         $('trainer-layer-offloading').addEventListener('change', syncOffloadingControls);
@@ -2026,12 +2103,25 @@
         });
         $('trainer-add-validation-btn').addEventListener('click', () => {
             state.validationItems.push(independentValidationUploads
-                ? { targetPath: '', prompt: '', mode: 'generation' }
+                ? { targetPath: '', prompt: '', mode: isQieJoint() ? 'paired' : 'generation' }
                 : { dataset: state.selectedDatasets[0]?.name || '', image: '', prompt: '' }
             );
             renderValidationItems();
         });
         $('trainer-validation-items').addEventListener('click', event => {
+            const controlPicker = event.target.closest('[data-pick-sample-image]');
+            const controlClear = event.target.closest('[data-clear-sample-image]');
+            if (controlPicker) {
+                $('trainer-validation-items').querySelector(`[data-sample-file="${controlPicker.dataset.pickSampleImage}"]`)?.click();
+                return;
+            }
+            if (controlClear) {
+                const [index, control] = controlClear.dataset.clearSampleImage.split('-').map(Number);
+                delete state.validationItems[index][`ctrlImg${control}`];
+                delete state.validationItems[index][`ctrl_img_${control}`];
+                renderValidationItemsPreservingPlace();
+                return;
+            }
             const removeButton = event.target.closest('[data-remove-validation]');
             const pickerButton = event.target.closest('[data-pick-validation-image]');
             const clearButton = event.target.closest('[data-clear-validation-image]');
@@ -2057,28 +2147,34 @@
             if (input) updateRepeatedItem(input, state.validationItems, 'validationIndex', 'validationField');
         });
         $('trainer-validation-items').addEventListener('change', event => {
+            const controlInput = event.target.closest('[data-sample-file]');
+            if (controlInput) uploadSampleImage(controlInput);
+            if (event.target.dataset.validationField === 'mode') renderValidationItemsPreservingPlace();
             const input = event.target.closest('[data-validation-file]');
             if (input) uploadValidationImage(input);
         });
         ['dragenter', 'dragover'].forEach(eventName => $('trainer-validation-items').addEventListener(eventName, event => {
-            const slot = event.target.closest('[data-validation-image-slot]');
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
             if (!slot) return;
             event.preventDefault();
             if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
             slot.classList.add('is-dragging');
         }));
         $('trainer-validation-items').addEventListener('dragleave', event => {
-            const slot = event.target.closest('[data-validation-image-slot]');
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
             if (slot && !slot.contains(event.relatedTarget)) slot.classList.remove('is-dragging');
         });
         $('trainer-validation-items').addEventListener('drop', event => {
-            const slot = event.target.closest('[data-validation-image-slot]');
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
             if (!slot) return;
             event.preventDefault();
             slot.classList.remove('is-dragging');
             const file = event.dataTransfer?.files?.[0];
-            const input = slot.querySelector('[data-validation-file]');
-            if (file && input) uploadValidationImage(input, file);
+            const input = slot.querySelector('[data-validation-file], [data-sample-file]');
+            if (file && input) {
+                if (input.dataset.sampleFile) uploadSampleImage(input, file);
+                else uploadValidationImage(input, file);
+            }
         });
         $('trainer-chroma-add-validation-btn').addEventListener('click', () => {
             $('trainer-chroma-validation-files').click();

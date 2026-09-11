@@ -90,6 +90,29 @@ class QwenImageModel(BaseModel):
             base_model_path, subfolder="vae", torch_dtype=dtype
         )
 
+    def _prepare_text_encoder(self, text_encoder, dtype):
+        # Freeze quantized weights on CPU before moving to CUDA. Moving the
+        # full BF16 encoder first can OOM before quantization even starts.
+        # Attach offloading after quantization, which replaces layer objects.
+        if self.model_config.quantize_te:
+            self.print_and_status_update("Quantizing Text Encoder on CPU")
+            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+            freeze(text_encoder)
+            flush()
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_text_encoder_percent > 0
+        ):
+            MemoryManager.attach(
+                text_encoder,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+            )
+
+        text_encoder.to(self.device_torch, dtype=dtype)
+        flush()
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Qwen Image model")
@@ -163,24 +186,7 @@ class QwenImageModel(BaseModel):
         if not self._qwen_image_keep_visual:
             text_encoder.model.visual = None
 
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-
-        text_encoder.to(self.device_torch, dtype=dtype)
-        flush()
-
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
+        self._prepare_text_encoder(text_encoder, dtype)
 
         self.print_and_status_update("Loading VAE")
         vae = self._load_qwen_vae(base_model_path, dtype)

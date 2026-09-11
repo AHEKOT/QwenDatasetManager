@@ -67,7 +67,7 @@ def prepare_rgba_image(
         )
         rgba_float[..., :3][partial] = np.clip(recovered[partial], 0.0, 1.0)
         rgba = np.clip(np.round(rgba_float * 255.0), 0, 255).astype(np.uint8)
-    elif edge_color_correction in ("nearest_opaque", "matte_despill"):
+    elif edge_color_correction in ("nearest_opaque", "matte_despill") and np.any(rgba[..., 3] < 255):
         # Chroma-key extraction often leaves a colored matte in antialiased
         # boundary pixels. Propagate straight RGB from the nearest opaque
         # foreground pixel while preserving the original alpha coverage.
@@ -209,26 +209,30 @@ def prepare_rgba_validation_pair(
     *,
     control_mode: str,
     background_image: Image.Image | None = None,
+    control_images: list[Image.Image] | None = None,
     alpha_threshold: float = 1.0 / 255.0,
     hidden_rgb_color: Sequence[int] = (0, 0, 0),
     edge_color_correction: str = "none",
     edge_matte_color: Sequence[int] = (0, 255, 0),
     edge_width: float = 3.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | list[torch.Tensor]]:
     """Build the deterministic RGBA target and matching RGB validation control.
 
     The target uses the exact training cleanup and an alpha-safe resize.  Edit
     mode composites it over a fixed opaque background; when none is supplied an
     intentionally varied deterministic background is generated locally.
-    Generation mode uses the same black control as training. Returned target is
-    normalized CHW [-1, 1] and control is CHW RGB [0, 1].
+    Generation mode uses the same black control as training. Paired mode accepts
+    RGB or RGBA targets and returns the supplied RGB controls in their original
+    sizes. Returned target is CHW [-1, 1]; controls are CHW RGB [0, 1].
     """
 
-    if control_mode not in {"edit", "generation"}:
-        raise ValueError("RGBA validation control_mode must be edit or generation")
+    if control_mode not in {"edit", "generation", "paired"}:
+        raise ValueError("RGBA validation control_mode must be edit, generation or paired")
+    if control_mode == 'paired' and not control_images:
+        raise ValueError('Paired RGBA validation requires input control images')
     prepared = prepare_rgba_image(
         image,
-        require_alpha=True,
+        require_alpha=control_mode != 'paired',
         alpha_threshold=alpha_threshold,
         hidden_rgb_color=hidden_rgb_color,
         edge_color_correction=edge_color_correction,
@@ -244,7 +248,15 @@ def prepare_rgba_validation_pair(
     rgba_array = np.asarray(prepared, dtype=np.float32) / 255.0
     target = torch.from_numpy(rgba_array.copy()).permute(2, 0, 1) * 2.0 - 1.0
 
-    if control_mode == "generation":
+    if control_mode == 'paired':
+        control = []
+        for reference in control_images:
+            rgba_reference = reference.convert('RGBA')
+            opaque = Image.new('RGBA', reference.size, (0, 0, 0, 255))
+            rgb = Image.alpha_composite(opaque, rgba_reference).convert('RGB')
+            array = np.asarray(rgb, dtype=np.float32) / 255.0
+            control.append(torch.from_numpy(array.copy()).permute(2, 0, 1))
+    elif control_mode == "generation":
         control = torch.zeros((3, size[1], size[0]), dtype=torch.float32)
     else:
         if background_image is None:

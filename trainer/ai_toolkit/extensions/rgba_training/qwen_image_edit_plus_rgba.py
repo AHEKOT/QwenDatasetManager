@@ -180,6 +180,11 @@ class QwenImageEditPlusRGBAModel(RGBALoRALossMixin, QwenImageEditPlusModel):
     )
     _qwen_pipeline = QwenImageEditPlusRGBACustomPipeline
 
+    def get_rgba_diffusion_loss_weight(self, batch):
+        # Learn the entire edit result, including RGB appearance and alpha.
+        # An alpha probe must never switch QIE to alpha-only training.
+        return 1.0
+
     def __init__(self, device, model_config, dtype="bf16", *args, **kwargs):
         super().__init__(device, model_config, dtype, *args, **kwargs)
         self.sample_lora_path = None
@@ -193,6 +198,9 @@ class QwenImageEditPlusRGBAModel(RGBALoRALossMixin, QwenImageEditPlusModel):
         cache_digest = hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()[:16]
         # AiToolkit includes this value in every latent cache key.
         self.latent_space_version = f"qwen-image-rgba-{cache_digest}"
+        probe_path = model_config.model_kwargs.get('rgba_lora_alpha_probe_path')
+        if probe_path:
+            self.set_rgba_alpha_probe(load_file(str(probe_path), device='cpu'))
 
     def _load_rgba_vae(self):
         vae_path = self.model_config.vae_path or self.default_rgba_vae_path

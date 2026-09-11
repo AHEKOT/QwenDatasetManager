@@ -343,6 +343,7 @@ class ValidationItem:
     def __init__(self, **kwargs):
         self.image_path: str = kwargs.get('image_path', '')
         self.prompt: str = kwargs.get('prompt', '')
+        self.control_paths: List[str] = kwargs.get('control_paths', [])
         self.rgba_control_mode: str | None = kwargs.get('rgba_control_mode', None)
         self.rgba_control_background_path: str | None = kwargs.get(
             'rgba_control_background_path', None
@@ -966,6 +967,8 @@ class DatasetConfig:
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)
+        # Preserve the selected maximum when preprocessing splits multi-resolution datasets.
+        self.text_embedding_resolution: int = kwargs.get('text_embedding_resolution', self.resolution)
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
         self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
@@ -1045,8 +1048,14 @@ class DatasetConfig:
         # generation: provide an empty black Control1 while keeping the RGBA
         # image as the training target.
         self.rgba_control_mode: str = str(kwargs.get('rgba_control_mode', 'edit')).lower()
-        if self.rgba_control_mode not in ['edit', 'generation']:
-            raise ValueError("rgba_control_mode must be either 'edit' or 'generation'")
+        if self.rgba_control_mode not in ['edit', 'generation', 'paired']:
+            raise ValueError("rgba_control_mode must be edit, generation or paired")
+        if self.rgba_control_mode == 'paired':
+            self.rgba_require_alpha = kwargs.get('rgba_require_alpha', False)
+        if self.rgba_control_mode == 'paired' and (
+            not self.rgba_mode or self.rgba_generate_control or not self.control_path
+        ):
+            raise ValueError("RGBA paired editing requires RGBA targets and explicit control_path, without generated controls")
         self.rgba_control_background_path: Union[str, None] = kwargs.get(
             'rgba_control_background_path', None
         )
@@ -1122,7 +1131,7 @@ class DatasetConfig:
         self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
         # A generated QIE control is derived from the processed RGBA target. Keep
         # that tensor available when latents have already been cached.
-        if self.rgba_generate_control:
+        if self.rgba_generate_control or (self.rgba_mode and self.rgba_control_mode == 'paired'):
             self.load_image_when_caching_latents = True
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)
@@ -1231,6 +1240,7 @@ def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
         for res in resolution_list:
             dataset_copy = dataset.copy()
             dataset_copy['resolution'] = res
+            dataset_copy['text_embedding_resolution'] = dataset.get('text_embedding_resolution', max(resolution_list))
             new_config.append(dataset_copy)
     return new_config
 

@@ -11,7 +11,9 @@ COMFY_MODELS_PATH = None
 if 'MODELS_PATH' in os.environ and os.environ['MODELS_PATH'].strip() != "":
     MODELS_PATH = os.environ['MODELS_PATH']
 else:
-    MODELS_PATH = os.path.join(TOOLKIT_ROOT, "models")
+    # The vendored runtime shares QDM's Comfy-layout model directory, including
+    # when run directly from a saved YAML rather than through the GUI launcher.
+    MODELS_PATH = os.path.abspath(os.path.join(TOOLKIT_ROOT, os.pardir, os.pardir, "models"))
 
 
 def get_path(path):

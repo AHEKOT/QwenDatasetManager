@@ -44,6 +44,13 @@ class QwenDatasetLoader:
         """Create a black tensor of specified size (W, H)"""
         img = Image.new('RGB', size, (0, 0, 0))
         return self.pil_to_tensor(img)
+
+    def load_pil_image(self, path):
+        """Load RGB or RGBA, preserving alpha and palette/color-key transparency."""
+        with Image.open(path) as source_image:
+            image = ImageOps.exif_transpose(source_image)
+            has_alpha = 'A' in image.getbands() or 'transparency' in image.info
+            return image.convert('RGBA' if has_alpha else 'RGB')
         
     def load_dataset(self, dataset_path, mode, manual_filename="image_00001.png", seed=0):
         dataset_path = dataset_path.strip()
@@ -110,12 +117,7 @@ class QwenDatasetLoader:
             # Load Target Image
             img_path = os.path.join(img_dir, filename)
             try:
-                with Image.open(img_path) as source_image:
-                    pil_img = ImageOps.exif_transpose(source_image)
-                    if pil_img.mode != 'RGB':
-                        pil_img = pil_img.convert('RGB')
-                    else:
-                        pil_img = pil_img.copy()
+                pil_img = self.load_pil_image(img_path)
 
                 target_tensor = self.pil_to_tensor(pil_img)
                 target_size = pil_img.size # (W, H)
@@ -148,17 +150,12 @@ class QwenDatasetLoader:
                         break
                 if c_path:
                     try:
-                        with Image.open(c_path) as source_control:
-                            c_img = ImageOps.exif_transpose(source_control)
-                            if c_img.mode != 'RGB':
-                                c_img = c_img.convert('RGB')
-                            else:
-                                c_img = c_img.copy()
+                        c_img = self.load_pil_image(c_path)
                         if c_img.size != target_size:
                             c_img = ImageOps.pad(
                                 c_img,
                                 target_size,
-                                color=(0, 0, 0),
+                                color=(0, 0, 0, 0) if c_img.mode == 'RGBA' else (0, 0, 0),
                                 centering=(0.5, 0.5)
                             )
                         return self.pil_to_tensor(c_img)
