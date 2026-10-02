@@ -2,6 +2,8 @@
 
 from .minimax_h3 import MinimaxH3Model, MinimaxH3Ref2VAModel
 from .qwen_image import QwenImageEditPlusModel
+from .qwen_image_2 import QwenImage2Model
+from .qwen_image_2.layered import QwenImage2LayeredModel
 from .flux2 import Flux2Klein4BModel, Flux2Klein9BModel
 
 
@@ -9,6 +11,8 @@ AI_TOOLKIT_MODELS = [
     MinimaxH3Model,
     MinimaxH3Ref2VAModel,
     QwenImageEditPlusModel,
+    QwenImage2Model,
+    QwenImage2LayeredModel,
     Flux2Klein4BModel,
     Flux2Klein9BModel,
 ]

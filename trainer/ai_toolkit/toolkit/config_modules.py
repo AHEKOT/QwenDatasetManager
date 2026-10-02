@@ -938,6 +938,19 @@ class DatasetConfig:
 
     def __init__(self, **kwargs):
         self.batch_size: Union[int, None] = kwargs.get('batch_size', None)
+        # Explicit override; legacy batch_size must not shadow the training value.
+        batch_override = kwargs.get('batch_size_override')
+        if isinstance(batch_override, str):
+            batch_override = batch_override.strip()
+        self.batch_size_override: Union[int, None] = None
+        if batch_override is not None and batch_override != '':
+            try:
+                value = float(batch_override)
+                if isinstance(batch_override, bool) or not value.is_integer() or not 1 <= value <= 128:
+                    raise ValueError
+                self.batch_size_override = int(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('batch_size_override must be an integer from 1 to 128 or empty') from None
         self.type = kwargs.get('type', 'image')  # sd, slider, reference
         # will be legacy
         self.folder_path: str = kwargs.get('folder_path', None)
@@ -1015,6 +1028,12 @@ class DatasetConfig:
         self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
         # RGBA targets are distinct from alpha_mask: the alpha channel is encoded by
         # a four-channel VAE instead of being consumed as a spatial loss mask.
+        self.target_format = kwargs.get('target_format', 'image')
+        self.layer_slots = kwargs.get('layer_slots', 4)
+        if self.target_format not in ('image', 'psd_layers'):
+            raise ValueError("Unsupported target_format")
+        if self.target_format == 'psd_layers' and (isinstance(self.layer_slots, bool) or not isinstance(self.layer_slots, int) or not 1 <= self.layer_slots <= 20):
+            raise ValueError("PSD layer_slots must be an integer from 1 to 20")
         self.pixel_channels: str = str(kwargs.get('pixel_channels', 'rgb')).lower()
         if kwargs.get('rgba', False):
             self.pixel_channels = 'rgba'
@@ -1140,6 +1159,16 @@ class DatasetConfig:
         # augmentations are returned as a separate image and cannot currently be cached
         self.augmentations: List[dict] = kwargs.get('augmentations', None)
         self.shuffle_augmentations: bool = kwargs.get('shuffle_augmentations', False)
+
+        if self.target_format == 'psd_layers':
+            if not self.buckets or self.standardize_images or self.augments or self.augmentations or self.flip_x or self.flip_y:
+                raise ValueError("PSD layers require buckets and support shared resize/crop only")
+            if self.rgba_generate_control or self.alpha_mask or self.control_from_same_folder:
+                raise ValueError("PSD layers require their own alpha, with optional real Control1")
+            if kwargs.get('num_frames', 1) != 1 or kwargs.get('auto_frame_count', False) or self.is_reg or self.prior_reg:
+                raise ValueError("PSD layer targets are one document, not video or regularization data")
+            if isinstance(self.control_path, list) and len(self.control_path) > 1:
+                raise ValueError("PSD layers accept only optional Control1")
 
         if self.rgba_mode and self.standardize_images:
             raise ValueError("standardize_images is not defined for four-channel RGBA targets")
@@ -1396,6 +1425,10 @@ class GenerateImageConfig:
         finally:
             self.output_folder = real_folder
         files = os.listdir(tmp_folder)
+        if any(file.lower().endswith('.psd') for file in files):
+            # Publish the layered file before the PNG that makes it visible in
+            # the gallery. Both were fully written before this point.
+            files.sort(key=lambda file: file.lower().endswith('.png'))
         # thumbs move into place first so they already exist when the media
         # file appears in the samples folder
         thumbs_folder = os.path.join(real_folder, '.thumbs')
@@ -1482,7 +1515,13 @@ class GenerateImageConfig:
                 add_album_artwork(audio_path)
         else:
             # TODO save image gen header info for A1111 and us, our seeds probably wont match
+            if image.mode == "RGBA" and self.output_ext not in ["png", "webp"]:
+                self.output_ext = "png"
             image.save(self.get_image_path(count, max_count))
+            if "qdm_psd_layers" in image.info:
+                from toolkit.layered_psd import save_layered_psd
+                psd_path = os.path.splitext(self.get_image_path(count, max_count))[0] + '.psd'
+                save_layered_psd(psd_path, image.info["qdm_psd_layers"])
             # do prompt file
             if self.add_prompt_file:
                 self.save_prompt_file(count, max_count)

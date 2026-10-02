@@ -117,6 +117,9 @@ app and open **Trainer** from the main screen.
 The trainer supports:
 
 - Qwen Image Edit 2511
+- Qwen Image 2.1 (text-to-image, editing and native RGBA; see [setup](trainer/QWEN21.md))
+- Qwen Image 2.1 Joint PSD layers LoRA (PSD targets, optional Control1, joint layer denoising and PSD samples; [dataset format](trainer/QWEN21_LAYERS.md))
+- Standalone [ComfyUI QI2 Layers nodes and workflows](ComfyUI-QDM-QI2-Layers/README.md) for applying joint-layer adapters and exporting PSD/RGBA layers.
 - FLUX.2 Klein Base 4B
 - FLUX.2 Klein Base 9B (gated model; requires Hugging Face access and is subject to the FLUX non-commercial license)
 - QDM CleanMatte (82,287 parameters; semantic classification and native alpha refinement)

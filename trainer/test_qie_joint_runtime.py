@@ -18,6 +18,69 @@ from extensions.rgba_training.qwen_image_edit_plus_rgba import QwenImageEditPlus
 
 
 class QieJointRuntimeTests(unittest.TestCase):
+    def test_disk_cache_disables_autograd_despite_input_gradient_hooks(self):
+        from unittest.mock import Mock
+        from toolkit.dataloader_mixins import TextEmbeddingCachingMixin
+        from toolkit.prompt_utils import PromptEmbeds
+        encoder = torch.nn.Sequential(torch.nn.Embedding(4, 8), torch.nn.Linear(8, 8))
+        encoder.requires_grad_(False)
+        encoder[0].register_forward_hook(lambda module, args, output: output.requires_grad_(True))
+        encoder.eval()
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = DatasetConfig(folder_path=folder, cache_text_embeddings=True, caption_dropout_rate=0)
+            item = SimpleNamespace(
+                dataset_config=cfg, caption='edit', encode_control_in_text_embeddings=False,
+                dopsd_self_ref=False,
+                get_text_embedding_path=lambda **kwargs: str(Path(folder) / 'unused.safetensors'),
+            )
+            def encode(caption):
+                self.assertFalse(torch.is_grad_enabled())
+                output = encoder(torch.tensor([[0, 1]]))
+                self.assertFalse(output.requires_grad)
+                self.assertIsNone(output.grad_fn)
+                result = PromptEmbeds(output)
+                result.save = Mock()
+                return result
+            sd = SimpleNamespace(device='cpu', set_device_state_preset=Mock(), encode_prompt=encode)
+            dataset = SimpleNamespace(sd=sd, dataset_path=folder, dataset_config=cfg, file_list=[item])
+            with torch.enable_grad():
+                TextEmbeddingCachingMixin.cache_text_embeddings(dataset)
+                self.assertTrue(torch.is_grad_enabled())
+            self.assertTrue(item.is_text_embedding_cached)
+
+    def test_qie_conditioning_skips_lm_head_and_preserves_padding_and_controls(self):
+        from unittest.mock import Mock
+        from extensions_built_in.diffusion_models.qwen_image.qwen_image_pipelines import QwenImageEditPlusCustomPipeline
+        hidden = torch.arange(30, dtype=torch.float32).reshape(2, 5, 3)
+        mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+        class Inputs(dict):
+            def to(self, device):
+                return self
+        inputs = Inputs(input_ids=torch.zeros(2, 5, dtype=torch.long), attention_mask=mask,
+                        pixel_values=torch.ones(2, 3), image_grid_thw=torch.ones(2, 3))
+        core = Mock(return_value=SimpleNamespace(last_hidden_state=hidden))
+        outer = Mock(side_effect=AssertionError('Vocabulary logits must not be computed'))
+        outer.model = core
+        outer.dtype = torch.float32
+        processor = Mock(return_value=inputs)
+        pipeline = SimpleNamespace(
+            _execution_device=torch.device('cpu'), text_encoder=outer, processor=processor,
+            prompt_template_encode='{}', prompt_template_encode_start_idx=2,
+            _extract_masked_hidden=lambda states, masks: [row[valid.bool()] for row, valid in zip(states, masks)],
+        )
+        controls = [object(), object()]
+        embeds, attention = QwenImageEditPlusCustomPipeline._get_qwen_prompt_embeds(
+            pipeline, ['edit A', 'edit B'], image=controls)
+        outer.assert_not_called()
+        self.assertFalse(core.call_args.kwargs['use_cache'])
+        self.assertFalse(core.call_args.kwargs['output_hidden_states'])
+        self.assertIs(processor.call_args.kwargs['images'], controls)
+        self.assertIn('Picture 2:', processor.call_args.kwargs['text'][0])
+        torch.testing.assert_close(embeds[0], hidden[0, 2:])
+        torch.testing.assert_close(embeds[1, :1], hidden[1, 2:3])
+        self.assertEqual(embeds[1, 1:].abs().sum().item(), 0)
+        torch.testing.assert_close(attention, torch.tensor([[1, 1, 1], [1, 0, 0]]))
+
     def test_real_loader_accepts_rgb_and_rgba_and_preserves_paired_control(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

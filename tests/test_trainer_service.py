@@ -131,6 +131,47 @@ class TrainerServiceTests(unittest.TestCase):
         self.assertEqual(process['train']['batch_size'], 10)
         self.assertNotIn('batch_size', process['datasets'][0])
 
+    def test_dataset_batch_override_and_global_fallback_are_saved(self):
+        self.make_dataset('demo')
+        self.make_dataset('second')
+        payload = self.default_payload([
+            {'name': 'demo', 'resolutions': [512, 768], 'batchSizeOverride': '1'},
+            {'name': 'second', 'resolutions': [512], 'batchSizeOverride': ''},
+        ])
+        payload['batchSize'] = 4
+        job, _ = self.service.create_job(payload)
+        config = json.loads(self.service._get_job_row(job['id'])['job_config'])
+        process = config['config']['process'][0]
+        self.assertEqual(process['train']['batch_size'], 4)
+        self.assertEqual(process['datasets'][0]['batch_size_override'], 1)
+        self.assertNotIn('batch_size_override', process['datasets'][1])
+        self.assertEqual(job['form']['datasets'][0]['batchSizeOverride'], 1)
+        self.assertEqual(job['form']['datasets'][1]['batchSizeOverride'], '')
+        payload['datasets'][0]['batchSizeOverride'] = ''
+        self.service.update_job(job['id'], payload)
+        config = json.loads(self.service._get_job_row(job['id'])['job_config'])
+        self.assertNotIn('batch_size_override', config['config']['process'][0]['datasets'][0])
+
+    def test_empty_dataset_batch_override_inherits_global(self):
+        self.make_dataset()
+        for value in (None, '', '  '):
+            with self.subTest(value=value):
+                payload = self.default_payload()
+                payload['batchSize'] = 4
+                payload['datasets'][0]['batchSizeOverride'] = value
+                config = self.service.build_job_config(payload)[2]
+                self.assertNotIn('batch_size_override', config['config']['process'][0]['datasets'][0])
+                self.assertEqual(config['meta']['qdm']['form']['datasets'][0]['batchSizeOverride'], '')
+
+    def test_invalid_dataset_batch_override_is_rejected(self):
+        self.make_dataset()
+        for value in (0, -1, 1.5, 129, True, 'invalid', float('inf'), float('nan')):
+            with self.subTest(value=value):
+                payload = self.default_payload()
+                payload['datasets'][0]['batchSizeOverride'] = value
+                with self.assertRaisesRegex(TrainerValidationError, 'Batch size override'):
+                    self.service.build_job_config(payload)
+
     def test_validation_sample_uses_real_control_images(self):
         self.make_dataset('demo')
         payload = self.default_payload()

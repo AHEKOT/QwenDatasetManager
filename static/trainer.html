@@ -132,6 +132,20 @@
                                 <p class="trainer-help">Local weights are reused from diffusion_models/, text_encoders/, vae/ and loras/ under Models folder, including nested folders. Overrides select individual files. Missing files download there unless Local files only is enabled. For fully offline loading, supply the original tokenizer/processor/text_encoder config folders too.</p>
                             </section>
 
+                            <section id="trainer-native-rgba-wrap" class="trainer-card hidden">
+                                <div class="trainer-card-heading"><span>Qwen Image 2.1</span></div>
+                                <label class="trainer-switch"><input id="trainer-native-rgba" type="checkbox"><span></span>Transparency (RGBA)</label>
+                                <p class="trainer-help">Uses the built-in RGBA VAE. RGB images receive opaque alpha; RGBA images and samples keep transparency. Datasets without Controls train text-to-image; paired Controls enable editing.</p>
+                            </section>
+
+                            <section id="trainer-layered-wrap" class="trainer-card hidden">
+                                <div class="trainer-card-heading"><span>QI2 — Joint PSD layers</span></div>
+                                <label class="trainer-field"><span>Layer slots</span><input id="trainer-layer-slots" type="number" min="1" max="20" step="1" value="4"></label>
+                                <p class="trainer-help">Target: img/name.psd (8-bit RGB), caption: img/name.txt. Optional Control1/name.png (also JPG/WebP): a flat reference. No Control1 means generation from the caption. All layers are denoised together.</p>
+                                <p class="trainer-help">Visible layers are read bottom to top on the document canvas. Empty upper slots are transparent; exceeding the slot count is an error. Normal raster layers, saved text/smart-object pixels, masks and opacity are supported. Rasterize effects, adjustments, clipping and non-Normal blends first. Plain groups are expanded in order. Memory grows with the number of slots.</p>
+                                <p class="trainer-help">Batch size: 1 document (gradient accumulation is available). Samples save a layered PSD and a composite PNG. This is an experimental architecture adaptation that needs layer training; quality is not guaranteed by the base checkpoint.</p>
+                            </section>
+
                             <section class="trainer-card trainer-lora-only">
                                 <div class="trainer-card-heading"><span>Quantize / compile</span></div>
                                 <div class="trainer-fields">
@@ -534,6 +548,7 @@
                     <button id="trainer-sample-zoom-reset" class="trainer-icon-btn" type="button" title="Reset zoom" aria-label="Reset zoom">1:1</button>
                     <button id="trainer-sample-zoom-in" class="trainer-icon-btn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
                     <a id="trainer-sample-download" class="trainer-btn trainer-btn-ghost" href="#">Download</a>
+                    <a id="trainer-sample-download-psd" class="trainer-btn trainer-btn-ghost hidden" href="#">Download PSD</a>
                     <button id="trainer-sample-delete" class="trainer-btn trainer-btn-danger" type="button">Delete</button>
                     <button class="trainer-icon-btn" type="button" data-sample-viewer-close aria-label="Close viewer">✕</button>
                 </div>

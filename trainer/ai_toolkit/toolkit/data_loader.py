@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 from tqdm import tqdm
 import albumentations as A
 
@@ -391,6 +391,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             sd: 'StableDiffusion' = None,
     ):
         self.dataset_config = dataset_config
+        if dataset_config.batch_size_override is not None:
+            batch_size = dataset_config.batch_size_override
         # update bucket divisibility
         self.dataset_config.bucket_tolerance = sd.get_bucket_divisibility()
         self.is_video = dataset_config.num_frames > 1 or dataset_config.auto_frame_count
@@ -410,6 +412,14 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         self.sd = sd
 
+        if dataset_config.target_format == 'psd_layers':
+            if sd is None or sd.arch != 'qwen_image_2_layered' or dataset_config.layer_slots != sd.target_layer_count:
+                raise ValueError("PSD layer dataset and QI2 layered model must use identical layer_slots")
+            if batch_size != 1:
+                raise ValueError("PSD layers currently require batch_size=1; use gradient accumulation")
+        elif sd is not None and sd.arch == 'qwen_image_2_layered':
+            raise ValueError("QI2 layered training requires target_format: psd_layers")
+
         if self.sd is None and self.is_caching_latents:
             raise ValueError(f"sd is required for caching latents")
 
@@ -426,7 +436,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         # check if dataset_path is a folder or json
         if os.path.isdir(self.dataset_path):
-            extensions = image_extensions
+            extensions = ['.psd'] if dataset_config.target_format == 'psd_layers' else image_extensions
             if self.is_audio_model:
                 # only look for audio files
                 extensions = audio_extensions
@@ -448,6 +458,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
+
+        if dataset_config.target_format == 'psd_layers':
+            if not file_list:
+                raise ValueError(f"No PSD targets in {self.dataset_path}")
+            stems = set()
+            for path in file_list:
+                if os.path.splitext(path)[1].lower() != '.psd' or os.path.dirname(os.path.abspath(path)) != os.path.abspath(self.dataset_path):
+                    raise ValueError("PSD targets must be stored directly in the dataset folder")
+                stem = os.path.splitext(os.path.basename(path))[0].casefold()
+                if stem in stems:
+                    raise ValueError(f"Ambiguous PSD basename: {path}")
+                stems.add(stem)
 
         if self.dataset_config.num_repeats > 1:
             # repeat the list
@@ -540,7 +562,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
                     encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
                     dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
-                    text_embedding_space_version=self.sd.text_embedding_space_version if self.sd else "sd1",
+                    text_embedding_space_version=(self.sd.get_text_embedding_space_version() if hasattr(self.sd, "get_text_embedding_space_version") else self.sd.text_embedding_space_version) if self.sd else "sd1",
+                    text_embedding_uses_target_size=getattr(self.sd, "text_embedding_uses_target_size", False),
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
                     temporal_compression=temporal_compression,
@@ -548,6 +571,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 )
                 self.file_list.append(file_item)
             except Exception as e:
+                if dataset_config.target_format == 'psd_layers':
+                    raise
                 print_acc(traceback.format_exc())
                 if self.is_video:
                     print_acc(f"Error processing video: {file}")
@@ -648,6 +673,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         try:
             file_item.load_and_process_image(self.transform)
         except Exception as e:
+            if self.dataset_config.target_format == 'psd_layers':
+                raise
             print(f"Error loading image, skipping and loading a different one: {file_item.path} ({e})")
             if _attempts >= 10:
                 # avoid infinite recursion if many files are corrupt
@@ -679,6 +706,29 @@ def dto_collation(batch: List['FileItemDTO']):
     )
 
 
+class DatasetBatchSampler(Sampler):
+    """Keep non-bucket batches within each dataset to respect its batch size."""
+
+    def __init__(self, dataset: ConcatDataset):
+        self.dataset = dataset
+
+    def __iter__(self):
+        batches = []
+        offset = 0
+        for dataset in self.dataset.datasets:
+            indices = list(range(offset, offset + len(dataset)))
+            random.shuffle(indices)
+            batches.extend(indices[start:start + dataset.batch_size]
+                           for start in range(0, len(indices), dataset.batch_size))
+            offset += len(dataset)
+        random.shuffle(batches)
+        yield from batches
+
+    def __len__(self):
+        return sum((len(dataset) + dataset.batch_size - 1) // dataset.batch_size
+                   for dataset in self.dataset.datasets)
+
+
 def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
@@ -705,10 +755,8 @@ def get_dataloader_from_datasets(
     for config in dataset_config_list:
 
         if config.type == 'image':
-            # Qwen Dataset Manager exposes one training batch size.  Older saved
-            # jobs may still contain the former per-dataset default (usually 1),
-            # so the train-level value must remain authoritative here as well as
-            # in newly generated configs.
+            # Only the explicit batch_size_override replaces the training value.
+            # Ignore legacy per-dataset batch_size values in older saved jobs.
             dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
             datasets.append(dataset)
             if config.buckets:
@@ -755,6 +803,13 @@ def get_dataloader_from_datasets(
             drop_last=False,
             shuffle=True,
             collate_fn=dto_collation,  # Use the custom collate function
+            **dataloader_kwargs
+        )
+    elif any(config.batch_size_override is not None for config in dataset_config_list):
+        data_loader = DataLoader(
+            concatenated_dataset,
+            batch_sampler=DatasetBatchSampler(concatenated_dataset),
+            collate_fn=dto_collation,
             **dataloader_kwargs
         )
     else:

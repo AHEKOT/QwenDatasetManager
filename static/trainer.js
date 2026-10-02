@@ -61,6 +61,7 @@
     h3.mount();
     const isH3 = () => h3.isH3(selectedModel()?.key);
     const isQieJoint = () => selectedModel()?.key === 'qwen_image_edit_2511' && selectedPreset() === 'transparent_lora';
+    const isLayered = () => selectedPreset() === 'qwen_layered_lora';
     const isVideoPath = path => /\.(mp4|avi|mov|webm|mkv|wmv|m4v|flv)$/i.test(path || '');
     const independentValidationUploads = document.body.dataset.independentValidationUploads === 'true';
     const editorView = $('trainer-editor-view');
@@ -195,6 +196,7 @@
             ? `<option value="${escapeHtml(trainingChoiceValue('chromakey_tiny', chroma.key))}">${escapeHtml(chroma.label)} — Clean alpha + native detail</option>`
             : '';
         modelSelect.innerHTML = [
+            state.models.some(model => model.key === 'qwen_image_2') ? `<optgroup label="Layered image training"><option value="qwen_layered_lora::qwen_image_2">Qwen Image 2.1 — Joint PSD layers LoRA</option></optgroup>` : '',
             `<optgroup label="Standard edit LoRA">${standardOptions}</optgroup>`,
             `<optgroup label="Edit / RGBA LoRA">${transparentOptions}</optgroup>`,
             (qwenVaeOption || flux2VaeOption || h3VaeOption)
@@ -242,6 +244,17 @@
         const isVae = isVaePreset(preset);
         const isChroma = isChromaPreset(preset);
         const isTransparent = preset === 'transparent_lora';
+        $('trainer-layered-wrap').classList.toggle('hidden', !isLayered());
+        $('trainer-batch-size').disabled = isLayered();
+        $('trainer-loss').disabled = isLayered();
+        ['trainer-dop', 'trainer-bpp', 'trainer-guidance-loss', 'trainer-differential-guidance', 'trainer-validation-enabled', 'trainer-use-advanced-config'].forEach(id => {
+            $(id).disabled = isLayered();
+            if (isLayered()) $(id).checked = false;
+        });
+        if (isLayered()) {
+            setInput('trainer-batch-size', 1);
+            setInput('trainer-loss', 'mse');
+        }
         document.querySelectorAll('.trainer-lora-only').forEach(element =>
             element.classList.toggle('hidden', isVae || isChroma)
         );
@@ -263,7 +276,9 @@
             : isVae
             ? (preset === 'h3_rgba_vae' ? 'Configure MiniMax H3 RGBA VAE training' : preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
             : (isQieJoint() ? 'Configure QIE2511 edit training (RGB / RGBA)' : isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
-        $('trainer-editor-description').textContent = isChroma
+        $('trainer-editor-description').textContent = isLayered()
+            ? 'Train one joint RGBA layer stack per PSD. Control1 is optional; samples include a layered PSD and a composite preview.'
+            : isChroma
             ? 'RGBA targets are composited onto configurable synthetic backgrounds without changing their aspect ratio. The model receives RGB only.'
             : isVae
             ? 'RGBA targets are mapped from each selected dataset; captions and Control folders are not used.'
@@ -285,6 +300,7 @@
         const model = selectedModel();
         if (!model) return;
         h3.render(isVaePreset(selectedPreset()) ? '' : model.key);
+        $('trainer-native-rgba-wrap').classList.toggle('hidden', !model.nativeRgba || isLayered());
         $('trainer-model-license').textContent = model.license;
         $('trainer-model-license').title = model.gated ? 'Gated Hugging Face model' : model.license;
         if (model.kind === 'chromakey') {
@@ -385,13 +401,13 @@
         const previous = select.value;
         const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
         const preset = selectedPreset();
-        const validityKey = isQieJoint() ? 'minimaxValid' : isH3() && preset === 'standard_lora' ? 'minimaxValid' : preset === 'transparent_lora'
+        const validityKey = isLayered() ? 'psdValid' : selectedModel()?.nativeRgba ? 'targetCount' : isQieJoint() ? 'minimaxValid' : isH3() && preset === 'standard_lora' ? 'minimaxValid' : preset === 'transparent_lora'
             ? 'transparentValid'
             : (isVaePreset(preset) ? 'vaeValid' : (isChromaPreset(preset) ? 'chromakeyValid' : 'valid'));
         select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
             const ready = !dataset.inspected || Boolean(dataset[validityKey]);
             const details = dataset.inspected
-                ? ` · ${isH3() ? dataset.mediaTargetCount : dataset.targetCount} targets · ${isH3() ? (dataset.videoCount || 0) + ' video' : (dataset.alphaCount || 0) + ' alpha'} · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`
+                ? (isLayered() ? ` · ${dataset.psdTargetCount || 0} PSD · ${dataset.psdPairedCount || 0} with Control1 · ${dataset.psdGenerationCount || 0} from scratch${ready ? '' : ' · not ready'}` : ` · ${isH3() ? dataset.mediaTargetCount : dataset.targetCount} targets · ${isH3() ? (dataset.videoCount || 0) + ' video' : (dataset.alphaCount || 0) + ' alpha'} · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`)
                 : '';
             return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)}${details}</option>`;
         }).join('');
@@ -444,6 +460,7 @@
             repeats: Number(settings.repeats ?? 1),
             weight: Number(settings.weight ?? 1),
             captionDropout: Number(settings.captionDropout ?? 0.05),
+            batchSizeOverride: settings.batchSizeOverride ?? '',
             defaultCaption: settings.defaultCaption || '',
             captionExtension: settings.captionExtension || 'txt',
             resolutions: Array.isArray(settings.resolutions) ? settings.resolutions.map(Number) : [512, 768, 1024],
@@ -547,7 +564,7 @@
             const inspectionWarnings = dataset.inspectionError
                 ? [`Inspection failed: ${dataset.inspectionError}`]
                 : [];
-            const relevantWarnings = [...dataset.warnings, ...inspectionWarnings].filter(warning => {
+            const relevantWarnings = [...(isLayered() ? dataset.psdErrors || [] : dataset.warnings), ...inspectionWarnings].filter(warning => {
                 if (isQieJoint() && settings.rgbaControlMode === 'paired') return !warning.includes('no alpha channel');
                 if (isH3()) return !warning.includes('no control images') && !warning.includes('no alpha channel') && !(dataset.videoCount && warning.includes('no target images'));
                 if (isChromaPreset(preset)) {
@@ -581,6 +598,7 @@
                     <label class="trainer-field"><span>Repeats</span><input data-dataset-field="repeats" data-dataset-index="${index}" type="number" min="1" max="1000" value="${settings.repeats}"></label>
                     <label class="trainer-field"><span>LoRA weight</span><input data-dataset-field="weight" data-dataset-index="${index}" type="number" min="0" max="100" step="0.1" value="${settings.weight}"></label>
                     <label class="trainer-field"><span>Caption dropout</span><input data-dataset-field="captionDropout" data-dataset-index="${index}" type="number" min="0" max="1" step="0.01" value="${settings.captionDropout}"></label>
+                    <label class="trainer-field" title="Leave empty to use the training batch size. Set 1 to process this dataset one sample at a time."><span>Batch size override</span><input data-dataset-field="batchSizeOverride" data-dataset-index="${index}" type="number" min="1" max="${isLayered() ? 1 : 128}" step="1" placeholder="Global" value="${escapeHtml(settings.batchSizeOverride ?? '')}"></label>
                     <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
                     <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
                     ${rgbaMode}
@@ -588,12 +606,14 @@
                     <div class="trainer-resolution-row"><span>Resolutions</span>${[256, 512, 768, 1024, 1280, 1328, 1536, 2048].map(value => resolutionChip(index, value, settings.resolutions.includes(value))).join('')}</div>
                     <div class="trainer-toggle-row trainer-resolution-row">
                         <label class="trainer-switch"><input data-dataset-field="cacheLatents" data-dataset-index="${index}" type="checkbox"${settings.cacheLatents ? ' checked' : ''}><span></span>Cache latents</label>
-                        <label class="trainer-switch"><input data-dataset-field="isRegularization" data-dataset-index="${index}" type="checkbox"${settings.isRegularization ? ' checked' : ''}><span></span>Is regularization</label>
-                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
-                        <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}><span></span>Flip Y</label>
+                        <label class="trainer-switch"><input data-dataset-field="isRegularization" data-dataset-index="${index}" type="checkbox"${settings.isRegularization ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Is regularization</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Flip X</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Flip Y</label>
                     </div>
                 </div>`;
-            const datasetMetrics = isChromaPreset(preset)
+            const datasetMetrics = isLayered()
+                ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.psdTargetCount ?? null)}</strong><span>PSD targets</span></div><div class="trainer-dataset-metric"><strong>${metric(dataset.psdPairedCount ?? null)}</strong><span>with Control1</span></div><div class="trainer-dataset-metric"><strong>${metric(dataset.psdGenerationCount ?? null)}</strong><span>from scratch</span></div></div>`
+                : isChromaPreset(preset)
                 ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.chromaImageCount ?? dataset.targetCount)}</strong><span>PNG/WebP images</span></div></div>`
                 : `<div class="trainer-dataset-metrics">
                     <div class="trainer-dataset-metric"><strong>${metric(isH3() ? dataset.mediaTargetCount : dataset.targetCount)}</strong><span>targets</span></div>
@@ -604,7 +624,7 @@
                 <div class="trainer-dataset-title">
                     <strong title="${escapeHtml(dataset.name)}">${escapeHtml(dataset.name)}</strong>
                     <span title="${escapeHtml(dataset.targetPath)}">…/Datasets/${escapeHtml(dataset.name)}/img</span>
-                    <div class="trainer-dataset-paths"><span>Target · ${metric(dataset.targetCount)}</span>${controls}</div>
+                    <div class="trainer-dataset-paths"><span>Target · ${metric(isLayered() ? dataset.psdTargetCount ?? null : dataset.targetCount)}</span>${isLayered() ? '<span>PSD + optional Control1</span>' : controls}</div>
                 </div>
                 ${datasetMetrics}
                 ${datasetSettings}
@@ -616,7 +636,7 @@
             </article>`;
         }).join('');
         const selectedInspected = state.selectedDatasets.every(item => state.datasets.find(dataset => dataset.name === item.name)?.inspected);
-        const totalTargets = state.selectedDatasets.reduce((sum, item) => sum + (state.datasets.find(dataset => dataset.name === item.name)?.targetCount || 0), 0);
+        const totalTargets = state.selectedDatasets.reduce((sum, item) => sum + (state.datasets.find(dataset => dataset.name === item.name)?.[isLayered() ? 'psdTargetCount' : 'targetCount'] || 0), 0);
         $('trainer-dataset-summary').textContent = state.datasetsLoaded && selectedInspected
             ? `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'} · ${totalTargets} target images`
             : `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'}`;
@@ -644,7 +664,7 @@
         } else if (input.type === 'checkbox') {
             dataset[field] = input.checked;
         } else if (input.type === 'number') {
-            dataset[field] = Number(input.value);
+            dataset[field] = field === 'batchSizeOverride' && input.value === '' ? '' : Number(input.value);
         } else {
             dataset[field] = input.value;
         }
@@ -694,7 +714,7 @@
                         <label class="trainer-field"><span>LoRA scale</span><input data-sample-field="networkMultiplier" data-sample-index="${index}" type="text" inputmode="decimal" value="${escapeHtml(sample.networkMultiplier ?? sample.network_multiplier ?? '')}" placeholder="1.0 (default)"></label>
                     </div>
                 </div>
-                <fieldset class="trainer-sample-images"><legend>${isH3() ? 'Optional references (image / video)' : 'Images to edit'}</legend><div>${[1, 2, 3].map(controlIndex => renderSampleImageSlot(sample, index, controlIndex)).join('')}</div></fieldset>
+                <fieldset class="trainer-sample-images"><legend>${isLayered() ? 'Optional flat Control1 (empty = from scratch)' : isH3() ? 'Optional references (image / video)' : 'Images to edit'}</legend><div>${(isLayered() ? [1] : [1, 2, 3]).map(controlIndex => renderSampleImageSlot(sample, index, controlIndex)).join('')}</div></fieldset>
             </div>
         </article>`).join('');
     }
@@ -967,6 +987,8 @@
             qtypeTextEncoder: $('trainer-qtype-te').value,
             lowVram: checked('trainer-low-vram'),
             matchTargetResolution: checked('trainer-match-resolution'),
+            nativeRgba: isLayered() || (Boolean(selectedModel()?.nativeRgba) && checked('trainer-native-rgba')),
+            layerSlots: numberValue('trainer-layer-slots'),
             compileModel: checked('trainer-compile'),
             networkType: $('trainer-network-type').value,
             rank: numberValue('trainer-rank'),
@@ -1071,10 +1093,17 @@
 
     function validateForm(payload) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(payload.name)) return 'Training name must use letters, numbers, dots, underscores or hyphens.';
+        if (payload.trainingPreset === 'qwen_layered_lora' && (!Number.isInteger(payload.layerSlots) || payload.layerSlots < 1 || payload.layerSlots > 20)) return 'Layer slots must be an integer from 1 to 20.';
         if (isVaePreset(payload.trainingPreset) && !payload.sourceVaePath) return 'Enter the standard VAE repository or local source path.';
         if (!isVaePreset(payload.trainingPreset) && !isChromaPreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
         if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
         if (!payload.datasets.length) return 'Select at least one dataset.';
+        const invalidBatch = payload.datasets.find(dataset => {
+            const value = dataset.batchSizeOverride;
+            return value !== undefined && value !== null && value !== ''
+                && (!Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > (payload.trainingPreset === 'qwen_layered_lora' ? 1 : 128));
+        });
+        if (invalidBatch) return `Batch size override for ${invalidBatch.name} must be an integer from 1 to ${payload.trainingPreset === 'qwen_layered_lora' ? 1 : 128}, or empty to use the global value.`;
         if (payload.trainingPreset === 'transparent_lora' && !(payload.model === 'minimax_h3_ref2va' && payload.distillationMethod === 'dopsd')) {
             const missingBackground = payload.datasets.find(dataset =>
                 dataset.rgbaControlMode === 'edit' && !dataset.rgbaBackgroundDataset
@@ -1089,7 +1118,7 @@
         if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
         if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
         if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling) {
-            const sampleWithoutImage = h3.isH3(payload.model) || payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
+            const sampleWithoutImage = h3.isH3(payload.model) || payload.model === 'qwen_image_2' || payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
             if (sampleWithoutImage) return 'Add at least one image to edit for every sample.';
             const sampleWithoutInstruction = payload.samples.find(sample => [1, 2, 3].some(index => sampleControlPath(sample, index)) && !String(sample.prompt || '').trim());
             if (sampleWithoutInstruction) return 'Enter an edit instruction for every sample.';
@@ -1226,6 +1255,8 @@
         setInput('trainer-qtype-te', data.qtypeTextEncoder);
         setInput('trainer-low-vram', data.lowVram);
         setInput('trainer-match-resolution', data.matchTargetResolution);
+        setInput('trainer-native-rgba', data.nativeRgba || false);
+        setInput('trainer-layer-slots', data.layerSlots ?? 4);
         setInput('trainer-compile', data.compileModel);
         setInput('trainer-network-type', data.networkType);
         setInput('trainer-rank', data.rank);
@@ -1494,6 +1525,8 @@
         $('trainer-sample-viewer-index').textContent = String(Number(sample.sampleIndex || 0) + 1);
         $('trainer-sample-viewer-seed').textContent = sample.seed ?? '—';
         $('trainer-sample-download').href = generatedSampleUrl(job.id, sample.name, '?download=1');
+        $('trainer-sample-download-psd').classList.toggle('hidden', !sample.psdFile);
+        $('trainer-sample-download-psd').href = sample.psdFile ? generatedSampleUrl(job.id, sample.psdFile, '?download=1') : '#';
 
         const controls = $('trainer-sample-controls');
         if (sample.controlCount > 0) {
@@ -1958,6 +1991,11 @@
                 setVaeSourceDefaults(true);
             }
             renderModelFields(true, true);
+            if (selectedModel()?.nativeRgba) {
+                const defaults = selectedModel().defaults;
+                const fields = { qtype: 'trainer-qtype', qtypeTextEncoder: 'trainer-qtype-te', timestepType: 'trainer-timestep', guidanceScale: 'trainer-guidance-scale', matchTargetResolution: 'trainer-match-resolution', lowVram: 'trainer-low-vram', nativeRgba: 'trainer-native-rgba' };
+                Object.entries(fields).forEach(([key, id]) => setInput(id, defaults[key]));
+            }
             if (isQieJoint()) {
                 $('trainer-rgba-edge-correction').value = 'none';
                 state.selectedDatasets.forEach(ds => { ds.rgbaControlMode = 'paired'; });
@@ -1972,6 +2010,12 @@
             }
             renderConditionalOptions();
             renderPresetFields();
+            if (isLayered()) {
+                state.selectedDatasets.forEach(ds => Object.assign(ds, { flipX: false, flipY: false, isRegularization: false }));
+                state.samples.forEach(sample => { delete sample.ctrlImg2; delete sample.ctrlImg3; delete sample.ctrl_img_2; delete sample.ctrl_img_3; delete sample.image; });
+                renderSelectedDatasets();
+                renderSamples();
+            }
         });
         $('h3-distillationMethod').addEventListener('change', () => {
             const method = $('h3-distillationMethod').value;

@@ -7,6 +7,8 @@ The comparison is intentionally limited to the `diffusion_trainer` (LoRA
 Trainer) Simple UI for these architecture entries:
 
 - `qwen_image_edit_plus:2511`
+- `qwen_image_2` from local source commit
+  `ecee894ed2b1f3716d9d7326693061ec1a3105bb`; see [QWEN21.md](QWEN21.md).
 - `flux2_klein_4b`
 - `flux2_klein_9b`
 - `minimax_h3` and `minimax_h3_ref2va` from local source commit
@@ -40,7 +42,7 @@ upstream entries:
 | Regularization | Differential Output Preservation + multiplier/class, Blank Prompt Preservation + multiplier, Contrastive Guidance Loss + target |
 | Advanced | differential guidance + scale |
 | Validation | cadence, resolution, sigmas, managed validation image/prompt list |
-| Dataset | target/control mapping, network weight, repeats, per-dataset batch size, default caption, dropout, caption extension, cache latents, regularization flag, flips, complete resolution list |
+| Dataset | target/control mapping, network weight, repeats, optional batch size override (empty inherits the training batch size; 1 processes individual samples), default caption, dropout, caption extension, cache latents, regularization flag, flips, complete resolution list |
 | Sampling | cadence/start, FlowMatch/DDPM sampler, guidance, steps, size, seed/walk, skip/force/disable, edit-instruction list, per-sample size/seed/network multiplier, independently uploaded `ctrl_img_1`–`ctrl_img_3` |
 | Runtime | queue, stop, save now, sample now, progress, speed, logs, and a live-polled Samples / VAE Validation gallery |
 | Generated validation media | step/prompt/seed metadata, per-step grouping, original and alpha-preserving thumbnail delivery, checkerboard RGBA display, full-screen zoom/navigation, control-image switching, deletion and ZIP download |
@@ -106,3 +108,10 @@ upstream entries:
 - AI Toolkit target/control folder selectors are replaced by QDM's managed
   dataset selector. `img` maps to the target and matching `Control1`–`Control3`
   folders map to multi-control inputs.
+
+## Local QI2 layered preset
+
+`qwen_image_2_layered` / `qwen_layered_lora` extends QI2 with jointly denoised
+RGBA target layers, bottom-to-top PSD datasets, optional Control1 and PSD sampling
+output. This is a local architecture change, not upstream parity. Details and
+unexecuted regression tests: [QWEN21_LAYERS.md](QWEN21_LAYERS.md).

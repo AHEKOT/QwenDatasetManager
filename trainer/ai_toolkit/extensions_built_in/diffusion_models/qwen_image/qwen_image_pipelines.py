@@ -24,6 +24,48 @@ from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutpu
 
 
 class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
+    def _get_qwen_prompt_embeds(self, prompt=None, image=None, device=None, dtype=None):
+        """Extract final conditioning states without computing vocabulary logits."""
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        image_count = len(image) if isinstance(image, list) else int(image is not None)
+        image_prefix = ''.join(
+            f'Picture {i + 1}: <|vision_start|><|image_pad|><|vision_end|>'
+            for i in range(image_count)
+        )
+        text = [self.prompt_template_encode.format(image_prefix + item) for item in prompt]
+        model_inputs = self.processor(
+            text=text, images=image, padding=True, return_tensors='pt',
+        ).to(device)
+
+        # The outer ForConditionalGeneration.forward also dequantizes lm_head
+        # and creates logits for every token. Neither logits, intermediate
+        # hidden states nor a generation KV cache are used for conditioning.
+        outputs = self.text_encoder.model(
+            input_ids=model_inputs['input_ids'],
+            attention_mask=model_inputs['attention_mask'],
+            pixel_values=model_inputs.get('pixel_values'),
+            image_grid_thw=model_inputs.get('image_grid_thw'),
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        states = self._extract_masked_hidden(outputs.last_hidden_state, model_inputs['attention_mask'])
+        states = [item[self.prompt_template_encode_start_idx:] for item in states]
+        max_length = max(item.size(0) for item in states)
+        prompt_embeds = torch.stack([
+            torch.cat([item, item.new_zeros(max_length - item.size(0), item.size(1))])
+            for item in states
+        ]).to(device=device, dtype=dtype)
+        attention_mask = torch.stack([
+            torch.cat([
+                torch.ones(item.size(0), dtype=torch.long, device=device),
+                torch.zeros(max_length - item.size(0), dtype=torch.long, device=device),
+            ]) for item in states
+        ])
+        return prompt_embeds, attention_mask
+
     @torch.no_grad()
     def __call__(
         self,

@@ -251,6 +251,14 @@ class BaseModel:
         return self.arch == 'ssd'
 
     @property
+    def load_rgba(self) -> bool:
+        """Images keep an alpha channel end to end: the dataloader loads them
+        as RGBA (opaque alpha when the source has none), the VAE encodes four
+        channels, and decoded samples keep the alpha. Only models with an RGBA
+        VAE override this."""
+        return False
+
+    @property
     def is_v3(self):
         return self.arch == 'sd3'
 
@@ -567,7 +575,7 @@ class BaseModel:
                                 # supports_video_control_images handle it in get_prompt_embeds
                                 ctrl_img_list.append(str(gen_config.ctrl_img))
                             elif gen_config.ctrl_img is not None:
-                                ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
+                                ctrl_img = Image.open(gen_config.ctrl_img).convert("RGBA" if getattr(self, "load_rgba", False) else "RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img = (
                                     TF.to_tensor(ctrl_img)
@@ -581,7 +589,7 @@ class BaseModel:
                                 # supports_video_control_images handle it in get_prompt_embeds
                                 ctrl_img_list.append(str(gen_config.ctrl_img_1))
                             elif gen_config.ctrl_img_1 is not None:
-                                ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
+                                ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGBA" if getattr(self, "load_rgba", False) else "RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_1 = (
                                     TF.to_tensor(ctrl_img_1)
@@ -594,7 +602,7 @@ class BaseModel:
                                 # supports_video_control_images handle it in get_prompt_embeds
                                 ctrl_img_list.append(str(gen_config.ctrl_img_2))
                             elif gen_config.ctrl_img_2 is not None:
-                                ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
+                                ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGBA" if getattr(self, "load_rgba", False) else "RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_2 = (
                                     TF.to_tensor(ctrl_img_2)
@@ -607,7 +615,7 @@ class BaseModel:
                                 # supports_video_control_images handle it in get_prompt_embeds
                                 ctrl_img_list.append(str(gen_config.ctrl_img_3))
                             elif gen_config.ctrl_img_3 is not None:
-                                ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
+                                ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGBA" if getattr(self, "load_rgba", False) else "RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_3 = (
                                     TF.to_tensor(ctrl_img_3)
@@ -625,19 +633,21 @@ class BaseModel:
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
                         conditional_embeds = self.encode_prompt(
-                            gen_config.prompt, 
-                            gen_config.prompt_2, 
+                            gen_config.prompt,
+                            gen_config.prompt_2,
                             force_all=True,
-                            control_images=ctrl_img
+                            control_images=ctrl_img,
+                            target_size=(gen_config.width, gen_config.height),
                         )
 
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = True
                         unconditional_embeds = self.encode_prompt(
-                            gen_config.negative_prompt, 
-                            gen_config.negative_prompt_2, 
+                            gen_config.negative_prompt,
+                            gen_config.negative_prompt_2,
                             force_all=True,
-                            control_images=ctrl_img
+                            control_images=ctrl_img,
+                            target_size=(gen_config.width, gen_config.height),
                         )
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
@@ -1124,6 +1134,7 @@ class BaseModel:
             max_length=None,
             dropout_prob=0.0,
             control_images=None,
+            target_size=None,
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -1135,7 +1146,11 @@ class BaseModel:
             prompt2 = [prompt2]
         # if control_images in the signature, pass it. This keep from breaking plugins
         if self.encode_control_in_text_embeddings:
-            return self.get_prompt_embeds(prompt, control_images=control_images)
+            kwargs = {"control_images": control_images}
+            # target (width, height) only for models that size references against it
+            if target_size is not None and "target_size" in inspect.signature(self.get_prompt_embeds).parameters:
+                kwargs["target_size"] = target_size
+            return self.get_prompt_embeds(prompt, **kwargs)
 
         return self.get_prompt_embeds(prompt)
 

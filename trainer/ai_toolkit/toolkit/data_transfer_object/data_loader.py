@@ -71,6 +71,9 @@ class FileItemDTO(
         # module-level function (picklable) for models whose valid frame
         # counts are not temporal_compression * n + 1; None = default math
         _sd = kwargs.get("sd", None)
+        self.load_rgba = bool(getattr(_sd, "load_rgba", False))
+        if self.load_rgba and self.dataset_config.alpha_mask:
+            raise ValueError("Native RGBA loading cannot be combined with alpha_mask")
         self.frame_count_snapper = (
             _sd.get_frame_count_snapper()
             if _sd is not None and hasattr(_sd, "get_frame_count_snapper")
@@ -89,6 +92,8 @@ class FileItemDTO(
         self.te_padding_side = kwargs.get("te_padding_side", "right")
         self.latent_space_version = kwargs.get("latent_space_version", "sd1")
         self.text_embedding_space_version = kwargs.get("text_embedding_space_version", "sd1")
+        # model sizes references against the item's bucket, so the cache key must carry it
+        self.text_embedding_uses_target_size = kwargs.get("text_embedding_uses_target_size", False)
         if dataset_root is not None:
             # remove dataset root from path
             file_key = self.path.replace(dataset_root, "")
@@ -143,6 +148,10 @@ class FileItemDTO(
                 # Release the video capture object immediately
                 video.release()
                 size_database[file_key] = (width, height, file_signature, video_total_frames, video_fps)
+        elif self.dataset_config.target_format == 'psd_layers':
+            from toolkit.layered_psd import psd_size, file_digest
+            w, h = psd_size(self.path)
+            self.psd_content_digest = file_digest(self.path)
         elif use_db_entry:
             w, h, _ = db_entry[:3]
         else:

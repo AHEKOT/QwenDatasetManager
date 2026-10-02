@@ -914,6 +914,10 @@ class ImageProcessingDTOMixin:
         if self.is_video:
             self.load_and_process_video(transform, only_load_latents)
             return
+        if self.dataset_config.target_format == 'psd_layers':
+            from toolkit.layered_psd import load_psd_target
+            load_psd_target(self, transform, only_load_latents)
+            return
         try:
             img = Image.open(self.path)
             img = exif_transpose(img)
@@ -942,7 +946,7 @@ class ImageProcessingDTOMixin:
             img = Image.fromarray(np_img)
 
         if not is_rgba_target:
-            img = img.convert('RGB')
+            img = img.convert('RGBA' if getattr(self, 'load_rgba', False) else 'RGB')
 
         def resize_target(target_img, size):
             if is_rgba_target:
@@ -1151,6 +1155,16 @@ class ControlFileItemDTOMixin:
             allow_video_controls = sd is not None and getattr(
                 sd, 'supports_video_control_images', False)
             for control_path in control_path_list:
+                if dataset_config.target_format == 'psd_layers':
+                    matches = sorted(os.path.join(control_path, name) for name in os.listdir(control_path)
+                                     if os.path.isfile(os.path.join(control_path, name))
+                                     and os.path.splitext(name)[0].casefold() == file_name_no_ext.casefold()
+                                     and os.path.splitext(name)[1].lower() in ('.png', '.jpg', '.jpeg', '.webp'))
+                    if len(matches) > 1:
+                        raise ValueError(f"Ambiguous PSD Control1 for {img_path}: {matches}")
+                    found_control_images.extend(matches)
+                    self.has_control_image = bool(found_control_images)
+                    continue
                 for ext in img_ext_list:
                     if os.path.exists(os.path.join(control_path, file_name_no_ext + ext)):
                         found_control_images.append(os.path.join(control_path, file_name_no_ext + ext))
@@ -1248,7 +1262,11 @@ class ControlFileItemDTOMixin:
                 img = Image.open(control_path)
                 img = exif_transpose(img)
 
-                if img.mode in ("RGBA", "LA"):
+                if getattr(self, "load_rgba", False):
+                    # keep the alpha instead of flattening it; sources without
+                    # one get a fully opaque alpha
+                    img = img.convert("RGBA")
+                elif img.mode in ("RGBA", "LA"):
                     # Create a background with the specified transparent color
                     transparent_color = tuple(self.dataset_config.control_transparent_color)
                     background = Image.new("RGB", img.size, transparent_color)
@@ -1259,6 +1277,8 @@ class ControlFileItemDTOMixin:
                     # Already no alpha channel
                     img = img.convert("RGB")
             except Exception as e:
+                if self.dataset_config.target_format == 'psd_layers':
+                    raise ValueError(f"Cannot load PSD Control1: {control_path}") from e
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
             
@@ -1580,9 +1600,13 @@ class AugmentationFileItemDTOMixin:
         # save the original tensor
         self.unaugmented_tensor = transforms.ToTensor()(img) if transform is None else transform(img)
 
+        has_alpha = img.mode == 'RGBA'
         open_cv_image = np.array(img)
-        # Convert RGB to BGR
-        open_cv_image = open_cv_image[:, :, ::-1].copy()
+        # Convert RGB to BGR, leaving any alpha channel where it is
+        if has_alpha:
+            open_cv_image = open_cv_image[:, :, [2, 1, 0, 3]].copy()
+        else:
+            open_cv_image = open_cv_image[:, :, ::-1].copy()
 
         # apply augmentations
         transformed = self.aug_transform(image=open_cv_image)
@@ -1599,7 +1623,7 @@ class AugmentationFileItemDTOMixin:
             self.aug_replay_spatial_transforms = augmented_params
 
         # convert back to RGB tensor
-        augmented = cv2.cvtColor(augmented, cv2.COLOR_BGR2RGB)
+        augmented = cv2.cvtColor(augmented, cv2.COLOR_BGRA2RGBA if has_alpha else cv2.COLOR_BGR2RGB)
 
         # convert to PIL image
         augmented = Image.fromarray(augmented)
@@ -1616,20 +1640,24 @@ class AugmentationFileItemDTOMixin:
 
         # save colorspace to convert back to
         colorspace = img.mode
+        has_alpha = colorspace == 'RGBA'
 
-        # convert to rgb
-        img = img.convert('RGB')
+        # convert to rgb, keeping alpha so it rides the same spatial transform
+        img = img.convert('RGBA' if has_alpha else 'RGB')
 
         open_cv_image = np.array(img)
-        # Convert RGB to BGR
-        open_cv_image = open_cv_image[:, :, ::-1].copy()
+        # Convert RGB to BGR, leaving any alpha channel where it is
+        if has_alpha:
+            open_cv_image = open_cv_image[:, :, [2, 1, 0, 3]].copy()
+        else:
+            open_cv_image = open_cv_image[:, :, ::-1].copy()
 
         # Replay transforms
         transformed = A.ReplayCompose.replay(self.aug_replay_spatial_transforms, image=open_cv_image)
         augmented = transformed["image"]
 
         # convert back to RGB tensor
-        augmented = cv2.cvtColor(augmented, cv2.COLOR_BGR2RGB)
+        augmented = cv2.cvtColor(augmented, cv2.COLOR_BGRA2RGBA if has_alpha else cv2.COLOR_BGR2RGB)
 
         # convert to PIL image
         augmented = Image.fromarray(augmented)
@@ -1893,6 +1921,10 @@ class LatentCachingFileItemDTOMixin:
         ])
         is_video = False
         # when adding items, do it after so we dont change old latents
+        if self.dataset_config.target_format == 'psd_layers':
+            item['psd_format_version'] = 1
+            item['layer_slots'] = self.dataset_config.layer_slots
+            item['psd_sha256'] = self.psd_content_digest
         if self.flip_x:
             item["flip_x"] = True
         if self.flip_y:
@@ -1925,6 +1957,8 @@ class LatentCachingFileItemDTOMixin:
         if self.dataset_config.cache_tensors_to_disk:
             # tensor is stored in the cache file, invalidate caches made without it
             item["cache_tensors_to_disk"] = True
+        if getattr(self, "load_rgba", False):
+            item["load_rgba"] = True
         if self.dataset_config.rgba_mode:
             item["pixel_channels"] = "rgba"
             item["rgba_preprocess_version"] = 1
@@ -2263,6 +2297,14 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+            if self.dataset_config.target_format == 'psd_layers':
+                from toolkit.layered_psd import file_digest
+                paths = self.control_path if isinstance(self.control_path, list) else [self.control_path]
+                item['control_sha256'] = [file_digest(path) for path in paths]
+            if getattr(self, "text_embedding_uses_target_size", False) and getattr(self, "crop_width", None):
+                item["control_target_size"] = [self.crop_width, self.crop_height]
+            if getattr(self, "load_rgba", False):
+                item["load_rgba"] = True
         if self.encode_control_in_text_embeddings and self.dataset_config.rgba_generate_control:
             item["rgba_generated_control"] = True
             if self.dataset_config.rgba_control_mode == 'generation':
@@ -2454,7 +2496,10 @@ class TextEmbeddingCachingMixin:
             super().__init__(**kwargs)
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
+    @torch.no_grad()
     def cache_text_embeddings(self: 'AiToolkitDataset'):
+        # Checkpointing can install input-gradient hooks even on frozen text
+        # encoders. Disk-cache generation must never retain an autograd graph.
         context = getattr(self.sd, 'text_embedding_dataset_context', None)
         with accelerator.main_process_first(), (context(self.dataset_config) if context else nullcontext()):
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
@@ -2521,7 +2566,7 @@ class TextEmbeddingCachingMixin:
                             control_path_list = [control_path_list]
                         for i in range(len(control_path_list)):
                             try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
+                                img = Image.open(control_path_list[i]).convert("RGBA" if getattr(self.sd, "load_rgba", False) else "RGB")
                                 img = exif_transpose(img)
                                 prepare_image = getattr(self.sd, 'prepare_text_encoder_image', None)
                                 if prepare_image is not None:
@@ -2534,6 +2579,8 @@ class TextEmbeddingCachingMixin:
                                 )
                                 ctrl_img_list.append(img)
                             except Exception as e:
+                                if file_item.dataset_config.target_format == 'psd_layers':
+                                    raise ValueError(f"Cannot encode PSD Control1: {control_path_list[i]}") from e
                                 print_acc(f"Error: {e}")
                                 print_acc(f"Error loading control image: {control_path_list[i]}")
                         # control VIDEOS ride into the presentation by path (models
@@ -2551,6 +2598,10 @@ class TextEmbeddingCachingMixin:
                             ctrl_img = ctrl_img_list[0]
                         else:
                             ctrl_img = ctrl_img_list
+                        # the bucket the item trains at, so references can be sized against it
+                        target_size = None
+                        if getattr(file_item, 'crop_width', None) and getattr(file_item, 'crop_height', None):
+                            target_size = (file_item.crop_width, file_item.crop_height)
                         for path, caption in encode_targets:
                             if path in dropout_target_paths:
                                 # dropout embeds are plain text. Only fall back to the
@@ -2558,9 +2609,11 @@ class TextEmbeddingCachingMixin:
                                 try:
                                     prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
                                 except Exception:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                        caption, control_images=ctrl_img, target_size=target_size)
                             else:
-                                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                    caption, control_images=ctrl_img, target_size=target_size)
                             prompt_embeds.save(path)
                             del prompt_embeds
                     elif (

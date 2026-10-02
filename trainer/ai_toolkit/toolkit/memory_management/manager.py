@@ -53,15 +53,29 @@ class MemoryManager:
         self.module: torch.nn.Module = module
         self.process_device: torch.device = process_device
         self.unmanaged_modules: list[torch.nn.Module] = []
+        self.parked = False
+
+    def _move_resident_tensors(self, device):
+        # Walk direct storage only: managed layers must keep their CPU weights.
+        # This also includes buffers/parameters on containers, outside the
+        # legacy unmanaged-module allowlist.
+        for sub in self.module.modules():
+            if hasattr(sub, '_layer_memory_manager'):
+                continue
+            # Module._apply swaps tensor-subclass storage correctly. Assigning
+            # .data corrupts torchao wrapper/inner-device consistency and can
+            # leave quantized storage on CUDA while the wrapper reports CPU.
+            sub._apply(lambda tensor: tensor.to(device), recurse=False)
+
+    def park(self):
+        """Release the resident GPU portion during an inactive training phase."""
+        self._move_resident_tensors(torch.device('cpu'))
+        self.parked = True
 
     def memory_managed_to(self, *args, **kwargs):
-        # the manager owns placement: the resident (unmanaged/ignore) set must
-        # live on the compute device for forwards to work. Legacy parking
-        # gestures (.to("cpu") between phases) would strand it there — the
-        # swapped .device property keeps reporting the compute device, so no
-        # holder heal ever brings it back. Honor device moves only TO the
-        # compute device; skip the device part of anything else (dtype
-        # handling below is unaffected).
+        # Layer offloading and whole-model parking are separate operations.
+        # A parked model reports CPU so holders resume it before the next
+        # forward; moving back restores only the resident portion.
         target_device = kwargs.get("device", None)
         for arg in args:
             if isinstance(arg, (torch.device, str)) and not isinstance(arg, torch.dtype):
@@ -74,7 +88,12 @@ class MemoryManager:
         move_resident = target_device is not None and (
             torch.device(target_device) == torch.device(self.process_device)
         )
+        if target_device is not None and torch.device(target_device).type == 'cpu':
+            self.park()
         if target_device is None or move_resident:
+            if move_resident and self.parked:
+                self._move_resident_tensors(self.process_device)
+                self.parked = False
             # first move all the unmanaged modules
             for module in self.unmanaged_modules:
                 if isinstance(module, torch.Tensor):
@@ -125,7 +144,8 @@ class MemoryManager:
                 (module.__class__,),
                 {
                     "device": property(
-                        lambda self: self._memory_manager.process_device,
+                        lambda self: torch.device('cpu') if self._memory_manager.parked
+                        else self._memory_manager.process_device,
                         lambda self, value: self.__dict__.__setitem__(
                             "_mm_device_shadow", value
                         ),
@@ -287,15 +307,7 @@ class MemoryManager:
         # on cpu and the first forward explodes on a device mismatch. Managed
         # layers (pinned-cpu weights, cpu-resident bouncing embeddings) are
         # skipped via their _layer_memory_manager.
-        for sub in module.modules():
-            if hasattr(sub, "_layer_memory_manager"):
-                continue
-            for p in sub.parameters(recurse=False):
-                if p is not None and p.device != device:
-                    p.data = p.data.to(device)
-            for name, b in sub._buffers.items():
-                if b is not None and b.device != device:
-                    sub._buffers[name] = b.to(device)
+        module._memory_manager._move_resident_tensors(device)
 
     @classmethod
     def detach(cls, module: torch.nn.Module):

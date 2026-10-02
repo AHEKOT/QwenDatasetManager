@@ -1,0 +1,16 @@
+QDM QI2 Layers
+
+Joint layer sequence construction is adapted from the Qwen Image 2.1 sequence
+implementation in ComfyUI (Comfy-Org/ComfyUI commit
+651ca296a73cd21c12a57eb8741d52e40dc6528f, comfy/ldm/qwen_image21/model.py,
+whose file attribution identifies Hugging Face Diffusers under Apache 2.0)
+and QwenDatasetManager's vendored Qwen Image 2.1 transformer/pipeline.
+
+Vendored Qwen transformer source attribution:
+Copyright 2026 Qwen-Image Team, The HuggingFace Team. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+Schedule equations follow Hugging Face Diffusers
+FlowMatchEulerDiscreteScheduler (Apache 2.0).
+
+This package does not bundle ComfyUI or model checkpoint weights.

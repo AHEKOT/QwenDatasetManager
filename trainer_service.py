@@ -24,6 +24,7 @@ from pathlib import Path
 
 from flask import Blueprint, jsonify, request, send_file
 from PIL import Image
+from trainer_layers import LAYERED_PRESET, LAYERED_ARCH, layer_slots, inspect_psd_dataset, validate_layered_payload, is_layered_job
 from trainer_h3 import H3_KEYS, H3_ARCHES, H3_SOURCE_COMMIT, local_h3_defaults, VIDEO_EXTENSIONS, h3_models, with_h3_defaults, configure_h3, frame_count, validate_h3_process
 
 
@@ -31,6 +32,7 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 ACTIVE_STATUSES = {'queued', 'running', 'stopping'}
 TRAINING_PRESETS = {
+    LAYERED_PRESET: 'Qwen Image 2.1 — Joint PSD layers LoRA',
     'standard_lora': 'Standard edit LoRA',
     'transparent_lora': 'Transparent RGBA LoRA',
     'qwen_rgba_vae': 'Qwen RGBA VAE',
@@ -42,6 +44,8 @@ VAE_TRAINING_PRESETS = {'qwen_rgba_vae', 'flux2_rgba_vae', 'h3_rgba_vae'}
 CHROMAKEY_PRESET = 'chromakey_tiny'
 CHROMAKEY_MODEL_KEY = 'qdm_cleanmatte_v1'
 CHROMAKEY_RESOLUTION_OPTIONS = {256, 320, 384, 448, 512, 640, 768, 896, 1024}
+QWEN21_KEY = 'qwen_image_2'
+QWEN21_SOURCE_COMMIT = 'ecee894ed2b1f3716d9d7326693061ec1a3105bb'
 EDIT_MODELS = {
     'qwen_image_edit_2511': {
         'label': 'Qwen Image Edit 2511',
@@ -56,6 +60,24 @@ EDIT_MODELS = {
         'allowUnloadTextEncoder': False,
         'accuracyRecoveryAdapters': {
             '3 bit with ARA': 'uint3|ostris/accuracy_recovery_adapters/qwen_image_edit_2511_torchao_uint3.safetensors'
+        },
+    },
+    QWEN21_KEY: {
+        'label': 'Qwen Image 2.1',
+        'modelPath': 'Comfy-Org/Qwen-Image-2.1',
+        'arch': 'qwen_image_2',
+        'license': 'Apache-2.0',
+        'gated': False,
+        'gateUrl': None,
+        'defaultQtype': 'convrot8',
+        'noiseScheduler': 'flowmatch',
+        'allowUnloadTextEncoder': False,
+        'accuracyRecoveryAdapters': {},
+        'nativeRgba': True,
+        'defaults': {
+            'qtype': 'convrot8', 'qtypeTextEncoder': 'convrot8',
+            'lowVram': True, 'timestepType': 'shift', 'guidanceScale': 3,
+            'matchTargetResolution': True, 'nativeRgba': False,
         },
     },
     'flux2_klein_4b': {
@@ -539,10 +561,11 @@ class TrainerService:
         return sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS),
                       key=lambda p: p.name.lower()) if folder.is_dir() else []
 
-    def inspect_dataset(self, name, media=False):
+    def inspect_dataset(self, name, media=False, layered=False):
         dataset_dir = self._resolve_dataset(name)
         media_files = self._media_files(dataset_dir / 'img')
-        target_files = media_files if media else self._image_files(dataset_dir / 'img')
+        target_files = (sorted(p for p in (dataset_dir / 'img').iterdir() if p.is_file() and not p.name.startswith('.') and p.suffix.lower() == '.psd')
+                        if layered else media_files if media else self._image_files(dataset_dir / 'img'))
         target_stems = {path.stem for path in target_files}
         # Dataset inspection is deliberately metadata-only. Saving, opening,
         # and queueing a job must never decode thousands of source images.
@@ -552,6 +575,8 @@ class TrainerService:
         controls = []
         warnings = []
         for index in range(1, 4):
+            if layered and index != 1:
+                continue
             folder = dataset_dir / f'Control{index}'
             stems = {p.stem for p in self._media_files(folder)} if media else self._image_stems(folder)
             if not stems:
@@ -566,7 +591,7 @@ class TrainerService:
                 'extra': len(extra),
                 'missingExamples': missing[:5],
             })
-            if missing:
+            if missing and not layered:
                 warnings.append(f'Control{index}: {len(missing)} target files have no matching control')
         caption_stems = {
             path.stem for path in (dataset_dir / 'img').iterdir()
@@ -575,13 +600,14 @@ class TrainerService:
         caption_count = len(target_stems & caption_stems)
         if not target_stems:
             warnings.append('Dataset has no target images')
-        if not controls:
+        if not controls and not layered:
             warnings.append('Dataset has no control images')
         if caption_count < len(target_stems):
             warnings.append(f'{len(target_stems) - caption_count} target files have no caption')
-        if target_files and alpha_count < len(target_files):
+        if not layered and target_files and alpha_count < len(target_files):
             warnings.append(f'{len(target_files) - alpha_count} target files have no alpha channel')
         return {
+            **inspect_psd_dataset(dataset_dir, IMAGE_EXTENSIONS),
             'name': name,
             'targetPath': str(dataset_dir / 'img'),
             'targetCount': len(target_stems),
@@ -835,7 +861,7 @@ class TrainerService:
                 value = raw.get(f'ctrlImg{control_index}') or raw.get(f'ctrl_img_{control_index}')
                 if value:
                     explicit_controls[f'ctrl_img_{control_index}'] = str(self.resolve_sample_image(value))
-            if explicit_controls or (payload.get('model') in H3_KEYS and not raw.get('image')):
+            if explicit_controls or (payload.get('model') in H3_KEYS | {QWEN21_KEY} and not raw.get('image')):
                 prompt = str(raw.get('prompt', '')).strip() or 'Edit the reference image'
                 sample = {'prompt': prompt, **explicit_controls}
                 if payload.get('model') in H3_KEYS and raw.get('numFrames') not in (None, ''):
@@ -1079,6 +1105,10 @@ class TrainerService:
                 raise TrainerValidationError('Unsupported ChromaKey model')
         elif model_key not in EDIT_MODELS:
             raise TrainerValidationError('Unsupported edit model')
+        if preset == LAYERED_PRESET:
+            validate_layered_payload(payload, TrainerValidationError)
+        if model_key == QWEN21_KEY and preset not in ('standard_lora', LAYERED_PRESET):
+            raise TrainerValidationError('Qwen Image 2.1 uses Standard LoRA with optional native RGBA')
         if preset == 'qwen_rgba_vae' and model_key != 'qwen_image_edit_2511':
             raise TrainerValidationError('Qwen RGBA VAE training requires the Qwen model family')
         if preset == 'flux2_rgba_vae' and model_key not in {'flux2_klein_4b', 'flux2_klein_9b'}:
@@ -1096,10 +1126,17 @@ class TrainerService:
             if not isinstance(dataset, dict):
                 raise TrainerValidationError('Invalid dataset configuration')
             dataset_name = dataset.get('name')
-            inspection = self.inspect_dataset(dataset_name, media=model_key in H3_KEYS and preset == 'standard_lora')
+            inspection = self.inspect_dataset(dataset_name, media=model_key in H3_KEYS and preset == 'standard_lora', layered=preset == LAYERED_PRESET)
+            if preset == LAYERED_PRESET and not inspection['psdValid']:
+                raise TrainerValidationError(f"{dataset_name}: {'; '.join(inspection['psdErrors'])}")
             if model_key in H3_KEYS and not inspection['minimaxValid']:
                 raise TrainerValidationError(f'Dataset has no images or videos: {dataset_name}')
-            if preset == 'standard_lora' and model_key not in H3_KEYS and not inspection['valid']:
+            if model_key == QWEN21_KEY:
+                if not inspection['targetCount']:
+                    raise TrainerValidationError(f'Dataset has no target images: {dataset_name}')
+                if preset != LAYERED_PRESET and any(control['missing'] for control in inspection['controls']):
+                    raise TrainerValidationError(f'Every target needs matching reference images: {dataset_name}')
+            if preset == 'standard_lora' and model_key not in H3_KEYS | {QWEN21_KEY} and not inspection['valid']:
                 raise TrainerValidationError(f'Dataset is not ready for edit training: {dataset_name}')
             if model_key in H3_KEYS and preset != 'standard_lora' and inspection['videoCount']:
                 raise TrainerValidationError('H3 RGBA training requires PNG/WebP images with alpha, not video targets')
@@ -1367,6 +1404,8 @@ class TrainerService:
 
     def build_job_config(self, payload):
         payload = with_h3_defaults(payload, self.project_root)
+        if payload.get('model') == QWEN21_KEY:
+            payload = {**EDIT_MODELS[QWEN21_KEY]['defaults'], **payload}
         name, model_key, gpu_ids, inspections, preset = self.validate_payload(payload)
         if preset == CHROMAKEY_PRESET:
             return self._build_chromakey_config(
@@ -1396,7 +1435,8 @@ class TrainerService:
         if not model_path or len(model_path) > 1024 or '\x00' in model_path:
             raise TrainerValidationError('Model name or path is invalid')
         transparent = preset == 'transparent_lora'
-        model_arch = model['transparentArch'] if transparent else model['arch']
+        layered = preset == LAYERED_PRESET
+        model_arch = LAYERED_ARCH if layered else model['transparentArch'] if transparent else model['arch']
         vae_path = ''
         if transparent:
             submitted_vae_path = payload.get('vaePath')
@@ -1427,6 +1467,22 @@ class TrainerService:
             caption_ext = str(submitted.get('captionExtension', 'txt')).strip().lstrip('.')
             if caption_ext not in {'txt', 'json', 'caption'}:
                 raise TrainerValidationError('Unsupported caption extension')
+            batch_override = submitted.get('batchSizeOverride')
+            if isinstance(batch_override, str):
+                batch_override = batch_override.strip()
+            if batch_override is None or batch_override == '':
+                batch_override = None
+            else:
+                try:
+                    value = float(batch_override)
+                    if isinstance(batch_override, bool) or not value.is_integer() or not 1 <= value <= (1 if layered else 128):
+                        raise ValueError
+                    batch_override = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    raise TrainerValidationError(
+                        f'Batch size override for {inspection["name"]} must be an integer '
+                        f'from 1 to {1 if layered else 128}, or empty to use the global value'
+                    ) from None
             dataset_config = {
                 'folder_path': inspection['targetPath'],
                 'control_path': control_paths,
@@ -1441,6 +1497,8 @@ class TrainerService:
                 'flip_x': bool(submitted.get('flipX', False)),
                 'flip_y': bool(submitted.get('flipY', False)),
             }
+            if batch_override is not None:
+                dataset_config['batch_size_override'] = batch_override
             if transparent:
                 rgba_control_mode = str(submitted.get('rgbaControlMode', 'edit')).lower()
                 if model_key == 'minimax_h3_ref2va' and payload.get('distillationMethod') == 'dopsd':
@@ -1492,10 +1550,13 @@ class TrainerService:
                     dataset_config['rgba_control_background_path'] = background_inspection['targetPath']
                     dynamic_rgba_backgrounds = True
             dataset_configs.append(dataset_config)
+            if layered:
+                dataset_config.update(target_format='psd_layers', layer_slots=layer_slots(payload, TrainerValidationError), buckets=True)
             normalized_datasets.append({
                 **submitted,
                 'name': inspection['name'],
                 'resolutions': resolutions,
+                'batchSizeOverride': batch_override if batch_override is not None else '',
                 **({'rgbaControlMode': rgba_control_mode} if transparent else {}),
                 **({'rgbaBackgroundDataset': background_dataset_name} if transparent else {}),
             })
@@ -1537,6 +1598,11 @@ class TrainerService:
             dataset_configs=dataset_configs,
         )
         model_kwargs = {'match_target_res': bool(payload.get('matchTargetResolution', False))}
+        native_rgba = layered or (model_key == QWEN21_KEY and bool(payload.get('nativeRgba', False)))
+        if model_key == QWEN21_KEY:
+            model_kwargs['rgba'] = native_rgba
+        if layered:
+            model_kwargs['layer_slots'] = layer_slots(payload, TrainerValidationError)
         if transparent:
             model_kwargs.update({
                 'rgba_lora_loss_alpha': clamp_number(
@@ -1666,7 +1732,7 @@ class TrainerService:
                     },
                     'sample': {
                         'sampler': sampler,
-                        **({'format': 'png'} if transparent else {}),
+                        **({'format': 'png'} if transparent or native_rgba else {}),
                         'sample_every': clamp_number(payload.get('sampleEvery'), 1, steps, save_every, integer=True),
                         'sample_start_step': clamp_number(payload.get('sampleStartStep'), 0, steps, 0, integer=True),
                         'width': clamp_number(payload.get('sampleWidth'), 64, 4096, 1024, integer=True),
@@ -1769,6 +1835,22 @@ class TrainerService:
             config['config']['process'][0] = advanced_process
         if model_key in H3_KEYS:
             validate_h3_process(config['config']['process'][0], TrainerValidationError)
+        if model_key == QWEN21_KEY:
+            process = config['config']['process'][0]
+            process['train']['unload_text_encoder'] = False
+            process['model'].setdefault('model_kwargs', {})['rgba'] = native_rgba
+            if native_rgba:
+                process['sample']['format'] = 'png'
+            config['meta']['qdm']['upstreamCommit'] = QWEN21_SOURCE_COMMIT
+        if layered:
+            config['config']['process'][0]['model']['model_kwargs']['timestep_embedding'] = 'fp32'
+            config['meta']['qdm']['layerFormat'] = {
+                'version': 1, 'layerSlots': layer_slots(payload, TrainerValidationError),
+                'order': 'bottom_to_top', 'padding': 'transparent_top',
+                'attention': 'joint_bidirectional_targets',
+                'timestepEmbedding': 'fp32',
+            }
+            normalized_form.update(nativeRgba=True, layerSlots=layer_slots(payload, TrainerValidationError))
         return name, gpu_ids, config, inspections
 
     def create_job(self, payload):
@@ -1795,6 +1877,15 @@ class TrainerService:
         if existing['status'] in ACTIVE_STATUSES:
             raise TrainerValidationError('Stop the job before editing it')
         name, gpu_ids, config, inspections = self.build_job_config(payload)
+        previous = json.loads(existing['job_config'])
+        previous_qdm = previous.get('meta', {}).get('qdm', {})
+        if (previous_qdm.get('trainingPreset') == LAYERED_PRESET and
+                config['meta']['qdm'].get('trainingPreset') == LAYERED_PRESET):
+            # Editing a saved run must not silently change its timestep semantics.
+            previous_kwargs = previous['config']['process'][0]['model'].get('model_kwargs', {})
+            mode = previous_kwargs.get('timestep_embedding', 'legacy_bf16')
+            config['config']['process'][0]['model']['model_kwargs']['timestep_embedding'] = mode
+            config['meta']['qdm']['layerFormat']['timestepEmbedding'] = mode
         with self._db_lock, self.connect() as connection:
             try:
                 connection.execute(
@@ -1977,6 +2068,8 @@ class TrainerService:
                 item['defaultRgbaVaePath'] = str(self.project_root / 'models' / 'vae' / 'minimax_h3_rgba_vae.safetensors')
                 item['defaults'] = local_h3_defaults(key, self.project_root)
                 item['defaultSourceVaePath'] = str(self.project_root / 'models' / 'vae' / 'minimax_h3_video_vae_fp16.safetensors')
+            if key == QWEN21_KEY:
+                item['defaultRgbaVaePath'] = ''
             models.append(item)
         models.append({
             'key': CHROMAKEY_MODEL_KEY,
@@ -2022,7 +2115,7 @@ class TrainerService:
         qdm_meta = config.get('meta', {}).get('qdm', {})
         preset = qdm_meta.get('trainingPreset', 'standard_lora')
         for item in qdm_meta.get('datasets', []):
-            inspection = self.inspect_dataset(item['name'])
+            inspection = self.inspect_dataset(item['name'], layered=preset == LAYERED_PRESET)
             ready = inspection['valid']
             if qdm_meta.get('modelKey') in H3_KEYS and preset == 'standard_lora':
                 ready = inspection['minimaxValid']
@@ -2032,7 +2125,13 @@ class TrainerService:
                 ready = inspection['vaeValid']
             elif preset == CHROMAKEY_PRESET:
                 ready = inspection['chromakeyValid']
+            elif preset == LAYERED_PRESET:
+                ready = inspection['psdValid']
             if not ready:
+                if preset == LAYERED_PRESET:
+                    raise TrainerValidationError(
+                        f"Dataset is not ready: {item['name']}: {'; '.join(inspection['psdErrors'])}"
+                    )
                 raise TrainerValidationError(f"Dataset is not ready: {item['name']}")
             if preset == 'transparent_lora' and item.get('rgbaControlMode', 'edit') == 'edit':
                 background_name = item.get('rgbaBackgroundDataset')
@@ -2311,6 +2410,7 @@ class TrainerService:
             else:
                 seed = sample_config.get('seed')
             info.update({
+                'psdFile': path.with_suffix('.psd').name if is_layered_job(row) and path.with_suffix('.psd').is_file() else None,
                 'prompt': str(item.get('prompt', '')),
                 'seed': seed,
                 'controlCount': len(self._sample_controls(item)),
@@ -2332,7 +2432,8 @@ class TrainerService:
             raise TrainerValidationError('Invalid sample filename')
         candidate = (samples_dir / filename).resolve()
         is_audio_sidecar = candidate.suffix.lower() == '.wav' and candidate.with_suffix('.png').is_file()
-        if samples_dir not in candidate.parents or (candidate.suffix.lower() not in MEDIA_EXTENSIONS and not is_audio_sidecar):
+        is_psd_sidecar = candidate.suffix.lower() == '.psd' and candidate.with_suffix('.png').is_file() and is_layered_job(_row)
+        if samples_dir not in candidate.parents or (candidate.suffix.lower() not in MEDIA_EXTENSIONS and not is_audio_sidecar and not is_psd_sidecar):
             raise TrainerValidationError('Unsupported sample image')
         if not candidate.is_file():
             raise FileNotFoundError('Validation image not found')
@@ -2366,6 +2467,8 @@ class TrainerService:
         path = self.resolve_job_sample(job_id, filename)
         samples_dir = path.parent
         path.unlink()
+        if path.suffix.lower() == '.png' and is_layered_job(self._get_job_row(job_id)):
+            path.with_suffix('.psd').unlink(missing_ok=True)
         if path.suffix.lower() == '.png':
             audio = path.with_suffix('.wav')
             if audio.is_file():
@@ -2395,6 +2498,9 @@ class TrainerService:
             with zipfile.ZipFile(temporary_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                 for path in files:
                     archive.write(path, arcname=f'samples/{path.name}')
+                    psd = path.with_suffix('.psd')
+                    if is_layered_job(row) and psd.is_file():
+                        archive.write(psd, arcname=f'samples/{psd.name}')
                     audio = path.with_suffix('.wav')
                     if path.suffix.lower() == '.png' and audio.is_file():
                         archive.write(audio, arcname=f'samples/{audio.name}')
@@ -2460,8 +2566,10 @@ def create_trainer_blueprint(service: TrainerService):
         try:
             payload = request.get_json() or {}
             is_h3 = payload.get('model') in H3_KEYS
-            inspections = [service.inspect_dataset(name, media=is_h3 and payload.get('trainingPreset', 'standard_lora') == 'standard_lora') for name in payload.get('datasets', [])]
             preset = payload.get('trainingPreset', 'standard_lora')
+            inspections = [service.inspect_dataset(
+                name, media=is_h3 and preset == 'standard_lora', layered=preset == LAYERED_PRESET
+            ) for name in payload.get('datasets', [])]
             validity_key = {
                 'standard_lora': 'valid',
                 'transparent_lora': 'transparentValid',
@@ -2469,6 +2577,7 @@ def create_trainer_blueprint(service: TrainerService):
                 'flux2_rgba_vae': 'vaeValid',
                 'h3_rgba_vae': 'vaeValid',
                 CHROMAKEY_PRESET: 'chromakeyValid',
+                LAYERED_PRESET: 'psdValid',
             }.get(preset, 'valid')
             if is_h3 and preset == 'standard_lora':
                 validity_key = 'minimaxValid'

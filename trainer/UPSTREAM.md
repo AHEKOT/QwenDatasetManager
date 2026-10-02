@@ -14,6 +14,9 @@ Upstream is MIT licensed. Its original `LICENSE` is preserved in
 - `jobs/` with the extension job entry point;
 - `extensions_built_in/sd_trainer/`;
 - Qwen Image Edit Plus model adapter;
+- Qwen Image 2.1 model, transformer, Qwen3-VL adapter and native RGBA VAE,
+  ported from `D:\AiToolkitNew\AI-Toolkit` at
+  `ecee894ed2b1f3716d9d7326693061ec1a3105bb`. See [QWEN21.md](QWEN21.md).
 - FLUX.2 Klein 4B and 9B model adapters.
 - MiniMax H3 / Ref2VA and their complete dependencies, ported from the local
   `D:\AiToolkitNew\AI-Toolkit` checkout at
@@ -37,7 +40,7 @@ adapters are not part of this trainer integration.
 
 ## Local integration changes
 
-- the model registry exposes Qwen Image Edit Plus, FLUX.2 Klein, and H3/Ref2VA;
+- the model registry exposes Qwen Image Edit Plus, Qwen Image 2.1, FLUX.2 Klein, and H3/Ref2VA;
 - built-in legacy model imports were removed from `toolkit/util/get_model.py`;
 - `jobs/__init__.py` imports only `BaseJob` and `ExtensionJob`.
 - `extensions/rgba_training/` adds opt-in transparent LoRA architectures and a
