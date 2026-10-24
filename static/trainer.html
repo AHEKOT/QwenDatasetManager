@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qwen Dataset Manager — Trainer</title>
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="stylesheet" href="/static/trainer.css?v=21">
+    <link rel="stylesheet" href="/static/trainer.css?v=22">
 </head>
 
 <body class="trainer-page" data-independent-validation-uploads="<!--TRAINER_VALIDATION_UPLOADS-->">
@@ -121,6 +121,10 @@
                                     <div class="trainer-toggle-row trainer-lora-only">
                                         <label class="trainer-switch"><input id="trainer-low-vram" type="checkbox" checked><span></span>Low VRAM</label>
                                         <label class="trainer-switch"><input id="trainer-match-resolution" type="checkbox"><span></span>Match target resolution</label>
+                                    </div>
+                                    <div id="trainer-qi2-alignment-wrap" class="hidden">
+                                        <label class="trainer-switch"><input id="trainer-qi2-align-references" type="checkbox" checked><span></span>Align reference dimensions (padding)</label>
+                                        <p class="trainer-help">QI2: fit Controls to the target bucket dimensions without cropping or stretching. Different aspect ratios receive white borders for RGB or transparent borders for RGBA.</p>
                                     </div>
                                 </div>
                             </section>

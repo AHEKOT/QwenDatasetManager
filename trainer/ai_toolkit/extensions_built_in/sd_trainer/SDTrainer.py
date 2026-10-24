@@ -1373,6 +1373,9 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
                         prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
                         prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
+                    elif self.sd.encode_control_in_text_embeddings and batch.control_tensor_list is not None:
+                        prompt_kwargs['control_images'] = batch.control_tensor_list
+                        prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
                     embeds_to_use = self.sd.encode_prompt(
                         prompt_list,
                         long_prompts=self.do_long_prompts,
@@ -1761,6 +1764,9 @@ class SDTrainer(BaseSDTrainProcess):
                     prompt_kwargs = {}
                     if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
                         prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
+                    elif self.sd.encode_control_in_text_embeddings and batch.control_tensor_list is not None:
+                        prompt_kwargs['control_images'] = batch.control_tensor_list
                         prompt_kwargs['target_size'] = self.get_batch_target_size(batch)
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):

@@ -55,11 +55,13 @@ def calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
 
 
 def prepare_condition_image(
-    image: torch.Tensor, max_pixels: int, match: bool = False
+    image: torch.Tensor, max_pixels: int, match: bool = False,
+    target_size: Optional[tuple[int, int]] = None,
 ) -> torch.Tensor:
     """Put one `(1, C, H, W)` condition image on the 32 px grid, shrinking it
     first if it is over the pixel budget. With `match`, scale it to the budget's
     area in both directions (own aspect kept) instead of only shrinking.
+    With target_size, contain and center-pad onto that exact grid-aligned canvas.
 
     Deterministic in the image and budget alone, on purpose: the Qwen3-VL pass
     and the VAE pass happen in different calls (`get_prompt_embeds` and
@@ -67,6 +69,24 @@ def prepare_condition_image(
     count and the latent-token count disagree and the sequence is rejected.
     """
     height, width = image.shape[2], image.shape[3]
+    if target_size is not None:
+        # Match the target canvas exactly. Only the canvas changes aspect ratio;
+        # the image is contained, centered, and never cropped or stretched.
+        target_width, target_height = (
+            max(VISION_TOKEN_PIXELS, int(size) // VISION_TOKEN_PIXELS * VISION_TOKEN_PIXELS)
+            for size in target_size
+        )
+        scale = min(target_width / width, target_height / height)
+        new_width = max(1, min(target_width, round(width * scale)))
+        new_height = max(1, min(target_height, round(height * scale)))
+        if (new_height, new_width) != (height, width):
+            image = F.interpolate(image.float(), size=(new_height, new_width),
+                                  mode="bicubic", antialias=True).clamp(0, 1)
+        left = (target_width - new_width) // 2
+        top = (target_height - new_height) // 2
+        return F.pad(image, (left, target_width - new_width - left,
+                             top, target_height - new_height - top),
+                     value=0.0 if image.shape[1] == 4 else 1.0)
     if match or height * width > max_pixels:
         new_width, new_height = calculate_dimensions(max_pixels, width / height)
     else:
@@ -154,6 +174,10 @@ class QwenImage21PromptEncoder:
         }
         if flat_images:
             processor_kwargs["images"] = flat_images
+            # The reference canvas already matches the VAE's 32 px grid.
+            # Qwen3-VL's default smart_resize also enforces min/max pixels:
+            # e.g. 448x128 becomes 480x160, producing 75 slots instead of 56.
+            processor_kwargs["do_resize"] = False
         model_inputs = self.processor(**processor_kwargs).to(device)
 
         forward_kwargs = {

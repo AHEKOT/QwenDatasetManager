@@ -1138,6 +1138,9 @@ class ControlFileItemDTOMixin:
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
         sd = kwargs.get('sd', None)
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
+        # Some models prepare references after collation; retain even a single
+        # reference as a list so different source sizes are not concatenated.
+        self.control_images_as_list = bool(getattr(sd, 'control_images_as_list', False))
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.full_size_control_images = False
         if dataset_config.control_path is not None:
@@ -1320,7 +1323,7 @@ class ControlFileItemDTOMixin:
             
         if len(control_tensors) == 0:
             self.control_tensor = None
-        elif len(control_tensors) == 1:
+        elif len(control_tensors) == 1 and not self.control_images_as_list:
             self.control_tensor = control_tensors[0]
         elif self.use_raw_control_images:
             # just send the list of tensors as their shapes wont match

@@ -985,6 +985,7 @@
             <div class="pt-tabs" role="tablist" aria-label="Process Text mode">
                 <button class="pt-tab-btn active" type="button" role="tab" aria-selected="true" data-pt-tab="rules">Rules</button>
                 <button class="pt-tab-btn" type="button" role="tab" aria-selected="false" data-pt-tab="auto-caption">Auto Caption</button>
+                <button class="pt-tab-btn" type="button" role="tab" aria-selected="false" data-pt-tab="postprocess">Post-processing</button>
             </div>
 
             <div class="pt-body pt-tab-panel active" data-pt-panel="rules">
@@ -1111,6 +1112,54 @@
                 </div>
             </div>
 
+            <div class="pt-body pt-tab-panel" data-pt-panel="postprocess">
+                <div class="pt-config">
+                    <section class="pt-section">
+                        <h3>Prefix &amp; Suffix</h3>
+                        <p class="pt-hint">Add text to every existing caption in the selected dataset. Spaces, commas and line breaks are added exactly as entered.</p>
+                        <label class="ac-field" for="pp-prefix">
+                            <span>Prefix</span>
+                            <textarea id="pp-prefix" class="pt-textarea ac-wrapper-area" spellcheck="false" maxlength="10000" placeholder="character_name, "></textarea>
+                        </label>
+                        <label class="ac-field" for="pp-suffix">
+                            <span>Suffix</span>
+                            <textarea id="pp-suffix" class="pt-textarea ac-wrapper-area" spellcheck="false" maxlength="10000" placeholder=", high quality"></textarea>
+                        </label>
+                    </section>
+                    <section class="pt-section">
+                        <h3>Find &amp; Replace</h3>
+                        <p class="pt-hint">Replace every exact, case-sensitive occurrence in each caption. Leave <code>Replace with</code> empty to delete the matching text.</p>
+                        <label class="ac-field" for="pp-find">
+                            <span>Find</span>
+                            <textarea id="pp-find" class="pt-textarea ac-wrapper-area" spellcheck="false" maxlength="10000" placeholder="Text to replace"></textarea>
+                        </label>
+                        <label class="ac-field" for="pp-replace">
+                            <span>Replace with</span>
+                            <textarea id="pp-replace" class="pt-textarea ac-wrapper-area" spellcheck="false" maxlength="10000" placeholder="New text (optional)"></textarea>
+                        </label>
+                    </section>
+                    <section class="pt-section">
+                        <h3>Processing Order</h3>
+                        <p class="pt-hint">Find &amp; replace → add prefix → add suffix. Use any operation on its own or combine them.</p>
+                        <p class="pt-hint">Apply to All updates every existing caption file in <code>img/</code>, including empty captions. A backup is created before saving.</p>
+                    </section>
+                </div>
+                <div class="pt-preview-panel">
+                    <div class="pt-preview-header">
+                        <h3>Preview <span id="pp-preview-count" class="pt-preview-count"></span></h3>
+                        <button id="pp-refresh-btn" class="pt-icon-btn" type="button" title="Refresh post-processing preview" aria-label="Refresh post-processing preview">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M23 4v6h-6M1 20v-6h6"></path>
+                                <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div id="pp-preview-list" class="pt-preview-list">
+                        <div class="pt-preview-empty">Enter a prefix, suffix, or text to replace to preview changes.</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Footer -->
             <div class="pt-footer">
                 <div class="pt-footer-left pt-footer-group" data-pt-footer="rules">
@@ -1132,6 +1181,13 @@
                     <button id="ac-apply-btn" class="pt-btn pt-btn-primary">Replace All</button>
                     <button id="ac-stop-btn" class="pt-btn pt-btn-stop hidden">Stop</button>
                 </div>
+                <div class="pt-footer-left pt-footer-group pp-footer-status hidden" data-pt-footer="postprocess">
+                    <span id="pp-status" class="pt-hint" role="status" aria-live="polite">Applies to all caption files in the selected dataset.</span>
+                </div>
+                <div class="pt-footer-right pt-footer-group hidden" data-pt-footer="postprocess">
+                    <button id="pp-preview-btn" class="pt-btn pt-btn-secondary" type="button" disabled>Preview</button>
+                    <button id="pp-apply-btn" class="pt-btn pt-btn-primary" type="button" disabled>Apply to All</button>
+                </div>
             </div>
 
         </div>
@@ -1139,7 +1195,7 @@
 
     <script src="/static/ui-dialog.js?v=1"></script>
     <script src="/static/editor.js?v=2"></script>
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=7"></script>
 </body>
 
 </html>

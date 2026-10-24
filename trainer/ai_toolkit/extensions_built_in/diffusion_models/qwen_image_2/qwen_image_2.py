@@ -132,10 +132,10 @@ class QwenImage2Model(BaseModel):
         # embeddings as vision tokens and their latents into the sequence.
         self.encode_control_in_text_embeddings = True
         self.has_multiple_control_images = True
-        # References keep their own size/aspect; prepare_condition_image budgets them
-        # identically in the cache and training paths so slot counts always agree.
-        # Batch > 1 requires same-size references (checked in encode_condition_images).
+        # Preparation handles source sizes after collation, identically for TE
+        # and VAE. Optional canvas padding aligns all references in a batch.
         self.use_raw_control_images = True
+        self.control_images_as_list = True
 
     @staticmethod
     def get_train_scheduler():
@@ -308,14 +308,23 @@ class QwenImage2Model(BaseModel):
         return bool(self.model_config.model_kwargs.get("match_target_res", True))
 
     @property
+    def align_reference_dimensions(self) -> bool:
+        """Fit references onto the target canvas with centered border padding."""
+        return bool(self.model_config.model_kwargs.get("align_reference_dimensions", False))
+
+    @property
     def text_embedding_uses_target_size(self) -> bool:
         # the dataloader adds the item's bucket size to the text-embedding cache key
-        return self.match_target_res
+        return self.match_target_res or self.align_reference_dimensions
 
     def get_text_embedding_space_version(self) -> str:
         # reference sizing changes the vision tokens; keep caches from different rules apart
         rule = "match" if self.match_target_res else f"cap{self.control_image_max_pixels}"
-        return f"{self.text_embedding_space_version}_ref{rule}"
+        if self.align_reference_dimensions:
+            rule += "_canvas_v1"
+        # Older embeddings allowed Qwen3-VL to resize references again, so
+        # their image slots may differ from the VAE even for the same canvas.
+        return f"{self.text_embedding_space_version}_ref{rule}_vision_grid_v2"
 
     def _target_pixels(self, target_size) -> Optional[int]:
         """`(width, height)` -> pixel area on the 32 px grid, or None. Floors the
@@ -355,9 +364,13 @@ class QwenImage2Model(BaseModel):
         self,
         control_images: List[List[torch.Tensor]],
         target_pixels: Optional[int] = None,
+        target_size=None,
     ) -> List[List[torch.Tensor]]:
         """Put every reference on the 32 px grid, as `(1, C, H, W)` in [0, 1].
-        With match_target_res and a known target, scale each to the target's area."""
+        With canvas alignment, fit/pad to the target size; otherwise match its
+        area when match_target_res is enabled."""
+        if target_pixels is None:
+            target_pixels = self._target_pixels(target_size)
         match = self.match_target_res and target_pixels is not None
         budget = target_pixels if match else self.control_image_max_pixels
         prepared = []
@@ -368,7 +381,8 @@ class QwenImage2Model(BaseModel):
                     image = image.unsqueeze(0)
                 images.append(
                     prepare_condition_image(
-                        image.to(self.device_torch), budget, match=match
+                        image.to(self.device_torch), budget, match=match,
+                        target_size=target_size if self.align_reference_dimensions else None,
                     )
                 )
             prepared.append(images)
@@ -402,8 +416,9 @@ class QwenImage2Model(BaseModel):
         if len(lengths) > 1:
             raise ValueError(
                 "every sample in a batch must contribute the same reference image "
-                f"token count, got {sorted(lengths)}. The dataloader bucket-resizes "
-                "reference images, so this means the samples disagree on how many."
+                f"token count, got {sorted(lengths)}. Enable reference dimension "
+                "alignment (padding) and use the same number of references per "
+                "sample, or set the dataset batch size override to 1."
             )
         return torch.cat(sample_latents, dim=0), shapes
 
@@ -423,6 +438,7 @@ class QwenImage2Model(BaseModel):
             samples = self._prepare_control_images(
                 self._normalize_control_images(control_images, len(prompt)),
                 target_pixels=self._target_pixels(target_size),
+                target_size=target_size,
             )
             images = [[tensor_to_pil(image) for image in sample] for sample in samples]
 
@@ -482,13 +498,13 @@ class QwenImage2Model(BaseModel):
                 if control is None:
                     control = batch.control_tensor
                 # same area the dataloader cached the prompt against (bucket crop)
-                target_pixels = self._target_pixels((
+                target_size = (
                     latent_model_input.shape[3] * VAE_SCALE_FACTOR,
                     latent_model_input.shape[2] // self.target_layer_count * VAE_SCALE_FACTOR,
-                ))
+                )
                 samples = self._prepare_control_images(
                     self._normalize_control_images(control, batch_size),
-                    target_pixels=target_pixels,
+                    target_size=target_size,
                 )
                 condition_latents, condition_shapes = self.encode_condition_images(
                     samples
@@ -588,6 +604,7 @@ class QwenImage2Model(BaseModel):
             condition_images = self._prepare_control_images(
                 self._normalize_control_images([tensors], 1),
                 target_pixels=self._target_pixels((gen_config.width, gen_config.height)),
+                target_size=(gen_config.width, gen_config.height),
             )
 
         return pipeline(

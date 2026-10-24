@@ -337,6 +337,138 @@ class DatasetManagerApiTests(unittest.TestCase):
         backup = dataset / body['backup'] / 'one.txt'
         self.assertEqual(backup.read_text(encoding='utf-8'), 'masterpiece, blue hair')
 
+    def test_postprocess_preview_and_apply_preserve_literal_text(self):
+        dataset = self.root / 'demo'
+        original = '  old.* old.*\r\nСтарый текст  \n'
+        caption = dataset / 'img' / 'one.txt'
+        caption.write_bytes(original.encode('utf-8'))
+        empty = dataset / 'img' / 'empty.TXT'
+        empty.write_bytes(b'')
+        (dataset / 'img' / 'directory.txt').mkdir()
+        control_caption = dataset / 'Control1' / 'one.txt'
+        control_caption.write_text('old.*', encoding='utf-8')
+        image = dataset / 'img' / 'missing.png'
+        self.save_image(image)
+        image_bytes_before = image.read_bytes()
+        config = {'prefix': 'old.*: ', 'suffix': '\n suffix ', 'find': 'old.*', 'replace': 'new $1'}
+        expected = config['prefix'] + original.replace('old.*', 'new $1') + config['suffix']
+
+        preview = self.client.post('/api/process-text/postprocess/preview', json={
+            'folder': 'demo', 'config': config, 'count': 50
+        })
+        self.assertEqual(preview.status_code, 200)
+        body = preview.get_json()
+        self.assertEqual(body['total'], 2)
+        self.assertEqual(body['changed'], 2)
+        sample = next(item for item in body['results'] if item['filename'] == 'one.txt')
+        self.assertEqual(sample['original'], original)
+        self.assertEqual(sample['processed'], expected)
+        self.assertEqual(caption.read_bytes(), original.encode('utf-8'))
+        self.assertFalse((dataset / '.postprocess-backup').exists())
+
+        applied = self.client.post('/api/process-text/postprocess/apply', json={
+            'folder': 'demo', 'config': config
+        })
+        self.assertEqual(applied.status_code, 200)
+        body = applied.get_json()
+        self.assertTrue(body['success'])
+        self.assertEqual(body['processed'], 2)
+        self.assertEqual(caption.read_bytes(), expected.encode('utf-8'))
+        self.assertEqual(empty.read_bytes(), (config['prefix'] + config['suffix']).encode('utf-8'))
+        self.assertEqual((dataset / body['backup'] / 'one.txt').read_bytes(), original.encode('utf-8'))
+        self.assertEqual((dataset / body['backup'] / 'empty.TXT').read_bytes(), b'')
+        self.assertEqual(control_caption.read_text(encoding='utf-8'), 'old.*')
+        self.assertFalse(image.with_suffix('.txt').exists())
+        self.assertEqual(image.read_bytes(), image_bytes_before)
+
+    def test_postprocess_operations_work_independently(self):
+        caption = self.root / 'demo' / 'img' / 'one.txt'
+        for config, expected in (
+            ({'prefix': 'tag, '}, 'tag, old OLD old'),
+            ({'suffix': ', end'}, 'old OLD old, end'),
+            ({'find': 'old', 'replace': 'new'}, 'new OLD new'),
+            ({'find': 'old', 'replace': ''}, ' OLD '),
+        ):
+            with self.subTest(config=config):
+                caption.write_bytes(b'old OLD old')
+                response = self.client.post('/api/process-text/postprocess/apply', json={
+                    'folder': 'demo', 'config': config
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()['processed'], 1)
+                self.assertEqual(caption.read_text(encoding='utf-8'), expected)
+
+    def test_postprocess_samples_changed_captions_and_skips_unchanged_writes(self):
+        dataset = self.root / 'demo'
+        unchanged = dataset / 'img' / 'a.txt'
+        changed = dataset / 'img' / 'z.txt'
+        unchanged.write_bytes(b'keep\r\n')
+        changed.write_text('old old', encoding='utf-8')
+        payload = {'folder': 'demo', 'config': {'find': 'old', 'replace': 'new'}, 'count': 1}
+        preview = self.client.post('/api/process-text/postprocess/preview', json=payload).get_json()
+        self.assertEqual(preview['changed'], 1)
+        self.assertEqual(preview['total'], 2)
+        self.assertEqual(preview['results'][0]['filename'], 'z.txt')
+        with patch.object(manager, 'atomic_write_text', wraps=manager.atomic_write_text) as write:
+            response = self.client.post('/api/process-text/postprocess/apply', json=payload)
+        self.assertEqual(response.get_json()['processed'], 1)
+        self.assertEqual(write.call_count, 1)
+        self.assertEqual(write.call_args.args[0], changed)
+        self.assertEqual(unchanged.read_bytes(), b'keep\r\n')
+
+    def test_postprocess_validation_and_empty_dataset(self):
+        for endpoint in ('preview', 'apply'):
+            url = f'/api/process-text/postprocess/{endpoint}'
+            for config in ({}, [], {'prefix': 3}, {'replace': 'new'}, {'find': None}, {'suffix': 'x' * 10001}):
+                with self.subTest(endpoint=endpoint, config=repr(config)[:80]):
+                    response = self.client.post(url, json={'folder': 'demo', 'config': config})
+                    self.assertEqual(response.status_code, 400)
+            for folder, status in (('../outside', 400), ('missing', 404), ('', 400)):
+                response = self.client.post(url, json={'folder': folder, 'config': {'prefix': 'tag'}})
+                self.assertEqual(response.status_code, status)
+            response = self.client.post(url, json={'folder': 'demo', 'config': {'prefix': 'tag'}})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()['total'], 0)
+            self.assertEqual(response.get_json()['results'], [])
+            self.assertIsNone(response.get_json()['backup'])
+
+    def test_postprocess_backup_failure_leaves_all_captions_unchanged(self):
+        dataset = self.root / 'demo'
+        for name in ('a.txt', 'b.txt'):
+            (dataset / 'img' / name).write_bytes(b'original')
+        with patch.object(manager.shutil, 'copy2', side_effect=OSError('disk full')):
+            response = self.client.post('/api/process-text/postprocess/apply', json={
+                'folder': 'demo', 'config': {'prefix': 'tag, '}
+            })
+        self.assertEqual(response.status_code, 500)
+        self.assertIn('Backup failed', response.get_json()['error'])
+        for name in ('a.txt', 'b.txt'):
+            self.assertEqual((dataset / 'img' / name).read_bytes(), b'original')
+
+    def test_postprocess_reports_file_errors_and_retains_backups(self):
+        dataset = self.root / 'demo'
+        (dataset / 'img' / 'bad.txt').write_bytes(b'\xff')
+        (dataset / 'img' / 'good.txt').write_bytes(b'caption')
+        response = self.client.post('/api/process-text/postprocess/apply', json={
+            'folder': 'demo', 'config': {'suffix': ', end'}
+        })
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(body['success'])
+        self.assertEqual(body['processed'], 1)
+        self.assertEqual(body['errors'][0]['file'], 'bad.txt')
+        self.assertEqual((dataset / 'img' / 'good.txt').read_bytes(), b'caption, end')
+        self.assertEqual((dataset / 'img' / 'bad.txt').read_bytes(), b'\xff')
+        self.assertEqual((dataset / body['backup'] / 'good.txt').read_bytes(), b'caption')
+        self.assertEqual((dataset / body['backup'] / 'bad.txt').read_bytes(), b'\xff')
+
+    def test_postprocess_respects_dataset_claims(self):
+        self.assertEqual(manager.claim_datasets(['demo'], 'other-job'), [])
+        response = self.client.post('/api/process-text/postprocess/apply', json={
+            'folder': 'demo', 'config': {'prefix': 'tag, '}
+        })
+        self.assertEqual(response.status_code, 409)
+
     def test_stitch_as_is_control_reencodes_to_real_png(self):
         dataset = self.root / 'demo'
         for stem, color in (('one', (255, 0, 0)), ('two', (0, 255, 0))):

@@ -207,6 +207,18 @@ backed up under `.auto-caption-backup/` before a completed replacement batch is
 written. A running batch can be stopped after its current image; captions that
 already completed are still saved.
 
+## Caption Post-processing
+
+Open **Process Text → Post-processing** to add a literal prefix or suffix, or
+find and replace text across every existing caption in the selected dataset.
+Replacement is case-sensitive and replaces all exact occurrences; an empty
+replacement deletes the matching text. Replacements run before the prefix and
+suffix are added. Include any needed spaces, commas or line breaks in the fields.
+
+Preview shows before/after samples and the total number of captions that will
+change. **Apply to All** backs up the original files under `.postprocess-backup/`
+before saving. Empty caption files are included; missing captions are not created.
+
 ## Keyboard Shortcuts
 
 | Key | Action |

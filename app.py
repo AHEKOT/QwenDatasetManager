@@ -216,10 +216,10 @@ def prune_finished_jobs(jobs):
         jobs.pop(job['jobId'], None)
 
 
-def atomic_write_text(path, content):
+def atomic_write_text(path, content, *, newline=None):
     temp_path = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
     try:
-        with open(temp_path, 'w', encoding='utf-8') as handle:
+        with open(temp_path, 'w', encoding='utf-8', newline=newline) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -3673,6 +3673,112 @@ def process_text_apply():
         'processed': processed_count,
         'errors': errors,
         'backup': str(backup_dir.relative_to(dataset_dir))
+    })
+
+
+# ─── Caption Post-processing ─────────────────────────────────────────────────
+
+def validate_postprocess_config(config):
+    if not isinstance(config, dict):
+        raise ValueError('Post-processing config must be an object')
+    normalized = {}
+    for field in ('prefix', 'suffix', 'find', 'replace'):
+        value = config.get(field, '')
+        if not isinstance(value, str) or len(value) > 10000:
+            raise ValueError(f'{field} must be a string of at most 10000 characters')
+        normalized[field] = value
+    if normalized['replace'] and not normalized['find']:
+        raise ValueError('Enter text to find before specifying a replacement')
+    if not any(normalized[field] for field in ('prefix', 'suffix', 'find')):
+        raise ValueError('Enter a prefix, suffix, or text to find')
+    return normalized
+
+
+def _apply_postprocess_config(caption_text, config):
+    if config['find']:
+        caption_text = caption_text.replace(config['find'], config['replace'])
+    return config['prefix'] + caption_text + config['suffix']
+
+
+def _postprocess_caption_files(dataset_dir):
+    img_dir = dataset_dir / 'img'
+    if not img_dir.is_dir():
+        raise FileNotFoundError('Dataset img folder not found')
+    if not _is_within(img_dir.resolve(), dataset_dir):
+        raise InvalidPathError('Caption folder escapes the dataset directory')
+    files = []
+    for path in sorted(img_dir.iterdir()):
+        if path.suffix.lower() != '.txt':
+            continue
+        if path.is_symlink() or not _is_within(path.resolve(), dataset_dir):
+            raise InvalidPathError('Caption symlinks are not allowed')
+        if path.is_file():
+            files.append(path)
+    return files
+
+
+@app.route('/api/process-text/postprocess/preview', methods=['POST'])
+@app.route('/api/process-text/postprocess/apply', methods=['POST'])
+def postprocess_text():
+    data = request.get_json() or {}
+    try:
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be an object')
+        if not data.get('folder'):
+            raise ValueError('folder required')
+        config = validate_postprocess_config(data.get('config', {}))
+        count = max(1, min(50, int(data.get('count', 5))))
+        dataset_dir = resolve_dataset_dir(data['folder'], must_exist=True)
+        txt_files = _postprocess_caption_files(dataset_dir)
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+
+    apply = request.path.endswith('/apply')
+    backup_dir = None
+    if apply and txt_files:
+        backup_root = dataset_dir / '.postprocess-backup'
+        if backup_root.is_symlink() or not _is_within(backup_root.resolve(), dataset_dir):
+            return jsonify({'error': 'Backup folder escapes the dataset directory'}), 400
+        backup_dir = backup_root / (
+            datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + f'-{uuid.uuid4().hex[:8]}'
+        )
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            for caption_path in txt_files:
+                shutil.copy2(caption_path, backup_dir / caption_path.name)
+        except OSError as exc:
+            return jsonify({'error': f'Backup failed; captions were not changed: {exc}'}), 500
+
+    changed = 0
+    errors = []
+    changed_samples = []
+    unchanged_samples = []
+    for path in txt_files:
+        try:
+            # Keep existing whitespace and line endings exactly as stored.
+            with path.open('r', encoding='utf-8', newline='') as handle:
+                original = handle.read()
+            processed = _apply_postprocess_config(original, config)
+            is_changed = processed != original
+            if apply and is_changed:
+                atomic_write_text(path, processed, newline='')
+            changed += int(is_changed)
+            samples = changed_samples if is_changed else unchanged_samples
+            if len(samples) < count:
+                samples.append({'filename': path.name, 'original': original, 'processed': processed})
+        except (OSError, UnicodeError) as exc:
+            errors.append({'file': path.name, 'error': str(exc)})
+
+    return jsonify({
+        'success': not errors,
+        'total': len(txt_files),
+        'changed': changed,
+        'processed': changed if apply else 0,
+        'results': (changed_samples + unchanged_samples)[:count],
+        'errors': errors,
+        'backup': str(backup_dir.relative_to(dataset_dir)) if backup_dir else None
     })
 
 

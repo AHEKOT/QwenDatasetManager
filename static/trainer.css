@@ -132,10 +132,13 @@
   height: calc(100vh - 72px);
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
+  /* Keep long job lists inside the viewport so both panels can scroll. */
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .trainer-jobs-panel {
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: rgba(18, 18, 26, 0.86);
@@ -252,6 +255,7 @@
 
 .trainer-workspace {
   min-width: 0;
+  min-height: 0;
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
@@ -508,7 +512,8 @@
 .trainer-dataset-metric strong, .trainer-dataset-metric span { display: block; }
 .trainer-dataset-metric strong { font: 600 11px var(--font-mono); }
 .trainer-dataset-metric span { margin-top: 2px; color: var(--text-muted); font-size: 9px; }
-.trainer-dataset-settings { display: grid; grid-template-columns: repeat(4, minmax(80px, 1fr)); gap: 7px; }
+.trainer-dataset-settings { min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.trainer-dataset-settings > .trainer-field { grid-template-rows: 1fr auto; }
 .trainer-dataset-caption { grid-column: span 3; }
 .trainer-rgba-settings { grid-column: 1 / -1; min-width: 0; display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.6fr); gap: 9px; padding: 10px; background: rgba(184, 169, 232, 0.055); border: 1px solid rgba(184, 169, 232, 0.17); border-radius: 8px; }
 .trainer-mode-toggle { min-height: 36px; display: grid; grid-template-columns: 1fr 1fr; padding: 3px; background: rgba(0, 0, 0, .2); border: 1px solid var(--border); border-radius: 8px; }

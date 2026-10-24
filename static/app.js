@@ -3377,6 +3377,23 @@ const ptTabButtons  = Array.from(ptModal.querySelectorAll('[data-pt-tab]'));
 const ptTabPanels   = Array.from(ptModal.querySelectorAll('[data-pt-panel]'));
 const ptFooterGroups = Array.from(ptModal.querySelectorAll('[data-pt-footer]'));
 
+const ppPrefix = document.getElementById('pp-prefix');
+const ppSuffix = document.getElementById('pp-suffix');
+const ppFind = document.getElementById('pp-find');
+const ppReplace = document.getElementById('pp-replace');
+const ppFields = [ppPrefix, ppSuffix, ppFind, ppReplace];
+const ppPreviewList = document.getElementById('pp-preview-list');
+const ppPreviewCount = document.getElementById('pp-preview-count');
+const ppPreviewBtn = document.getElementById('pp-preview-btn');
+const ppRefreshBtn = document.getElementById('pp-refresh-btn');
+const ppApplyBtn = document.getElementById('pp-apply-btn');
+const ppStatus = document.getElementById('pp-status');
+let ppInitializedFolder = '';
+let ppPreviewDebounce = null;
+let ppPreviewController = null;
+let ppPreviewSequence = 0;
+let ppBusy = false;
+
 const acSystemPrompt = document.getElementById('ac-system-prompt');
 const acModelSelect = document.getElementById('ac-model-select');
 const acQuantSelect = document.getElementById('ac-quant-select');
@@ -3420,6 +3437,7 @@ async function openProcessTextModal() {
         return;
     }
     ptModal.classList.add('active');
+    ppInitialize();
     await Promise.all([ptLoadConfig(), acInitialize()]);
     ptCloseBtn.focus();
 }
@@ -3438,6 +3456,7 @@ function ptSelectTab(tabName) {
     });
     ptTabPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.ptPanel === tabName));
     ptFooterGroups.forEach(group => group.classList.toggle('hidden', group.dataset.ptFooter !== tabName));
+    if (tabName === 'postprocess' && !ppBusy) ppRunPreview();
 }
 
 ptTabButtons.forEach(button => button.addEventListener('click', () => ptSelectTab(button.dataset.ptTab)));
@@ -3570,10 +3589,17 @@ async function ptRunPreview() {
             return;
         }
 
-        const countEl = ptModal.querySelector('.pt-preview-count');
+        const countEl = ptModal.querySelector('[data-pt-panel="rules"] .pt-preview-count');
         if (countEl) countEl.textContent = `(${data.results.length} samples)`;
 
-        ptPreviewList.innerHTML = data.results.map(r => `
+        ptRenderPreviewResults(ptPreviewList, data.results);
+    } catch (e) {
+        ptPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(e.message)}</div>`;
+    }
+}
+
+function ptRenderPreviewResults(list, results) {
+    list.innerHTML = results.map(r => `
             <div class="pt-preview-item">
                 <div class="pt-preview-filename">${escHtml(r.filename)}</div>
                 <div class="pt-preview-row">
@@ -3588,9 +3614,6 @@ async function ptRunPreview() {
                     </div>
                 </div>
             </div>`).join('');
-    } catch (e) {
-        ptPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(e.message)}</div>`;
-    }
 }
 
 ptRefreshBtn.addEventListener('click', ptRunPreview);
@@ -3652,6 +3675,136 @@ function ptShowStatus(msg, type = 'info') {
     bar.classList.add('visible');
     setTimeout(() => bar.classList.remove('visible'), 4000);
 }
+
+// ── Post-processing ──────────────────────────────────────────────────────────
+
+function ppGetConfig() {
+    return { prefix: ppPrefix.value, suffix: ppSuffix.value, find: ppFind.value, replace: ppReplace.value };
+}
+
+function ppConfigError(config) {
+    if (config.replace && !config.find) return 'Enter text to find before specifying a replacement.';
+    if (!config.prefix && !config.suffix && !config.find) return 'Enter a prefix, suffix, or text to replace to preview changes.';
+    return '';
+}
+
+function ppUpdateButtons() {
+    const disabled = ppBusy || Boolean(ppConfigError(ppGetConfig()));
+    [ppPreviewBtn, ppRefreshBtn, ppApplyBtn].forEach(button => { button.disabled = disabled; });
+    ppFields.forEach(field => { field.disabled = ppBusy; });
+    ppApplyBtn.textContent = ppBusy ? 'Applying…' : 'Apply to All';
+}
+
+function ppInitialize() {
+    if (ppInitializedFolder !== currentFolder) {
+        clearTimeout(ppPreviewDebounce);
+        ppPreviewController?.abort();
+        ppPreviewSequence++;
+        ppInitializedFolder = currentFolder;
+        ppFields.forEach(field => { field.value = ''; });
+        ppPreviewCount.textContent = '';
+        ppPreviewList.innerHTML = '<div class="pt-preview-empty">Enter a prefix, suffix, or text to replace to preview changes.</div>';
+        ppStatus.textContent = 'Applies to all caption files in the selected dataset.';
+    }
+    ppUpdateButtons();
+}
+
+function ppSchedulePreview() {
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    ppPreviewSequence++;
+    ppPreviewCount.textContent = '';
+    ppStatus.textContent = 'Applies to all caption files in the selected dataset.';
+    ppUpdateButtons();
+    ppPreviewDebounce = setTimeout(ppRunPreview, 600);
+}
+
+function ppRenderResults(data, applied = false) {
+    ppPreviewCount.textContent = `(${data.results.length} samples / ${data.total} captions)`;
+    if (data.results.length) {
+        ptRenderPreviewResults(ppPreviewList, data.results);
+    } else {
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty">${data.total ? 'No captions could be processed.' : 'No caption files found in this dataset.'}</div>`;
+    }
+    const errorCount = data.errors?.length || 0;
+    ppStatus.textContent = applied
+        ? `${data.processed} of ${data.total} captions updated.${data.backup ? ` Backup: ${data.backup}.` : ''}`
+        : `${data.changed} of ${data.total} captions will change.`;
+    if (errorCount) {
+        ppStatus.textContent += ` ${errorCount} error(s): ${data.errors.map(error => `${error.file}: ${error.error}`).join('; ')}`;
+    }
+}
+
+async function ppRunPreview() {
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    const sequence = ++ppPreviewSequence;
+    if (!currentFolder || ppBusy) return;
+    const folder = currentFolder;
+    const config = ppGetConfig();
+    const error = ppConfigError(config);
+    ppPreviewCount.textContent = '';
+    if (error) {
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty">${escHtml(error)}</div>`;
+        return;
+    }
+    const controller = new AbortController();
+    ppPreviewController = controller;
+    ppPreviewList.innerHTML = '<div class="pt-preview-empty pt-loading">Generating preview…</div>';
+    try {
+        const res = await fetch('/api/process-text/postprocess/preview', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+            body: JSON.stringify({ folder, config, count: 5 })
+        });
+        const data = await res.json();
+        if (sequence !== ppPreviewSequence || folder !== currentFolder) return;
+        if (!res.ok || data.error) throw new Error(data.error || 'Preview failed');
+        ppRenderResults(data);
+    } catch (error) {
+        if (error.name === 'AbortError' || sequence !== ppPreviewSequence || folder !== currentFolder) return;
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(error.message)}</div>`;
+    }
+}
+
+ppFields.forEach(field => field.addEventListener('input', ppSchedulePreview));
+ppPreviewBtn.addEventListener('click', ppRunPreview);
+ppRefreshBtn.addEventListener('click', ppRunPreview);
+
+ppApplyBtn.addEventListener('click', async () => {
+    if (!currentFolder || ppBusy || ppConfigError(ppGetConfig())) return;
+    const folder = currentFolder;
+    const config = ppGetConfig();
+    let confirmed = false;
+    ppBusy = true;
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    ppPreviewSequence++;
+    ppUpdateButtons();
+    try {
+        if (!await checkUnsavedCaption()) return;
+        const ok = await appDialog.confirm(
+            `Apply post-processing to ALL existing captions in "${folder}"?\n\nA backup will be created before saving. Applying again will add the prefix and suffix again.`,
+            { title: 'Post-process All Captions', tone: 'warning', confirmLabel: 'Apply to All' }
+        );
+        if (!ok || folder !== currentFolder) return;
+        confirmed = true;
+        const res = await fetch('/api/process-text/postprocess/apply', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder, config, count: 5 })
+        });
+        const data = await res.json();
+        if (folder !== currentFolder) return;
+        if (!res.ok || data.error) throw new Error(data.error || 'Apply failed');
+        ppRenderResults(data, true);
+        if (images[currentIndex]) loadCaption(images[currentIndex]);
+    } catch (error) {
+        if (folder === currentFolder) ppStatus.textContent = 'Apply failed: ' + error.message;
+    } finally {
+        ppBusy = false;
+        ppUpdateButtons();
+        if (!confirmed && folder === currentFolder) ppRunPreview();
+    }
+});
 
 // ── Auto Caption ─────────────────────────────────────────────────────────────
 

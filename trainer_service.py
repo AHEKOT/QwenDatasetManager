@@ -77,7 +77,7 @@ EDIT_MODELS = {
         'defaults': {
             'qtype': 'convrot8', 'qtypeTextEncoder': 'convrot8',
             'lowVram': True, 'timestepType': 'shift', 'guidanceScale': 3,
-            'matchTargetResolution': True, 'nativeRgba': False,
+            'matchTargetResolution': True, 'nativeRgba': False, 'alignReferenceDimensions': True,
         },
     },
     'flux2_klein_4b': {
@@ -1601,6 +1601,7 @@ class TrainerService:
         native_rgba = layered or (model_key == QWEN21_KEY and bool(payload.get('nativeRgba', False)))
         if model_key == QWEN21_KEY:
             model_kwargs['rgba'] = native_rgba
+            model_kwargs['align_reference_dimensions'] = bool(payload.get('alignReferenceDimensions', True))
         if layered:
             model_kwargs['layer_slots'] = layer_slots(payload, TrainerValidationError)
         if transparent:
@@ -1839,6 +1840,7 @@ class TrainerService:
             process = config['config']['process'][0]
             process['train']['unload_text_encoder'] = False
             process['model'].setdefault('model_kwargs', {})['rgba'] = native_rgba
+            process['model']['model_kwargs']['align_reference_dimensions'] = bool(payload.get('alignReferenceDimensions', True))
             if native_rgba:
                 process['sample']['format'] = 'png'
             config['meta']['qdm']['upstreamCommit'] = QWEN21_SOURCE_COMMIT

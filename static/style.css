@@ -2624,6 +2624,7 @@ input[type="range"]::-moz-range-thumb {
 .ac-progress-item[data-status="error"] { color: var(--error); }
 .ac-progress-item[data-status="generating"] { color: var(--accent); }
 .pt-footer-group { display: flex; gap: 0.5rem; align-items: center; }
+.pp-footer-status { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
 .pt-config {
   display: flex;
@@ -2855,7 +2856,7 @@ input[type="range"]::-moz-range-thumb {
   gap: 0.6rem;
   align-items: start;
 }
-.pt-preview-col { display: flex; flex-direction: column; gap: 0.3rem; }
+.pt-preview-col { display: flex; min-width: 0; flex-direction: column; gap: 0.3rem; }
 .pt-preview-label {
   font-size: 9px;
   font-weight: 700;

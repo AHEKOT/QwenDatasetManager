@@ -1,4 +1,5 @@
 """CPU dataloader checks; run with trainer/.venv, without model weights."""
+import os
 import sys
 import tempfile
 import unittest
@@ -6,6 +7,8 @@ from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 sys.path.insert(0, str(Path(__file__).parent / 'ai_toolkit'))
 
 import torch
@@ -17,8 +20,11 @@ from extensions_built_in.diffusion_models.qwen_image_2 import QwenImage2Model
 
 class DatasetBatchRuntimeTests(unittest.TestCase):
     def model(self):
-        return QwenImage2Model('cpu', ModelConfig(name_or_path='unused', arch='qwen_image_2',
-                              model_kwargs={'rgba': True}), dtype='fp32')
+        model = QwenImage2Model('cpu', ModelConfig(name_or_path='unused', arch='qwen_image_2',
+                               model_kwargs={'rgba': True}), dtype='fp32')
+        model.vae = None
+        model.model = None
+        return model
 
     def dataset(self, root, name, count=4, **options):
         folder = root / name
@@ -85,10 +91,10 @@ class DatasetBatchRuntimeTests(unittest.TestCase):
             for batch in loader:
                 self.assertEqual(len(batch.file_items), 1)
                 prepared.extend(model._prepare_control_images(
-                    model._normalize_control_images(batch.control_tensor, 1), target_pixels=352 * 352))
+                    model._normalize_control_images(batch.control_tensor_list, 1), target_pixels=352 * 352))
 
             # Replace only the heavy VAE with its 16x spatial output shape.
-            def encode(images, **kwargs):
+            def encode(model, images, **kwargs):
                 height, width = images[0].shape[-2:]
                 return torch.zeros(1, 64, height // 16, width // 16)
 
@@ -97,6 +103,39 @@ class DatasetBatchRuntimeTests(unittest.TestCase):
                     model.encode_condition_images(prepared)
                 lengths = [model.encode_condition_images([sample])[0].shape[1] for sample in prepared]
             self.assertEqual(sorted(lengths), [480, 504])
+
+    def test_variable_source_sizes_collate_and_align_in_multi_sample_batches(self):
+        for references, workers in ((1, 0), (2, 0), (1, 1)):
+            with self.subTest(references=references, workers=workers), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / 'img'
+                target.mkdir()
+                controls = [root / f'Control{index + 1}' for index in range(references)]
+                for folder in controls:
+                    folder.mkdir()
+                for index, size in enumerate(((1352, 512), (1024, 1024), (288, 448))):
+                    Image.new('RGBA', (352, 352), (20, 40, 60, 128)).save(target / f'{index}.png')
+                    for reference_index, folder in enumerate(controls):
+                        Image.new('RGBA', size, (20 + reference_index * 40, 40, 60, 128)).save(folder / f'{index}.png')
+                model = self.model()
+                model.model_config.model_kwargs.update(align_reference_dimensions=True, match_target_res=False)
+                loader = get_dataloader_from_datasets([dict(folder_path=str(target),
+                    control_path=[str(folder) for folder in controls], full_size_control_images=True,
+                    resolution=352, num_workers=workers, caption_dropout_rate=0)], batch_size=3, sd=model)
+                for batch in loader:
+                    self.assertIsNone(batch.control_tensor)
+                    self.assertEqual(len(batch.control_tensor_list), 3)
+                    prepared = model._prepare_control_images(batch.control_tensor_list, target_size=(352, 352))
+                    self.assertTrue(all(tuple(image.shape) == (1, 4, 352, 352)
+                                        for sample in prepared for image in sample))
+                    samples = model._normalize_control_images(batch.control_tensor_list, 3)
+                    prepared = model._prepare_control_images(samples, target_size=(352, 352))
+                    def encode(model, images, **kwargs):
+                        return torch.zeros(1, 64, images[0].shape[-2] // 16, images[0].shape[-1] // 16)
+                    with patch.object(QwenImage2Model, 'encode_images', side_effect=encode):
+                        latents, shapes = model.encode_condition_images(prepared)
+                    self.assertEqual(tuple(latents.shape), (3, 484 * references, 64))
+                    self.assertEqual(shapes, [(22, 22)] * references)
 
 
 if __name__ == '__main__':

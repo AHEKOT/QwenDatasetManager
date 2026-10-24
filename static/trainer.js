@@ -300,6 +300,7 @@
         const model = selectedModel();
         if (!model) return;
         h3.render(isVaePreset(selectedPreset()) ? '' : model.key);
+        $('trainer-qi2-alignment-wrap').classList.toggle('hidden', model.key !== 'qwen_image_2' || isVaePreset(selectedPreset()));
         $('trainer-native-rgba-wrap').classList.toggle('hidden', !model.nativeRgba || isLayered());
         $('trainer-model-license').textContent = model.license;
         $('trainer-model-license').title = model.gated ? 'Gated Hugging Face model' : model.license;
@@ -987,6 +988,7 @@
             qtypeTextEncoder: $('trainer-qtype-te').value,
             lowVram: checked('trainer-low-vram'),
             matchTargetResolution: checked('trainer-match-resolution'),
+            alignReferenceDimensions: checked('trainer-qi2-align-references'),
             nativeRgba: isLayered() || (Boolean(selectedModel()?.nativeRgba) && checked('trainer-native-rgba')),
             layerSlots: numberValue('trainer-layer-slots'),
             compileModel: checked('trainer-compile'),
@@ -1191,7 +1193,7 @@
         const defaults = {
             name: 'qdm_edit_lora_v1', gpuIds: '0', trainingPreset: 'standard_lora', triggerWord: '', model: state.models[0]?.key || 'qwen_image_edit_2511',
             modelPath: '', qtype: 'qfloat8', qtypeTextEncoder: 'qfloat8', lowVram: true,
-            matchTargetResolution: false, compileModel: false, networkType: 'lora', rank: 32, lokrFactor: -1, saveDtype: 'bf16', maxSaves: 4,
+            matchTargetResolution: false, alignReferenceDimensions: true, compileModel: false, networkType: 'lora', rank: 32, lokrFactor: -1, saveDtype: 'bf16', maxSaves: 4,
             batchSize: 1, gradientAccumulation: 1, steps: 3000, learningRate: 0.0001, optimizer: 'adamw8bit',
             weightDecay: 0.0001, timestepType: 'weighted', timestepBias: 'balanced', lossType: 'mse', saveEvery: 250,
             cacheTextEmbeddings: false, unloadTextEncoder: false, useEma: false, emaDecay: 0.99,
@@ -1255,6 +1257,7 @@
         setInput('trainer-qtype-te', data.qtypeTextEncoder);
         setInput('trainer-low-vram', data.lowVram);
         setInput('trainer-match-resolution', data.matchTargetResolution);
+        setInput('trainer-qi2-align-references', data.alignReferenceDimensions);
         setInput('trainer-native-rgba', data.nativeRgba || false);
         setInput('trainer-layer-slots', data.layerSlots ?? 4);
         setInput('trainer-compile', data.compileModel);
@@ -1993,7 +1996,7 @@
             renderModelFields(true, true);
             if (selectedModel()?.nativeRgba) {
                 const defaults = selectedModel().defaults;
-                const fields = { qtype: 'trainer-qtype', qtypeTextEncoder: 'trainer-qtype-te', timestepType: 'trainer-timestep', guidanceScale: 'trainer-guidance-scale', matchTargetResolution: 'trainer-match-resolution', lowVram: 'trainer-low-vram', nativeRgba: 'trainer-native-rgba' };
+                const fields = { qtype: 'trainer-qtype', qtypeTextEncoder: 'trainer-qtype-te', timestepType: 'trainer-timestep', guidanceScale: 'trainer-guidance-scale', matchTargetResolution: 'trainer-match-resolution', alignReferenceDimensions: 'trainer-qi2-align-references', lowVram: 'trainer-low-vram', nativeRgba: 'trainer-native-rgba' };
                 Object.entries(fields).forEach(([key, id]) => setInput(id, defaults[key]));
             }
             if (isQieJoint()) {

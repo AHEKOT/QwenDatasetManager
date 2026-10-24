@@ -3,11 +3,17 @@
 Select **Qwen Image 2.1** in Trainer. The same `qwen_image_2` architecture
 trains generation from captions when the dataset has no Controls, or editing
 when paired Control1–3 images exist. Every used Control folder must have a
-matching image for each target. Start with batch size 1; larger batches require
-compatible reference token counts and shapes.
-For a dataset with varying reference sizes, set its **Batch size override** to
-**1** while other datasets keep the global batch size. An empty override inherits
-the training batch size. Gradient accumulation remains a global setting.
+matching image for each target. **Align reference dimensions (padding)** defaults
+on in Trainer: each Control is fitted to the target bucket canvas, centered,
+without cropping or stretching. RGB borders are white; RGBA borders are transparent.
+This allows larger batches with different source dimensions and aspect ratios,
+provided every sample has the same number of references. Targets still use normal
+resolution buckets; source files are not modified. The same fitting rule is used
+for text embeddings, VAE references, and preview sampling.
+When alignment is off, references keep their own aspect ratio and larger batches
+require compatible reference token counts and shapes. **Batch size override: 1**
+remains available for individual datasets. An empty override inherits the global
+batch size. Gradient accumulation remains a global setting.
 
 Enable **Transparency (RGBA)** to preserve alpha in targets, references and PNG
 samples. Mixed RGB/RGBA datasets work: RGB images receive opaque alpha. This
@@ -18,10 +24,18 @@ cannot be combined.
 
 Defaults match the source UI: `Comfy-Org/Qwen-Image-2.1`, transformer and text
 encoder `convrot8`, low VRAM enabled, FlowMatch, Shift timesteps, CFG 3, and
-text encoder unloading disabled. Match target resolution defaults on: references
-keep their aspect ratio and are scaled to the target pixel area on a 32-pixel
-grid. Turning it off uses the model's reference pixel cap. Text caches include
-this rule and the target bucket size; RGBA uses separate latent/reference caches.
+text encoder unloading disabled. With alignment off, Match target resolution
+scales references to the target pixel area on a 32-pixel grid; turning both options
+off uses the model's reference pixel cap. Alignment takes precedence over this
+area-based sizing. Its text caches use a separate version and the target bucket
+size, so old embeddings are not reused. RGBA uses separate latent/reference caches.
+Existing jobs must be edited and saved with alignment enabled to use the new rule.
+
+Prepared references bypass Qwen3-VL's automatic min/max-pixel resize, keeping the
+vision slots on exactly the same 32-pixel canvas as the VAE. This includes small
+panoramic buckets such as 448x128 (56 slots) and references above the processor's
+usual pixel limit. Text cache versions also change so embeddings made with the
+old processor resize are rebuilt automatically.
 
 The loader reuses/downloads weights in the existing `models/` Comfy layout:
 
@@ -50,7 +64,8 @@ defaults, generation without references, paired-reference validation, native
 RGBA and Advanced config handling. `trainer/test_qwen21_runtime.py` runs with
 `trainer/.venv` and covers a small real transformer forward/backward for
 generation and editing, flow targets, RGB/RGBA dataloading and cache identities,
-prompt sizing, alpha compositing and convrot embedding import. These tests do
+prompt sizing, real Qwen3-VL processor slot counts, panoramic batch forward/backward,
+alpha compositing and convrot embedding import. These tests do
 not download checkpoints; full-size GPU training is not covered by them.
 
 ## Совместная генерация PSD-слоёв

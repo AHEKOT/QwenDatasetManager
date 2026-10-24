@@ -35,7 +35,8 @@ class Qwen21TrainerTests(unittest.TestCase):
             self.assertEqual(p['model']['name_or_path'], 'Comfy-Org/Qwen-Image-2.1')
             self.assertEqual(p['model']['qtype'], 'convrot8')
             self.assertEqual(p['model']['qtype_te'], 'convrot8')
-            self.assertEqual(p['model']['model_kwargs'], {'rgba': rgba, 'match_target_res': True})
+            self.assertEqual(p['model']['model_kwargs'], {'rgba': rgba, 'match_target_res': True,
+                                                        'align_reference_dimensions': True})
             self.assertNotIn('vae_path', p['model'])
             self.assertFalse(p['train']['unload_text_encoder'])
             self.assertEqual(p['train']['timestep_type'], 'shift')
@@ -58,7 +59,7 @@ class Qwen21TrainerTests(unittest.TestCase):
         self.assertEqual(p['datasets'][0]['control_path'], [str(control)])
 
     def test_advanced_and_saved_form_keep_native_options(self):
-        payload = self.payload(nativeRgba=True, matchTargetResolution=False,
+        payload = self.payload(nativeRgba=True, matchTargetResolution=False, alignReferenceDimensions=False,
                                cacheTextEmbeddings=True, unloadTextEncoder=True)
         config = self.service.build_job_config(payload)[2]
         advanced = copy.deepcopy(config['config']['process'][0])
@@ -70,9 +71,27 @@ class Qwen21TrainerTests(unittest.TestCase):
         p = config['config']['process'][0]
         self.assertTrue(p['model']['model_kwargs']['rgba'])
         self.assertFalse(p['model']['model_kwargs']['match_target_res'])
+        self.assertFalse(p['model']['model_kwargs']['align_reference_dimensions'])
         self.assertFalse(p['train']['unload_text_encoder'])
         self.assertEqual(p['sample']['format'], 'png')
         self.assertTrue(config['meta']['qdm']['form']['nativeRgba'])
+        self.assertFalse(config['meta']['qdm']['form']['alignReferenceDimensions'])
+
+    def test_reference_alignment_is_saved_and_other_models_are_unchanged(self):
+        job, _ = self.service.create_job(self.payload(alignReferenceDimensions=True))
+        self.assertTrue(job['form']['alignReferenceDimensions'])
+        self.service.update_job(job['id'], self.payload(alignReferenceDimensions=False))
+        self.assertFalse(self.service.get_job(job['id'])['form']['alignReferenceDimensions'])
+        payload = self.payload(alignReferenceDimensions=True)
+        payload['model'] = 'flux2_klein_4b'
+        payload['disableSampling'] = True
+        for name in ('Control1', 'Control2'):
+            folder = self.datasets / 'demo' / name
+            folder.mkdir()
+            for stem in ('rgb', 'rgba'):
+                Image.new('RGB', (64, 64)).save(folder / f'{stem}.png')
+        config = self.service.build_job_config(payload)[2]
+        self.assertNotIn('align_reference_dimensions', config['config']['process'][0]['model']['model_kwargs'])
 
     def test_native_vae_does_not_accept_legacy_transparent_preset(self):
         with self.assertRaisesRegex(TrainerValidationError, 'native RGBA'):
