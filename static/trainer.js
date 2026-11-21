@@ -1,0 +1,2375 @@
+(() => {
+    'use strict';
+
+    const bootstrapState = (() => {
+        const element = document.getElementById('trainer-bootstrap');
+        if (!element) return null;
+        try {
+            const value = JSON.parse(element.textContent);
+            return value && Array.isArray(value.jobs) ? value : null;
+        } catch (_) {
+            return null;
+        }
+    })();
+
+    // During local updates Flask can still be running with an older Python
+    // process while serving the newest trainer.js from disk. Treat an older,
+    // partial bootstrap as a fast list-only snapshot and fetch the full state
+    // before restoring an editor form. Otherwise selects such as qtype have no
+    // options yet and assigning the saved value silently clears it.
+    const bootstrapCanRestoreEditor = Boolean(
+        bootstrapState
+        && Array.isArray(bootstrapState.models)
+        && Array.isArray(bootstrapState.trainingPresets)
+        && Array.isArray(bootstrapState.qtypes)
+        && bootstrapState.qtypes.length
+        && Array.isArray(bootstrapState.datasets)
+        && Array.isArray(bootstrapState.gpus)
+    );
+
+    const state = {
+        models: bootstrapState?.models || [],
+        trainingPresets: bootstrapState?.trainingPresets || [],
+        qtypes: bootstrapState?.qtypes || [],
+        datasets: bootstrapState?.datasets || [],
+        datasetsLoaded: Boolean(bootstrapState && Array.isArray(bootstrapState.datasets)),
+        jobs: bootstrapState?.jobs || [],
+        gpus: bootstrapState?.gpus || [],
+        selectedDatasets: [],
+        samples: [],
+        validationItems: [],
+        chromaValidationItems: [],
+        selectedJobId: null,
+        editingJobId: null,
+        initialViewChosen: false,
+        filter: 'all',
+        trainerInstalled: Boolean(bootstrapState?.trainerInstalled),
+        pollTimer: null,
+        samplePollTimer: null,
+        detailTab: 'overview',
+        generatedSamples: [],
+        generatedSampleCount: 1,
+        generatedSamplesStatus: 'idle',
+        validationResults: null,
+        selectedGeneratedSample: null,
+        selectedSampleControl: null,
+        sampleZoom: 1,
+    };
+
+    const $ = id => document.getElementById(id);
+    const h3 = window.QdmH3;
+    h3.mount();
+    const isH3 = () => h3.isH3(selectedModel()?.key);
+    const isQieJoint = () => selectedModel()?.key === 'qwen_image_edit_2511' && selectedPreset() === 'transparent_lora';
+    const isLayered = () => selectedPreset() === 'qwen_layered_lora';
+    const isVideoPath = path => /\.(mp4|avi|mov|webm|mkv|wmv|m4v|flv)$/i.test(path || '');
+    const independentValidationUploads = document.body.dataset.independentValidationUploads === 'true';
+    const editorView = $('trainer-editor-view');
+    const detailView = $('trainer-detail-view');
+    const form = $('trainer-job-form');
+    const jobsList = $('trainer-jobs-list');
+    const formError = $('trainer-form-error');
+    const datasetInspectionRequests = new Map();
+
+    function replaceTrainerLocation({ jobId = null, edit = false, newJob = false, tab = 'overview' } = {}) {
+        const url = new URL(window.location.href);
+        url.search = '';
+        if (newJob) url.searchParams.set('new', '1');
+        else if (jobId) {
+            url.searchParams.set('job', jobId);
+            if (edit) url.searchParams.set('edit', '1');
+            else if (tab === 'samples') url.searchParams.set('tab', 'samples');
+        }
+        window.history.replaceState(null, '', url);
+    }
+
+    const escapeHtml = value => String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+
+    async function api(url, options = {}) {
+        const response = await fetch(url, {
+            ...options,
+            headers: {
+                ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+                ...(options.headers || {}),
+            },
+        });
+        let data = {};
+        try { data = await response.json(); } catch (_) { /* empty response */ }
+        if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+        return data;
+    }
+
+    function showToast(message, isError = false) {
+        const toast = $('trainer-toast');
+        toast.textContent = message;
+        toast.classList.toggle('is-error', isError);
+        toast.classList.remove('hidden');
+        window.clearTimeout(showToast.timer);
+        showToast.timer = window.setTimeout(() => toast.classList.add('hidden'), 3500);
+    }
+
+    function showFormError(message = '') {
+        formError.textContent = message;
+        formError.classList.toggle('hidden', !message);
+        if (message) formError.scrollIntoView({ block: 'nearest' });
+    }
+
+    const trainingChoiceValue = (preset, modelKey) => `${preset}::${modelKey}`;
+
+    function selectedTrainingChoice() {
+        const raw = $('trainer-model').value || '';
+        const separator = raw.indexOf('::');
+        if (separator > 0) {
+            return {
+                preset: raw.slice(0, separator),
+                modelKey: raw.slice(separator + 2),
+            };
+        }
+        return {
+            preset: $('trainer-preset').value || 'standard_lora',
+            modelKey: raw || state.models[0]?.key || 'qwen_image_edit_2511',
+        };
+    }
+
+    function selectedModel() {
+        const { modelKey } = selectedTrainingChoice();
+        return state.models.find(model => model.key === modelKey) || state.models[0];
+    }
+
+    function selectedPreset() {
+        return selectedTrainingChoice().preset;
+    }
+
+    const isVaePreset = preset => ['qwen_rgba_vae', 'flux2_rgba_vae', 'h3_rgba_vae'].includes(preset);
+    const isChromaPreset = preset => preset === 'chromakey_tiny';
+
+    function setTrainingChoice(modelKey, preset = 'standard_lora') {
+        const select = $('trainer-model');
+        const requested = trainingChoiceValue(preset, modelKey);
+        const fallback = trainingChoiceValue('standard_lora', modelKey);
+        const values = Array.from(select.options).map(option => option.value);
+        select.value = values.includes(requested)
+            ? requested
+            : (values.includes(fallback) ? fallback : values[0] || '');
+        $('trainer-preset').value = selectedPreset();
+    }
+
+    function currentJob() {
+        return state.jobs.find(job => job.id === state.selectedJobId) || null;
+    }
+
+    function renderRuntime() {
+        const pill = $('trainer-runtime-status');
+        pill.classList.remove('is-checking', 'is-ready', 'is-missing');
+        pill.classList.add(state.trainerInstalled ? 'is-ready' : 'is-missing');
+        pill.textContent = state.trainerInstalled ? 'CUDA trainer ready' : 'Trainer not installed';
+        $('trainer-runtime-banner').classList.toggle('hidden', state.trainerInstalled);
+    }
+
+    function renderModelOptions() {
+        const modelSelect = $('trainer-model');
+        const previous = selectedTrainingChoice();
+        const editModels = state.models.filter(model => model.kind !== 'chromakey');
+        const standardOptions = editModels.map(model =>
+            `<option value="${escapeHtml(trainingChoiceValue('standard_lora', model.key))}">${escapeHtml(model.label)}</option>`
+        ).join('');
+        const transparentOptions = editModels.filter(model => model.transparentArch).map(model =>
+            `<option value="${escapeHtml(trainingChoiceValue('transparent_lora', model.key))}">${escapeHtml(model.label)} — ${model.key === 'qwen_image_edit_2511' ? 'Edit RGB / RGBA LoRA' : 'Transparent RGBA LoRA'}</option>`
+        ).join('');
+        const qwen = state.models.find(model => model.key === 'qwen_image_edit_2511');
+        const qwenVaeOption = qwen
+            ? `<option value="${escapeHtml(trainingChoiceValue('qwen_rgba_vae', qwen.key))}">${escapeHtml(qwen.label)} — Train RGBA VAE</option>`
+            : '';
+        const klein = state.models.find(model => model.key === 'flux2_klein_4b');
+        const flux2VaeOption = klein
+            ? `<option value="${escapeHtml(trainingChoiceValue('flux2_rgba_vae', klein.key))}">FLUX.2 Klein 4B / 9B — Train RGBA VAE</option>`
+            : '';
+        const h3Model = state.models.find(model => model.key === 'minimax_h3');
+        const h3VaeOption = h3Model ? `<option value="${escapeHtml(trainingChoiceValue('h3_rgba_vae', h3Model.key))}">MiniMax H3 / Ref2VA — Train RGBA VAE</option>` : '';
+        const chroma = state.models.find(model => model.kind === 'chromakey');
+        const chromaOption = chroma
+            ? `<option value="${escapeHtml(trainingChoiceValue('chromakey_tiny', chroma.key))}">${escapeHtml(chroma.label)} — Clean alpha + native detail</option>`
+            : '';
+        modelSelect.innerHTML = [
+            state.models.some(model => model.key === 'qwen_image_2') ? `<optgroup label="Layered image training"><option value="qwen_layered_lora::qwen_image_2">Qwen Image 2.1 — Joint PSD layers LoRA</option></optgroup>` : '',
+            `<optgroup label="Standard edit LoRA">${standardOptions}</optgroup>`,
+            `<optgroup label="Edit / RGBA LoRA">${transparentOptions}</optgroup>`,
+            (qwenVaeOption || flux2VaeOption || h3VaeOption)
+                ? `<optgroup label="VAE training">${qwenVaeOption}${flux2VaeOption}${h3VaeOption}</optgroup>`
+                : '',
+            chromaOption ? `<optgroup label="Specialized models">${chromaOption}</optgroup>` : '',
+        ].join('');
+        setTrainingChoice(previous.modelKey, previous.preset);
+        renderModelFields();
+    }
+
+    function renderPresetOptions() {
+        $('trainer-preset').value = selectedPreset();
+        renderPresetFields();
+    }
+
+    function setVaeSourceDefaults(force = false) {
+        const preset = selectedPreset();
+        if (!isVaePreset(preset)) return;
+        const isFlux2 = preset === 'flux2_rgba_vae';
+        const isH3Vae = preset === 'h3_rgba_vae';
+        const path = $('trainer-source-vae-path');
+        const subfolder = $('trainer-source-vae-subfolder');
+        const knownPaths = ['Qwen/Qwen-Image-Edit-2511', 'ai-toolkit/flux2_vae'];
+        if (force || !path.value.trim() || knownPaths.includes(path.value.trim())) {
+            path.value = isH3Vae ? selectedModel().defaultSourceVaePath : isFlux2 ? 'ai-toolkit/flux2_vae' : 'Qwen/Qwen-Image-Edit-2511';
+        }
+        if (force || !subfolder.value.trim() || subfolder.value.trim() === 'vae') {
+            subfolder.value = isFlux2 || isH3Vae ? '' : 'vae';
+        }
+        $('trainer-vae-heading').textContent = isH3Vae ? 'MiniMax H3 RGBA VAE training' : isFlux2
+            ? 'FLUX.2 Klein RGBA VAE training'
+            : 'Qwen RGBA VAE training';
+        $('trainer-source-vae-path-label').textContent = isH3Vae ? 'Original local H3 RGB video VAE (.safetensors)' : isFlux2
+            ? 'Standard FLUX.2 VAE repository / local file'
+            : 'Standard Qwen model / path';
+        $('trainer-source-vae-subfolder-label').textContent = isFlux2
+            ? 'Repository subfolder (optional)'
+            : 'VAE subfolder';
+    }
+
+    function renderPresetFields() {
+        const preset = selectedPreset();
+        $('trainer-preset').value = preset;
+        const isVae = isVaePreset(preset);
+        const isChroma = isChromaPreset(preset);
+        const isTransparent = preset === 'transparent_lora';
+        $('trainer-layered-wrap').classList.toggle('hidden', !isLayered());
+        $('trainer-batch-size').disabled = isLayered();
+        $('trainer-loss').disabled = isLayered();
+        ['trainer-dop', 'trainer-bpp', 'trainer-guidance-loss', 'trainer-differential-guidance', 'trainer-validation-enabled', 'trainer-use-advanced-config'].forEach(id => {
+            $(id).disabled = isLayered();
+            if (isLayered()) $(id).checked = false;
+        });
+        if (isLayered()) {
+            setInput('trainer-batch-size', 1);
+            setInput('trainer-loss', 'mse');
+        }
+        document.querySelectorAll('.trainer-lora-only').forEach(element =>
+            element.classList.toggle('hidden', isVae || isChroma)
+        );
+        document.querySelectorAll('.trainer-transparent-only').forEach(element =>
+            element.classList.toggle('hidden', !isTransparent)
+        );
+        document.querySelectorAll('.trainer-vae-only').forEach(element =>
+            element.classList.toggle('hidden', !isVae)
+        );
+        document.querySelectorAll('.trainer-chromakey-only').forEach(element =>
+            element.classList.toggle('hidden', !isChroma)
+        );
+        if (isVae || isChroma) {
+            $('trainer-use-advanced-config').checked = false;
+            if (isVae) setVaeSourceDefaults(false);
+        }
+        $('trainer-editor-title').textContent = isChroma
+            ? 'Configure CleanMatte alpha training'
+            : isVae
+            ? (preset === 'h3_rgba_vae' ? 'Configure MiniMax H3 RGBA VAE training' : preset === 'flux2_rgba_vae' ? 'Configure FLUX.2 Klein RGBA VAE training' : 'Configure Qwen RGBA VAE training')
+            : (isQieJoint() ? 'Configure QIE2511 edit training (RGB / RGBA)' : isTransparent ? 'Configure transparent RGBA LoRA training' : 'Configure LoRA training');
+        $('trainer-editor-description').textContent = isLayered()
+            ? 'Train one joint RGBA layer stack per PSD. Control1 is optional; samples include a layered PSD and a composite preview.'
+            : isChroma
+            ? 'RGBA targets are composited onto configurable synthetic backgrounds without changing their aspect ratio. The model receives RGB only.'
+            : isVae
+            ? 'RGBA targets are mapped from each selected dataset; captions and Control folders are not used.'
+            : (isTransparent
+                ? (isQieJoint() ? 'Train edits from Control1–3 and caption instructions against the complete target. RGB, RGBA and mixed datasets are supported; missing alpha means fully opaque. Uses the compatible RGBA VAE.' : isH3() ? 'Single RGBA image targets. Edit uses opaque composites; Generation uses captions. Select a trained H3 RGBA VAE. Video samples are lossless APNG, with audio in a WAV sidecar.' : 'Each dataset independently uses Edit with random real backgrounds or Generation with a black Control1.')
+                : 'Target images and Control1–3 are mapped directly from the selected datasets.');
+        $('trainer-rgba-loss-help').textContent = isH3()
+            ? 'H3 uses RGBA latent flow loss plus differentiable VAE alpha and edge reconstruction. The auxiliary loss decodes the predicted clean image and uses extra VAE memory. Set both strengths to 0 for latent flow loss only.'
+            : isQieJoint() ? 'The complete latent diffusion loss trains RGB edits and alpha together. Alpha-only filtering is disabled. Extra alpha/edge losses apply only when a compatible calibrated probe is loaded.' : "A calibrated fixed latent probe reinforces the VAE alpha direction. Recommended starting values: alpha 1, edges 0.5, learning rate 0.00001.";
+        $('trainer-independent-validation-help').textContent = isQieJoint()
+            ? 'Upload held-out RGB or RGBA targets with their real input Controls and edit instructions. These files are not used for training. Full validation loss and alpha metrics are reported separately.'
+            : 'Upload an independent RGBA target set here. These files are not used for training. Alpha PASS/FAIL uses the worst selected sigma.';
+        renderDatasetPicker();
+        renderSelectedDatasets();
+        renderChromaValidationItems();
+    }
+
+    function renderModelFields(resetPath = false, resetAssets = false) {
+        const model = selectedModel();
+        if (!model) return;
+        h3.render(isVaePreset(selectedPreset()) ? '' : model.key);
+        $('trainer-qi2-alignment-wrap').classList.toggle('hidden', model.key !== 'qwen_image_2' || isVaePreset(selectedPreset()));
+        $('trainer-native-rgba-wrap').classList.toggle('hidden', !model.nativeRgba || isLayered());
+        $('trainer-model-license').textContent = model.license;
+        $('trainer-model-license').title = model.gated ? 'Gated Hugging Face model' : model.license;
+        if (model.kind === 'chromakey') {
+            $('trainer-model-gate').classList.add('hidden');
+            return;
+        }
+        if (resetPath || !$('trainer-model-path').value) $('trainer-model-path').value = model.modelPath;
+        $('trainer-model-gate').classList.toggle('hidden', !model.gateUrl);
+        $('trainer-model-gate').href = model.gateUrl || '#';
+        $('trainer-noise-scheduler').value = model.noiseScheduler === 'flowmatch' ? 'FlowMatch' : model.noiseScheduler;
+        $('trainer-unload-text-wrap').classList.toggle('hidden', !model.allowUnloadTextEncoder);
+        if (!model.allowUnloadTextEncoder) $('trainer-unload-text').checked = false;
+        if (resetAssets) {
+            $('trainer-sample-lora-path').value = model.defaultSampleLoraPath || '';
+            $('trainer-vae-path').value = model.defaultRgbaVaePath || '';
+        } else {
+            if (!$('trainer-sample-lora-path').value && model.defaultSampleLoraPath) {
+                $('trainer-sample-lora-path').value = model.defaultSampleLoraPath;
+            }
+            if (!$('trainer-vae-path').value && model.defaultRgbaVaePath) {
+                $('trainer-vae-path').value = model.defaultRgbaVaePath;
+            }
+        }
+
+        const qtype = $('trainer-qtype');
+        const previous = qtype.value || model.defaultQtype;
+        const standardOptions = state.qtypes.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(qtypeLabel(value))}</option>`).join('');
+        const araOptions = Object.entries(model.accuracyRecoveryAdapters || {}).map(([label, value]) =>
+            `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`
+        ).join('');
+        qtype.innerHTML = araOptions
+            ? `<optgroup label="Standard">${state.qtypes.slice(0, 2).map(value => `<option value="${escapeHtml(value)}">${escapeHtml(qtypeLabel(value))}</option>`).join('')}</optgroup><optgroup label="Accuracy Recovery Adapters">${araOptions}</optgroup><optgroup label="Additional quantization options">${state.qtypes.slice(2).map(value => `<option value="${escapeHtml(value)}">${escapeHtml(qtypeLabel(value))}</option>`).join('')}</optgroup>`
+            : standardOptions;
+        const allowed = new Set([...state.qtypes, ...Object.values(model.accuracyRecoveryAdapters || {})]);
+        qtype.value = allowed.has(previous) ? previous : model.defaultQtype;
+
+        const qtypeTe = $('trainer-qtype-te');
+        const previousTe = qtypeTe.value || model.defaultQtypeTextEncoder || model.defaultQtype;
+        qtypeTe.innerHTML = standardOptions;
+        qtypeTe.value = state.qtypes.includes(previousTe) ? previousTe : model.defaultQtype;
+    }
+
+    function qtypeLabel(value) {
+        const labels = {
+            '': 'None', qfloat8: 'qfloat8 (default)', float8: 'float8', convrot8: '8bit convrot',
+            convrot4: '4bit convrot (nvfp4)', nvfp4: 'nvfp4 (4bit weight only)',
+            convrotint7: '7bit convrot', convrotint6: '6bit convrot', convrotint5: '5bit convrot',
+            convrotint4: '4bit convrot', convrotint3: '3bit convrot', convrotint2: '2bit convrot',
+            convrotbitnet: '1.58bit convrot (bitnet)', uint7: '7 bit', uint6: '6 bit',
+            uint5: '5 bit', uint4: '4 bit', uint3: '3 bit', uint2: '2 bit',
+        };
+        return labels[value] || value;
+    }
+
+    function renderGpuOptions() {
+        const select = $('trainer-gpu');
+        const previous = select.value || '0';
+        if (!state.gpus.length) {
+            select.innerHTML = '<option value="0">GPU 0 (not detected here)</option>';
+            return;
+        }
+        select.innerHTML = state.gpus.map(gpu =>
+            `<option value="${escapeHtml(gpu.index)}">GPU ${escapeHtml(gpu.index)} · ${escapeHtml(gpu.name)} · ${Math.round(gpu.memoryFreeMb / 1024)} / ${Math.round(gpu.memoryTotalMb / 1024)} GB free</option>`
+        ).join('');
+        if (state.gpus.some(gpu => gpu.index === previous)) select.value = previous;
+    }
+
+    function jobVisible(job) {
+        if (state.filter === 'active') return ['queued', 'running', 'stopping'].includes(job.status);
+        if (state.filter === 'finished') return ['completed', 'error'].includes(job.status);
+        return true;
+    }
+
+    function renderJobs() {
+        const scrollTop = jobsList.scrollTop;
+        const jobs = state.jobs.filter(jobVisible);
+        $('trainer-job-count').textContent = `${state.jobs.length} training job${state.jobs.length === 1 ? '' : 's'}`;
+        if (!jobs.length) {
+            jobsList.innerHTML = `<div class="trainer-empty-list"><strong>${state.jobs.length ? 'No matching jobs' : 'No jobs yet'}</strong><span>${state.jobs.length ? 'Try another filter.' : 'Create a LoRA training job from your existing datasets.'}</span></div>`;
+            jobsList.scrollTop = scrollTop;
+            return;
+        }
+        jobsList.innerHTML = jobs.map(job => {
+            const model = state.models.find(item => item.key === job.form?.model);
+            const presetLabel = job.form?.model === 'qwen_image_edit_2511' && job.form?.trainingPreset === 'transparent_lora'
+            ? 'Edit RGB / RGBA LoRA' : state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
+            return `<button class="trainer-job-item${job.id === state.selectedJobId ? ' is-selected' : ''}" type="button" data-job-id="${escapeHtml(job.id)}">
+                <span class="trainer-job-item-top"><strong>${escapeHtml(job.name)}</strong><span class="trainer-mini-status" data-status="${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></span>
+                <span class="trainer-job-item-meta"><span>${escapeHtml(presetLabel || model?.label || job.config?.config?.process?.[0]?.model?.arch || 'Training')}</span><span>${escapeHtml(job.step)} / ${escapeHtml(job.total_steps)}</span></span>
+                <span class="trainer-job-item-progress"><span style="width:${Number(job.progress) || 0}%"></span></span>
+            </button>`;
+        }).join('');
+        jobsList.scrollTop = scrollTop;
+    }
+
+    function renderDatasetPicker() {
+        const select = $('trainer-dataset-select');
+        const previous = select.value;
+        const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
+        const preset = selectedPreset();
+        const validityKey = isLayered() ? 'psdValid' : selectedModel()?.nativeRgba ? 'targetCount' : isQieJoint() ? 'minimaxValid' : isH3() && preset === 'standard_lora' ? 'minimaxValid' : preset === 'transparent_lora'
+            ? 'transparentValid'
+            : (isVaePreset(preset) ? 'vaeValid' : (isChromaPreset(preset) ? 'chromakeyValid' : 'valid'));
+        select.innerHTML = '<option value="">Select dataset…</option>' + state.datasets.map(dataset => {
+            const ready = !dataset.inspected || Boolean(dataset[validityKey]);
+            const details = dataset.inspected
+                ? (isLayered() ? ` · ${dataset.psdTargetCount || 0} PSD · ${dataset.psdPairedCount || 0} with Control1 · ${dataset.psdGenerationCount || 0} from scratch${ready ? '' : ' · not ready'}` : ` · ${isH3() ? dataset.mediaTargetCount : dataset.targetCount} targets · ${isH3() ? (dataset.videoCount || 0) + ' video' : (dataset.alphaCount || 0) + ' alpha'} · ${dataset.controls.length} controls${ready ? '' : ' · not ready'}`)
+                : '';
+            return `<option value="${escapeHtml(dataset.name)}"${selectedNames.has(dataset.name) || !ready ? ' disabled' : ''}>${escapeHtml(dataset.name)}${details}</option>`;
+        }).join('');
+        if (state.datasets.some(dataset => dataset.name === previous && !selectedNames.has(previous))) select.value = previous;
+    }
+
+    async function ensureDatasetInspection(name) {
+        if (!name) return;
+        const existing = state.datasets.find(dataset => dataset.name === name);
+        if (existing?.inspected || datasetInspectionRequests.has(name)) return;
+        const requestValue = api(`/api/trainer/datasets/${encodeURIComponent(name)}`)
+            .then(result => {
+                const inspected = { ...result, inspected: true };
+                const index = state.datasets.findIndex(dataset => dataset.name === name);
+                if (index >= 0) state.datasets[index] = inspected;
+                else state.datasets.push(inspected);
+                renderDatasetPicker();
+                if (state.selectedDatasets.some(dataset => dataset.name === name)) renderSelectedDatasets();
+            })
+            .catch(error => {
+                const index = state.datasets.findIndex(dataset => dataset.name === name);
+                if (index >= 0) {
+                    state.datasets[index] = {
+                        ...state.datasets[index],
+                        inspectionError: error.message || 'Dataset inspection failed',
+                    };
+                }
+                if (state.selectedDatasets.some(dataset => dataset.name === name)) renderSelectedDatasets();
+            })
+            .finally(() => datasetInspectionRequests.delete(name));
+        datasetInspectionRequests.set(name, requestValue);
+        await requestValue;
+    }
+
+    function inspectSelectedDatasets() {
+        const names = new Set();
+        state.selectedDatasets.forEach(dataset => {
+            names.add(dataset.name);
+            if (dataset.rgbaBackgroundDataset) names.add(dataset.rgbaBackgroundDataset);
+        });
+        names.forEach(name => ensureDatasetInspection(name));
+    }
+
+    function addDataset(name, settings = {}, allowDuplicate = false) {
+        const inspection = state.datasets.find(dataset => dataset.name === name);
+        if (!inspection || (!allowDuplicate && state.selectedDatasets.some(dataset => dataset.name === name))) return;
+        state.selectedDatasets.push({
+            name,
+            ...(isH3() ? { ...h3.datasetDefaults, ...settings } : {}),
+            repeats: Number(settings.repeats ?? 1),
+            weight: Number(settings.weight ?? 1),
+            captionDropout: Number(settings.captionDropout ?? 0.05),
+            batchSizeOverride: settings.batchSizeOverride ?? '',
+            defaultCaption: settings.defaultCaption || '',
+            captionExtension: settings.captionExtension || 'txt',
+            resolutions: Array.isArray(settings.resolutions) ? settings.resolutions.map(Number) : [512, 768, 1024],
+            cacheLatents: Boolean(settings.cacheLatents ?? isH3()),
+            isRegularization: Boolean(settings.isRegularization),
+            flipX: Boolean(settings.flipX),
+            flipY: Boolean(settings.flipY),
+            rgbaControlMode: settings.rgbaControlMode || (isQieJoint() ? 'paired' : 'edit'),
+            rgbaBackgroundDataset: settings.rgbaBackgroundDataset || '',
+        });
+        renderSelectedDatasets();
+    }
+
+    function resolutionChip(datasetIndex, value, checked) {
+        return `<label class="trainer-resolution-chip"><input type="checkbox" data-dataset-field="resolution" data-dataset-index="${datasetIndex}" value="${value}"${checked ? ' checked' : ''}><span>${value}</span></label>`;
+    }
+
+    function backgroundDatasetOptions(value) {
+        const eligible = state.datasets.filter(dataset => !dataset.inspected || dataset.backgroundValid);
+        const missing = value && !eligible.some(dataset => dataset.name === value)
+            ? `<option value="${escapeHtml(value)}" selected${state.datasetsLoaded ? ' disabled' : ''}>${escapeHtml(value)}${state.datasetsLoaded ? ' · unavailable' : ''}</option>`
+            : '';
+        const empty = eligible.length || !state.datasetsLoaded ? '' : '<option value="" disabled>No opaque background datasets available</option>';
+        return `<option value="">Select background dataset…</option>${empty}${missing}${eligible.map(dataset =>
+            `<option value="${escapeHtml(dataset.name)}"${dataset.name === value ? ' selected' : ''}>${escapeHtml(dataset.name)}${dataset.inspected ? ` · ${dataset.opaqueBackgroundCount || dataset.targetCount} backgrounds` : ''}</option>`
+        ).join('')}`;
+    }
+
+    function syncRgbaCacheState() {
+        const isTransparent = selectedPreset() === 'transparent_lora';
+        const dynamicBackgrounds = isTransparent
+            && state.selectedDatasets.some(dataset => dataset.rgbaControlMode === 'edit');
+        const dynamicTextCacheSafe = ['flux2_klein_4b', 'flux2_klein_9b'].includes(
+            selectedTrainingChoice().modelKey
+        );
+        const dopsd = isH3() && $('h3-distillationMethod').value === 'dopsd';
+        const cacheRequired = (isTransparent && dynamicTextCacheSafe) || dopsd;
+        const cacheUnsafe = dynamicBackgrounds && !dynamicTextCacheSafe && !dopsd;
+        const input = $('trainer-cache-text');
+        const wrap = $('trainer-cache-text-wrap');
+        const unloadInput = $('trainer-unload-text');
+        const unloadWrap = $('trainer-unload-text-wrap');
+        if (cacheRequired) {
+            input.checked = true;
+            unloadInput.checked = true;
+        } else if (cacheUnsafe) {
+            input.checked = false;
+            if (isH3()) unloadInput.checked = false;
+        }
+        input.disabled = cacheUnsafe || cacheRequired;
+        unloadInput.disabled = cacheRequired;
+        wrap.classList.toggle('is-disabled', cacheUnsafe || cacheRequired);
+        unloadWrap.classList.toggle('is-disabled', cacheRequired);
+        wrap.title = dopsd ? 'D-OPSD caches student and teacher captions plus target pixels.' : cacheRequired
+            ? 'Klein RGBA training caches captions once and keeps the text encoder unloaded.'
+            : (cacheUnsafe
+            ? 'Random background controls are generated on every training sample and cannot use cached text embeddings.'
+            : '');
+        unloadWrap.title = cacheRequired
+            ? 'Klein RGBA training keeps the text encoder unloaded after caption caching.'
+            : '';
+    }
+
+    function renderSelectedDatasets() {
+        const container = $('trainer-selected-datasets');
+        const selectedNames = new Set(state.selectedDatasets.map(item => item.name));
+        const fallbackName = state.selectedDatasets[0]?.name || '';
+        state.samples.forEach(item => {
+            if (!selectedNames.has(item.dataset)) item.dataset = fallbackName;
+        });
+        if (!state.selectedDatasets.length) {
+            const emptyHelp = selectedPreset() === 'transparent_lora'
+                ? 'Choose an RGBA target dataset, then configure its mode and background source.'
+                : (isChromaPreset(selectedPreset())
+                    ? 'Choose one or more RGBA datasets. Captions and Control folders are ignored.'
+                    : 'Choose a dataset above. Target and control folders will be mapped automatically.');
+            container.innerHTML = `<div class="trainer-empty-datasets"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM7 4h10v3H7z"></path><path d="M8 11h8M8 15h5"></path></svg><strong>No datasets selected</strong><span>${emptyHelp}</span></div>`;
+            $('trainer-dataset-summary').textContent = 'Select one or more managed datasets';
+            renderDatasetPicker();
+            renderSamples();
+            renderValidationItems();
+            syncRgbaCacheState();
+            return;
+        }
+
+        container.innerHTML = state.selectedDatasets.map((settings, index) => {
+            const dataset = state.datasets.find(item => item.name === settings.name) || {
+                name: settings.name,
+                targetPath: '',
+                targetCount: null,
+                captionCount: null,
+                alphaCount: null,
+                controls: [],
+                warnings: [],
+            };
+            const metric = value => value === null ? '—' : value;
+            const preset = selectedPreset();
+            const controls = (preset === 'transparent_lora' && settings.rgbaControlMode !== 'paired') || isChromaPreset(preset)
+                ? '<span>Paired controls ignored</span>'
+                : (isH3() ? (dataset.mediaControls || dataset.controls) : dataset.controls).map(item => `<span>${escapeHtml(item.name)} · ${item.count}</span>`).join('');
+            const inspectionWarnings = dataset.inspectionError
+                ? [`Inspection failed: ${dataset.inspectionError}`]
+                : [];
+            const relevantWarnings = [...(isLayered() ? dataset.psdErrors || [] : dataset.warnings), ...inspectionWarnings].filter(warning => {
+                if (isQieJoint() && settings.rgbaControlMode === 'paired') return !warning.includes('no alpha channel');
+                if (isH3()) return !warning.includes('no control images') && !warning.includes('no alpha channel') && !(dataset.videoCount && warning.includes('no target images'));
+                if (isChromaPreset(preset)) {
+                    return !warning.includes('no control images') && !warning.includes('no caption');
+                }
+                return preset === 'standard_lora' || !warning.includes('no control images');
+            });
+            const warnings = relevantWarnings.length ? `<div class="trainer-dataset-warning">${escapeHtml(relevantWarnings.join(' · '))}</div>` : '';
+            const rgbaMode = preset === 'transparent_lora'
+                ? `<section class="trainer-rgba-settings">
+                    <div class="trainer-field"><span>RGBA training mode</span><div class="trainer-mode-toggle" role="radiogroup" aria-label="RGBA training mode for ${escapeHtml(dataset.name)}">
+                        ${isQieJoint() ? `<label><input type="radio" name="rgba-mode-${index}" value="paired" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'paired' ? ' checked' : ''}><span>Paired edit · RGB / RGBA</span></label>` : ''}
+                        <label><input type="radio" name="rgba-mode-${index}" value="edit" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'edit' ? ' checked' : ''}><span>${isQieJoint() ? 'Automatic background removal' : 'Edit'}</span></label>
+                        <label><input type="radio" name="rgba-mode-${index}" value="generation" data-dataset-field="rgbaControlMode" data-dataset-index="${index}"${settings.rgbaControlMode === 'generation' ? ' checked' : ''}><span>Generation</span></label>
+                    </div></div>
+                    ${settings.rgbaControlMode === 'paired' ? `<div class="trainer-rgba-mode-note"><strong>Edit and alpha trained together</strong><span>Control1–3 supply the real inputs; img supplies the RGB or RGBA result. Matching filenames and caption instructions define the edit. No synthetic background is used.</span></div>` : settings.rgbaControlMode === 'edit'
+                        ? `<label class="trainer-field trainer-background-dataset-field"><span>Background dataset <small>required</small></span><select data-dataset-field="rgbaBackgroundDataset" data-dataset-index="${index}">${backgroundDatasetOptions(settings.rgbaBackgroundDataset)}</select><small>A random opaque image from its img folder is placed behind the RGBA target on every training sample.</small></label>`
+                        : isH3() || isQieJoint() ? `<div class="trainer-rgba-mode-note"><strong>Generation from captions</strong><span>Train the complete RGBA latent target. Paired control folders are ignored in this mode.</span></div>` : `<div class="trainer-rgba-mode-note"><strong>Generation mode · alpha residual only</strong><span>The PNG supplies only its alpha mask and edges. RGB content is preserved from the frozen base model, caption dropout is disabled, and Control1 is solid black.</span></div>`}
+                </section>`
+                : '';
+            const datasetSettings = isChromaPreset(preset)
+                ? `<div class="trainer-dataset-settings"><p class="trainer-help">All top-level PNG/WebP files participate in aspect-preserving neural matting training. No pixel pre-analysis, square resize, captions, prompts or Control folders are used.</p></div>`
+                : isVaePreset(preset)
+                ? `<div class="trainer-dataset-settings">
+                    <div class="trainer-toggle-row trainer-resolution-row">
+                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}><span></span>Flip X</label>
+                    </div>
+                    <p class="trainer-help">All alpha-channel targets in this img folder join the deterministic train/validation split. Captions and Control folders are not used by the VAE process.</p>
+                </div>`
+                : `<div class="trainer-dataset-settings">
+                    <label class="trainer-field"><span>Repeats</span><input data-dataset-field="repeats" data-dataset-index="${index}" type="number" min="1" max="1000" value="${settings.repeats}"></label>
+                    <label class="trainer-field"><span>LoRA weight</span><input data-dataset-field="weight" data-dataset-index="${index}" type="number" min="0" max="100" step="0.1" value="${settings.weight}"></label>
+                    <label class="trainer-field"><span>Caption dropout</span><input data-dataset-field="captionDropout" data-dataset-index="${index}" type="number" min="0" max="1" step="0.01" value="${settings.captionDropout}"></label>
+                    <label class="trainer-field" title="Leave empty to use the training batch size. Set 1 to process this dataset one sample at a time."><span>Batch size override</span><input data-dataset-field="batchSizeOverride" data-dataset-index="${index}" type="number" min="1" max="${isLayered() ? 1 : 128}" step="1" placeholder="Global" value="${escapeHtml(settings.batchSizeOverride ?? '')}"></label>
+                    <label class="trainer-field trainer-dataset-caption"><span>Default caption</span><input data-dataset-field="defaultCaption" data-dataset-index="${index}" type="text" value="${escapeHtml(settings.defaultCaption)}"></label>
+                    <label class="trainer-field"><span>Caption extension</span><select data-dataset-field="captionExtension" data-dataset-index="${index}"><option value="txt"${settings.captionExtension === 'txt' ? ' selected' : ''}>txt</option><option value="json"${settings.captionExtension === 'json' ? ' selected' : ''}>json</option><option value="caption"${settings.captionExtension === 'caption' ? ' selected' : ''}>caption</option></select></label>
+                    ${rgbaMode}
+                    ${selectedPreset() === 'standard_lora' ? h3.datasetFields(settings, index, selectedModel()?.key, escapeHtml, dataset.mediaControls || dataset.controls) : ''}
+                    <div class="trainer-resolution-row"><span>Resolutions</span>${[256, 512, 768, 1024, 1280, 1328, 1536, 2048].map(value => resolutionChip(index, value, settings.resolutions.includes(value))).join('')}</div>
+                    <div class="trainer-toggle-row trainer-resolution-row">
+                        <label class="trainer-switch"><input data-dataset-field="cacheLatents" data-dataset-index="${index}" type="checkbox"${settings.cacheLatents ? ' checked' : ''}><span></span>Cache latents</label>
+                        <label class="trainer-switch"><input data-dataset-field="isRegularization" data-dataset-index="${index}" type="checkbox"${settings.isRegularization ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Is regularization</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipX" data-dataset-index="${index}" type="checkbox"${settings.flipX ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Flip X</label>
+                        <label class="trainer-switch"><input data-dataset-field="flipY" data-dataset-index="${index}" type="checkbox"${settings.flipY ? ' checked' : ''}${isLayered() ? ' disabled' : ''}><span></span>Flip Y</label>
+                    </div>
+                </div>`;
+            const datasetMetrics = isLayered()
+                ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.psdTargetCount ?? null)}</strong><span>PSD targets</span></div><div class="trainer-dataset-metric"><strong>${metric(dataset.psdPairedCount ?? null)}</strong><span>with Control1</span></div><div class="trainer-dataset-metric"><strong>${metric(dataset.psdGenerationCount ?? null)}</strong><span>from scratch</span></div></div>`
+                : isChromaPreset(preset)
+                ? `<div class="trainer-dataset-metrics"><div class="trainer-dataset-metric"><strong>${metric(dataset.chromaImageCount ?? dataset.targetCount)}</strong><span>PNG/WebP images</span></div></div>`
+                : `<div class="trainer-dataset-metrics">
+                    <div class="trainer-dataset-metric"><strong>${metric(isH3() ? dataset.mediaTargetCount : dataset.targetCount)}</strong><span>targets</span></div>
+                    <div class="trainer-dataset-metric"><strong>${metric(isH3() ? dataset.mediaCaptionCount : dataset.captionCount)}</strong><span>captions</span></div>
+                    <div class="trainer-dataset-metric"><strong>${isQieJoint() && settings.rgbaControlMode === 'paired' ? 'RGB / RGBA' : metric(dataset.alphaCount)}</strong><span>${isQieJoint() && settings.rgbaControlMode === 'paired' ? 'target format' : 'alpha'}</span></div>
+                </div>`;
+            return `<article class="trainer-dataset-card" data-dataset-card="${index}">
+                <div class="trainer-dataset-title">
+                    <strong title="${escapeHtml(dataset.name)}">${escapeHtml(dataset.name)}</strong>
+                    <span title="${escapeHtml(dataset.targetPath)}">…/Datasets/${escapeHtml(dataset.name)}/img</span>
+                    <div class="trainer-dataset-paths"><span>Target · ${metric(isLayered() ? dataset.psdTargetCount ?? null : dataset.targetCount)}</span>${isLayered() ? '<span>PSD + optional Control1</span>' : controls}</div>
+                </div>
+                ${datasetMetrics}
+                ${datasetSettings}
+                <div class="trainer-dataset-actions">
+                    <button class="trainer-icon-btn" type="button" data-duplicate-dataset="${index}" aria-label="Duplicate ${escapeHtml(dataset.name)}" title="Duplicate dataset"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg></button>
+                    <button class="trainer-icon-btn trainer-remove-dataset" type="button" data-remove-dataset="${index}" aria-label="Remove ${escapeHtml(dataset.name)}" title="Remove dataset"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
+                </div>
+                ${warnings}
+            </article>`;
+        }).join('');
+        const selectedInspected = state.selectedDatasets.every(item => state.datasets.find(dataset => dataset.name === item.name)?.inspected);
+        const totalTargets = state.selectedDatasets.reduce((sum, item) => sum + (state.datasets.find(dataset => dataset.name === item.name)?.[isLayered() ? 'psdTargetCount' : 'targetCount'] || 0), 0);
+        $('trainer-dataset-summary').textContent = state.datasetsLoaded && selectedInspected
+            ? `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'} · ${totalTargets} target images`
+            : `${state.selectedDatasets.length} dataset${state.selectedDatasets.length === 1 ? '' : 's'}`;
+        renderDatasetPicker();
+        renderSamples();
+        renderValidationItems();
+        syncRgbaCacheState();
+    }
+
+    function updateDatasetSetting(input) {
+        const index = Number(input.dataset.datasetIndex);
+        const field = input.dataset.datasetField;
+        const dataset = state.selectedDatasets[index];
+        if (!dataset) return;
+        if (field === 'controls') {
+            const available = state.datasets.find(item => item.name === dataset.name);
+            const controls = new Set(dataset.controls ?? (available.mediaControls || available.controls).map(c => c.name));
+            input.checked ? controls.add(input.value) : controls.delete(input.value);
+            dataset.controls = [...controls];
+        } else if (field === 'resolution') {
+            const value = Number(input.value);
+            const resolutions = new Set(dataset.resolutions);
+            input.checked ? resolutions.add(value) : resolutions.delete(value);
+            dataset.resolutions = [...resolutions].sort((a, b) => a - b);
+        } else if (input.type === 'checkbox') {
+            dataset[field] = input.checked;
+        } else if (input.type === 'number') {
+            dataset[field] = field === 'batchSizeOverride' && input.value === '' ? '' : Number(input.value);
+        } else {
+            dataset[field] = input.value;
+        }
+    }
+
+    function selectedDatasetOptions(value) {
+        const names = [...new Set(state.selectedDatasets.map(item => item.name))];
+        return names.map(name => `<option value="${escapeHtml(name)}"${name === value ? ' selected' : ''}>${escapeHtml(name)}</option>`).join('');
+    }
+
+    function sampleControlPath(sample, controlIndex) {
+        return sample[`ctrlImg${controlIndex}`] || sample[`ctrl_img_${controlIndex}`] || '';
+    }
+
+    function sampleImagePreviewUrl(path) {
+        const filename = String(path || '').split(/[\\/]/).pop();
+        return filename ? `/api/trainer/sample-images/${encodeURIComponent(filename)}` : '';
+    }
+
+    function renderSampleImageSlot(sample, sampleIndex, controlIndex) {
+        const path = sampleControlPath(sample, controlIndex);
+        const addLabel = controlIndex === 1 ? 'Add Image 1' : `Add Additional Image ${controlIndex}`;
+        const preview = sampleImagePreviewUrl(path);
+        const previewContent = path
+            ? (isVideoPath(path) ? `<video src="${escapeHtml(preview)}" muted preload="metadata"></video>` : `<img src="${escapeHtml(preview)}" alt="Reference ${controlIndex}">`)
+            : `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>${escapeHtml(addLabel)}</strong><span>Click or drop</span>`;
+        return `<div class="trainer-sample-image-slot${path ? ' has-image' : ''}" data-sample-image-slot="${sampleIndex}-${controlIndex}">
+            <button class="trainer-sample-image-picker" type="button" data-pick-sample-image="${sampleIndex}-${controlIndex}" aria-label="${path ? 'Replace' : 'Add'} image to edit ${controlIndex}">${previewContent}</button>
+            ${path ? `<button class="trainer-sample-image-clear" type="button" data-clear-sample-image="${sampleIndex}-${controlIndex}" aria-label="Clear image to edit ${controlIndex}" title="Clear image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>` : ''}
+            <input class="hidden" type="file" accept="image/png,image/jpeg,image/webp${isH3() ? ',video/*' : ''}" data-sample-file="${sampleIndex}-${controlIndex}" tabindex="-1">
+            <div class="trainer-sample-upload-overlay hidden" aria-live="polite"><div class="trainer-sample-upload-track"><span></span></div><small>Uploading… <b>0%</b></small></div>
+        </div>`;
+    }
+
+    function renderSamples() {
+        const container = $('trainer-sample-items');
+        $('trainer-sample-count').textContent = `Sample prompts (${state.samples.length})`;
+        container.innerHTML = state.samples.map((sample, index) => `<article class="trainer-repeat-card trainer-sample-card">
+            <button class="trainer-icon-btn trainer-sample-remove" type="button" data-remove-sample="${index}" aria-label="Remove sample ${index + 1}" title="Remove sample"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
+            <div class="trainer-sample-editor">
+                <div class="trainer-sample-fields">
+                    <label class="trainer-field trainer-sample-instruction"><span>${isH3() ? 'Prompt' : 'Edit instruction'}</span><input data-sample-field="prompt" data-sample-index="${index}" type="text" value="${escapeHtml(sample.prompt || '')}" placeholder="${isH3() ? 'Describe the scene and audio' : 'Describe the edit'}" required></label>
+                    <div class="trainer-sample-parameters">
+                        <label class="trainer-field"><span>Width</span><input data-sample-field="width" data-sample-index="${index}" type="text" inputmode="numeric" value="${escapeHtml(sample.width ?? '')}" placeholder="${escapeHtml($('trainer-sample-width').value)} (default)"></label>
+                        <label class="trainer-field"><span>Height</span><input data-sample-field="height" data-sample-index="${index}" type="text" inputmode="numeric" value="${escapeHtml(sample.height ?? '')}" placeholder="${escapeHtml($('trainer-sample-height').value)} (default)"></label>
+                        <label class="trainer-field"><span>Seed</span><input data-sample-field="seed" data-sample-index="${index}" type="text" inputmode="numeric" value="${escapeHtml(sample.seed ?? '')}" placeholder="${escapeHtml(Number($('trainer-sample-seed').value) + ($('trainer-walk-seed').checked ? index : 0))} (default)"></label>
+                        <label class="trainer-field"><span>LoRA scale</span><input data-sample-field="networkMultiplier" data-sample-index="${index}" type="text" inputmode="decimal" value="${escapeHtml(sample.networkMultiplier ?? sample.network_multiplier ?? '')}" placeholder="1.0 (default)"></label>
+                    </div>
+                </div>
+                <fieldset class="trainer-sample-images"><legend>${isLayered() ? 'Optional flat Control1 (empty = from scratch)' : isH3() ? 'Optional references (image / video)' : 'Images to edit'}</legend><div>${(isLayered() ? [1] : [1, 2, 3]).map(controlIndex => renderSampleImageSlot(sample, index, controlIndex)).join('')}</div></fieldset>
+            </div>
+        </article>`).join('');
+    }
+
+    function renderSamplesPreservingPlace(focusSelector = '') {
+        const workspace = document.querySelector('.trainer-workspace');
+        const scrollTop = workspace?.scrollTop || 0;
+        const windowScrollX = window.scrollX;
+        const windowScrollY = window.scrollY;
+        renderSamples();
+        if (workspace) {
+            workspace.scrollTop = scrollTop;
+        }
+        window.scrollTo(windowScrollX, windowScrollY);
+        requestAnimationFrame(() => {
+            if (workspace) workspace.scrollTop = scrollTop;
+            window.scrollTo(windowScrollX, windowScrollY);
+            if (focusSelector) $('trainer-sample-items').querySelector(focusSelector)?.focus({ preventScroll: true });
+        });
+    }
+
+    function uploadSampleImage(input, droppedFile = null) {
+        const file = droppedFile || input.files?.[0];
+        if (!file) return;
+        const [sampleIndexText, controlIndexText] = input.dataset.sampleFile.split('-');
+        const sampleIndex = Number(sampleIndexText);
+        const controlIndex = Number(controlIndexText);
+        const validationControl = Boolean(input.closest('#trainer-validation-items'));
+        const sample = (validationControl ? state.validationItems : state.samples)[sampleIndex];
+        if (!sample) return;
+        const slot = input.closest('.trainer-sample-image-slot');
+        const overlay = slot.querySelector('.trainer-sample-upload-overlay');
+        const progressBar = overlay.querySelector('span');
+        const progressText = overlay.querySelector('b');
+        overlay.classList.remove('hidden');
+        const requestValue = new XMLHttpRequest();
+        requestValue.open('POST', '/api/trainer/sample-images');
+        requestValue.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const percent = Math.round((event.loaded / event.total) * 100);
+            progressBar.style.width = `${percent}%`;
+            progressText.textContent = `${percent}%`;
+        });
+        requestValue.addEventListener('load', () => {
+            let result = {};
+            try { result = JSON.parse(requestValue.responseText || '{}'); } catch (_) { /* handled below */ }
+            if (requestValue.status < 200 || requestValue.status >= 300 || !result.path) {
+                overlay.classList.add('hidden');
+                showToast(result.error || `Upload failed (${requestValue.status})`, true);
+                return;
+            }
+            sample[`ctrlImg${controlIndex}`] = result.path;
+            delete sample[`ctrl_img_${controlIndex}`];
+            if (validationControl) renderValidationItemsPreservingPlace();
+            else renderSamplesPreservingPlace(`[data-pick-sample-image="${sampleIndex}-${controlIndex}"]`);
+        });
+        requestValue.addEventListener('error', () => {
+            overlay.classList.add('hidden');
+            showToast('Sample image upload failed.', true);
+        });
+        const body = new FormData();
+        body.append('files', file);
+        requestValue.send(body);
+    }
+
+    function validationTargetPath(item) {
+        return item.targetPath || item.target_path || '';
+    }
+
+    function validationImagePreviewUrl(path) {
+        const filename = String(path || '').split(/[\\/]/).pop();
+        return filename ? `/api/trainer/validation-images/${encodeURIComponent(filename)}` : '';
+    }
+
+    function renderValidationImageSlot(item, index) {
+        const path = validationTargetPath(item);
+        const preview = validationImagePreviewUrl(path);
+        const previewContent = path
+            ? `<img src="${escapeHtml(preview)}" alt="RGBA validation target ${index + 1}">`
+            : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path></svg><strong>Upload RGB / RGBA target</strong><span>PNG, JPEG or WebP · click or drop</span>`;
+        return `<div class="trainer-sample-image-slot trainer-validation-image-slot${path ? ' has-image' : ''}" data-validation-image-slot="${index}">
+            <button class="trainer-sample-image-picker" type="button" data-pick-validation-image="${index}" aria-label="${path ? 'Replace' : 'Upload'} RGBA validation target">${previewContent}</button>
+            ${path ? `<button class="trainer-sample-image-clear" type="button" data-clear-validation-image="${index}" aria-label="Clear validation target" title="Clear image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>` : ''}
+            <input class="hidden" type="file" accept="image/png,image/jpeg,image/webp" data-validation-file="${index}" tabindex="-1">
+            <div class="trainer-sample-upload-overlay hidden" aria-live="polite"><div class="trainer-sample-upload-track"><span></span></div><small>Uploading… <b>0%</b></small></div>
+        </div>`;
+    }
+
+    function renderValidationItems() {
+        const container = $('trainer-validation-items');
+        if (!independentValidationUploads) {
+            container.innerHTML = state.validationItems.map((item, index) => `<article class="trainer-repeat-card">
+                <div class="trainer-repeat-card-heading"><strong>Validation image ${index + 1}</strong><button class="trainer-icon-btn" type="button" data-remove-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+                <div class="trainer-repeat-grid trainer-validation-item-grid">
+                    <label class="trainer-field"><span>Dataset</span><select data-validation-field="dataset" data-validation-index="${index}">${selectedDatasetOptions(item.dataset)}</select></label>
+                    <label class="trainer-field"><span>Target image</span><input data-validation-field="image" data-validation-index="${index}" type="text" value="${escapeHtml(item.image || '')}" placeholder="image.png"></label>
+                    <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}"></label>
+                </div>
+            </article>`).join('');
+            return;
+        }
+        container.innerHTML = state.validationItems.map((item, index) => `<article class="trainer-repeat-card">
+            <div class="trainer-repeat-card-heading"><strong>Validation image ${index + 1}</strong><button class="trainer-icon-btn" type="button" data-remove-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+            <div class="trainer-validation-item-editor">
+                ${renderValidationImageSlot(item, index)}
+                <div class="trainer-repeat-grid trainer-validation-item-grid">
+                    ${selectedPreset() === 'transparent_lora' ? `<label class="trainer-field"><span>Validation mode</span><select data-validation-field="mode" data-validation-index="${index}">${isQieJoint() ? `<option value="paired"${item.mode === 'paired' ? ' selected' : ''}>Paired edit · RGB / RGBA</option>` : ''}<option value="generation"${(item.mode || 'generation') === 'generation' ? ' selected' : ''}>${isH3() ? 'Generation from captions' : 'Generation · black control'}</option><option value="edit"${item.mode === 'edit' ? ' selected' : ''}>Edit · automatic opaque control</option></select></label>` : ''}
+                    ${item.mode === 'paired' ? `<fieldset class="trainer-sample-images"><legend>Input Controls (required)</legend><div>${[1, 2, 3].map(controlIndex => renderSampleImageSlot(item, index, controlIndex)).join('')}</div></fieldset>` : ''}
+                    <label class="trainer-field trainer-repeat-prompt"><span>Prompt</span><input data-validation-field="prompt" data-validation-index="${index}" type="text" value="${escapeHtml(item.prompt || '')}" placeholder="Optional validation prompt"></label>
+                    <p>${item.mode === 'paired' ? 'Full latent loss measures the edit result. Alpha metrics are reported separately; RGB targets have opaque alpha. Check sample images for instruction following.' : 'PASS/FAIL is calculated against this image’s alpha channel at every selected sigma; the worst result decides the image status.'}</p>
+                </div>
+            </div>
+        </article>`).join('');
+    }
+
+    function renderValidationItemsPreservingPlace() {
+        const workspace = document.querySelector('.trainer-workspace');
+        const scrollTop = workspace?.scrollTop || 0;
+        renderValidationItems();
+        if (workspace) workspace.scrollTop = scrollTop;
+        requestAnimationFrame(() => { if (workspace) workspace.scrollTop = scrollTop; });
+    }
+
+    function uploadValidationImage(input, droppedFile = null) {
+        const file = droppedFile || input.files?.[0];
+        if (!file) return;
+        const index = Number(input.dataset.validationFile);
+        const item = state.validationItems[index];
+        if (!item) return;
+        const slot = input.closest('.trainer-validation-image-slot');
+        const overlay = slot.querySelector('.trainer-sample-upload-overlay');
+        const progressBar = overlay.querySelector('span');
+        const progressText = overlay.querySelector('b');
+        overlay.classList.remove('hidden');
+        const requestValue = new XMLHttpRequest();
+        requestValue.open('POST', '/api/trainer/validation-images');
+        requestValue.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const percent = Math.round((event.loaded / event.total) * 100);
+            progressBar.style.width = `${percent}%`;
+            progressText.textContent = `${percent}%`;
+        });
+        requestValue.addEventListener('load', () => {
+            let result = {};
+            try { result = JSON.parse(requestValue.responseText || '{}'); } catch (_) { /* handled below */ }
+            if (requestValue.status < 200 || requestValue.status >= 300 || !result.path) {
+                overlay.classList.add('hidden');
+                showToast(result.error || `Upload failed (${requestValue.status})`, true);
+                return;
+            }
+            item.targetPath = result.path;
+            item.targetName = file.name;
+            delete item.target_path;
+            delete item.dataset;
+            delete item.image;
+            renderValidationItemsPreservingPlace();
+        });
+        requestValue.addEventListener('error', () => {
+            overlay.classList.add('hidden');
+            showToast('Validation target upload failed.', true);
+        });
+        const body = new FormData();
+        body.append('files', file);
+        requestValue.send(body);
+    }
+
+    function chromaValidationPreview(path) {
+        const filename = String(path || '').split(/[\\/]/).pop();
+        return filename ? `/api/trainer/chromakey-validation-images/${encodeURIComponent(filename)}` : '';
+    }
+
+    function renderChromaValidationItems() {
+        const container = $('trainer-chroma-validation-items');
+        if (!container) return;
+        if (!state.chromaValidationItems.length) {
+            container.innerHTML = '<div class="trainer-empty-datasets"><strong>No visual validation images</strong><span>Upload real chroma-background inputs to generate periodic RGB / cutout / alpha previews.</span></div>';
+            return;
+        }
+        container.innerHTML = state.chromaValidationItems.map((item, index) => `
+            <article class="trainer-repeat-card">
+                <div class="trainer-repeat-card-heading"><strong>${escapeHtml(item.name || `Validation image ${index + 1}`)}</strong><button class="trainer-icon-btn" type="button" data-remove-chroma-validation="${index}" aria-label="Remove validation image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+                <div class="trainer-validation-item-editor"><div class="trainer-sample-image-slot has-image"><img src="${escapeHtml(chromaValidationPreview(item.path))}" alt="${escapeHtml(item.name || 'ChromaKey validation image')}"></div><p class="trainer-help">Inference-only; never used for gradients.</p></div>
+            </article>`).join('');
+    }
+
+    async function uploadChromaValidationFiles(files) {
+        for (const file of files) {
+            const body = new FormData();
+            body.append('files', file);
+            try {
+                const response = await fetch('/api/trainer/chromakey-validation-images', { method: 'POST', body });
+                const result = await response.json();
+                if (!response.ok || !result.path) throw new Error(result.error || `Upload failed (${response.status})`);
+                state.chromaValidationItems.push({ path: result.path, name: file.name });
+                renderChromaValidationItems();
+            } catch (error) {
+                showToast(error.message, true);
+            }
+        }
+    }
+
+    function selectedChromaResolutions() {
+        return Array.from(document.querySelectorAll('#trainer-chroma-resolutions input:checked')).map(input => Number(input.value));
+    }
+
+    function setChromaResolutions(values) {
+        const selected = new Set((values || []).map(Number));
+        document.querySelectorAll('#trainer-chroma-resolutions input').forEach(input => {
+            input.checked = selected.has(Number(input.value));
+        });
+    }
+
+    function updateRepeatedItem(input, collection, indexKey, fieldKey) {
+        const item = collection[Number(input.dataset[indexKey])];
+        if (!item) return;
+        const field = input.dataset[fieldKey];
+        item[field] = input.type === 'number' ? (input.value === '' ? '' : Number(input.value)) : input.value;
+    }
+
+    function renderConditionalOptions() {
+        $('trainer-lokr-factor-field').classList.toggle('hidden', $('trainer-network-type').value !== 'lokr');
+        $('trainer-rank-field').classList.toggle('hidden', $('trainer-network-type').value !== 'lora');
+        $('trainer-ema-decay-field').classList.toggle('hidden', !$('trainer-use-ema').checked);
+        $('trainer-dop-options').classList.toggle('hidden', !$('trainer-dop').checked);
+        $('trainer-bpp-options').classList.toggle('hidden', !$('trainer-bpp').checked);
+        $('trainer-guidance-loss-options').classList.toggle('hidden', !$('trainer-guidance-loss').checked);
+        $('trainer-differential-guidance-options').classList.toggle('hidden', !$('trainer-differential-guidance').checked);
+        $('trainer-validation-options').classList.toggle('hidden', !$('trainer-validation-enabled').checked);
+        syncOffloadingControls();
+    }
+
+    function syncOffloadingControls() {
+        const offloadingEnabled = $('trainer-layer-offloading').checked;
+        $('trainer-offload-sliders').classList.toggle('hidden', !offloadingEnabled);
+        $('trainer-transformer-offload').disabled = !offloadingEnabled;
+        $('trainer-text-offload').disabled = !offloadingEnabled;
+    }
+
+    function syncSlider(id) {
+        const input = $(id);
+        const min = Number(input.min || 0);
+        const max = Number(input.max || 100);
+        const value = Math.min(max, Math.max(min, Number(input.value) || 0));
+        const percent = max === min ? 0 : ((value - min) / (max - min)) * 100;
+        input.value = String(value);
+        input.style.setProperty('--slider-fill', `${percent}%`);
+        $(`${id}-value`).textContent = String(Math.round(value));
+    }
+
+    function numberValue(id) { return Number($(id).value); }
+    function checked(id) { return $(id).checked; }
+
+    function collectForm(includeAdvanced = true) {
+        const isVae = isVaePreset(selectedPreset());
+        const payload = {
+            name: $('trainer-name').value.trim(),
+            gpuIds: $('trainer-gpu').value,
+            trainingPreset: selectedPreset(),
+            triggerWord: $('trainer-trigger').value.trim(),
+            model: selectedModel()?.key || 'qwen_image_edit_2511',
+            modelPath: $('trainer-model-path').value.trim(),
+            vaePath: $('trainer-vae-path').value.trim(),
+            sampleLoraPath: $('trainer-sample-lora-path').value.trim(),
+            rgbaEdgeCorrection: $('trainer-rgba-edge-correction').value,
+            rgbaEdgeWidth: numberValue('trainer-rgba-edge-width'),
+            rgbaAlphaThreshold: numberValue('trainer-rgba-alpha-threshold'),
+            rgbaLoraLossAlpha: numberValue('trainer-rgba-lora-alpha-loss'),
+            rgbaLoraLossAlphaEdge: numberValue('trainer-rgba-lora-edge-loss'),
+            qtype: $('trainer-qtype').value,
+            qtypeTextEncoder: $('trainer-qtype-te').value,
+            lowVram: checked('trainer-low-vram'),
+            matchTargetResolution: checked('trainer-match-resolution'),
+            alignReferenceDimensions: checked('trainer-qi2-align-references'),
+            nativeRgba: isLayered() || (Boolean(selectedModel()?.nativeRgba) && checked('trainer-native-rgba')),
+            layerSlots: numberValue('trainer-layer-slots'),
+            compileModel: checked('trainer-compile'),
+            networkType: $('trainer-network-type').value,
+            rank: numberValue('trainer-rank'),
+            lokrFactor: numberValue('trainer-lokr-factor'),
+            saveDtype: $('trainer-save-dtype').value,
+            maxSaves: numberValue(isVae ? 'trainer-vae-max-saves' : 'trainer-max-saves'),
+            batchSize: numberValue(isVae ? 'trainer-vae-batch-size' : 'trainer-batch-size'),
+            gradientAccumulation: numberValue(isVae ? 'trainer-vae-gradient-accumulation' : 'trainer-gradient-accumulation'),
+            steps: numberValue(isVae ? 'trainer-vae-steps' : 'trainer-steps'),
+            learningRate: numberValue(isVae ? 'trainer-vae-learning-rate' : 'trainer-learning-rate'),
+            optimizer: $('trainer-optimizer').value,
+            weightDecay: numberValue(isVae ? 'trainer-vae-weight-decay' : 'trainer-weight-decay'),
+            timestepType: $('trainer-timestep').value,
+            timestepBias: $('trainer-timestep-bias').value,
+            lossType: $('trainer-loss').value,
+            saveEvery: numberValue(isVae ? 'trainer-vae-save-every' : 'trainer-save-every'),
+            cacheTextEmbeddings: checked('trainer-cache-text'),
+            unloadTextEncoder: checked('trainer-unload-text'),
+            useEma: checked('trainer-use-ema'),
+            emaDecay: numberValue('trainer-ema-decay'),
+            diffOutputPreservation: checked('trainer-dop'),
+            dopMultiplier: numberValue('trainer-dop-multiplier'),
+            dopClass: $('trainer-dop-class').value.trim(),
+            blankPromptPreservation: checked('trainer-bpp'),
+            bppMultiplier: numberValue('trainer-bpp-multiplier'),
+            guidanceLoss: checked('trainer-guidance-loss'),
+            guidanceLossTarget: numberValue('trainer-guidance-loss-target'),
+            differentialGuidance: checked('trainer-differential-guidance'),
+            differentialGuidanceScale: numberValue('trainer-differential-guidance-scale'),
+            validationEnabled: checked('trainer-validation-enabled'),
+            validateEvery: numberValue('trainer-validation-every'),
+            validationResolution: numberValue('trainer-validation-resolution'),
+            validationSigmas: $('trainer-validation-sigmas').value.split(',').map(Number),
+            validationItems: state.validationItems.map(item => ({ ...item })),
+            sampleEvery: numberValue('trainer-sample-every'),
+            sampleStartStep: numberValue('trainer-sample-start'),
+            sampler: $('trainer-sampler').value,
+            guidanceScale: numberValue('trainer-guidance-scale'),
+            sampleSteps: numberValue('trainer-sample-steps'),
+            sampleWidth: numberValue('trainer-sample-width'),
+            sampleHeight: numberValue('trainer-sample-height'),
+            sampleSeed: numberValue('trainer-sample-seed'),
+            walkSeed: checked('trainer-walk-seed'),
+            skipFirstSample: checked('trainer-skip-first-sample'),
+            forceFirstSample: checked('trainer-force-first-sample'),
+            disableSampling: checked('trainer-disable-sampling'),
+            samples: state.samples.map(item => ({ ...item })),
+            layerOffloading: checked('trainer-layer-offloading'),
+            transformerOffload: numberValue('trainer-transformer-offload') / 100,
+            textEncoderOffload: numberValue('trainer-text-offload') / 100,
+            datasets: state.selectedDatasets.map(item => ({ ...item, resolutions: [...item.resolutions] })),
+            sourceVaePath: $('trainer-source-vae-path').value.trim(),
+            sourceVaeSubfolder: $('trainer-source-vae-subfolder').value.trim(),
+            sourceVaeLocalOnly: checked('trainer-source-vae-local'),
+            vaeResolution: numberValue('trainer-vae-resolution'),
+            vaeTrainScope: $('trainer-vae-scope').value,
+            vaeDtype: $('trainer-vae-dtype').value,
+            vaeAlphaLrMultiplier: numberValue('trainer-vae-alpha-lr'),
+            vaeWorkers: numberValue('trainer-vae-workers'),
+            vaeMaxGradNorm: numberValue('trainer-vae-max-grad'),
+            vaeValidateEvery: numberValue('trainer-vae-validate-every'),
+            vaeValidationMaxImages: numberValue('trainer-vae-validation-images'),
+            vaeRequiredPasses: numberValue('trainer-vae-required-passes'),
+            vaeGradientCheckpointing: checked('trainer-vae-gradient-checkpointing'),
+            vaeStopWhenReady: checked('trainer-vae-stop-ready'),
+            vaeComfyExport: checked('trainer-vae-comfy-export'),
+            chromaBatchSize: numberValue('trainer-chroma-batch-size'),
+            chromaMegapixelsPerBatch: numberValue('trainer-chroma-megapixels'),
+            chromaGradientAccumulation: numberValue('trainer-chroma-gradient-accumulation'),
+            chromaSteps: numberValue('trainer-chroma-steps'),
+            chromaCleanSteps: numberValue('trainer-chroma-clean-steps'),
+            chromaWarmupSteps: numberValue('trainer-chroma-warmup'),
+            chromaLearningRate: numberValue('trainer-chroma-learning-rate'),
+            chromaMaxGradNorm: numberValue('trainer-chroma-max-grad'),
+            chromaSeed: numberValue('trainer-chroma-seed'),
+            chromaSaveEvery: numberValue('trainer-chroma-save-every'),
+            chromaValidateEvery: numberValue('trainer-chroma-validate-every'),
+            chromaValidationMaxSide: numberValue('trainer-chroma-validation-max-side'),
+            chromaAnalyticPercent: numberValue('trainer-chroma-analytic-percent'),
+            chromaDetailCropPercent: numberValue('trainer-chroma-detail-crop'),
+            chromaLossAlpha: numberValue('trainer-chroma-loss-alpha'),
+            chromaLossClassification: numberValue('trainer-chroma-loss-classification'),
+            chromaLossGradient: numberValue('trainer-chroma-loss-gradient'),
+            chromaLossConsistency: numberValue('trainer-chroma-loss-consistency'),
+            chromaGreenChance: numberValue('trainer-chroma-green-chance'),
+            chromaBlueChance: numberValue('trainer-chroma-blue-chance'),
+            chromaWhiteChance: numberValue('trainer-chroma-white-chance'),
+            chromaBlackChance: numberValue('trainer-chroma-black-chance'),
+            chromaNoiseStrength: numberValue('trainer-chroma-noise-strength'),
+            chromaJpegChance: numberValue('trainer-chroma-jpeg'),
+            chromaSpillChance: numberValue('trainer-chroma-spill-chance'),
+            chromaDtype: $('trainer-chroma-dtype').value,
+            chromaResolutions: selectedChromaResolutions(),
+            chromaValidationItems: state.chromaValidationItems.map(item => ({ ...item })),
+        };
+        if (isH3()) Object.assign(payload, h3.collect());
+        if (includeAdvanced && checked('trainer-use-advanced-config') && $('trainer-advanced-config-json').value.trim()) {
+            payload.advancedProcess = $('trainer-advanced-config-json').value.trim();
+        }
+        return payload;
+    }
+
+    function validateForm(payload) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(payload.name)) return 'Training name must use letters, numbers, dots, underscores or hyphens.';
+        if (payload.trainingPreset === 'qwen_layered_lora' && (!Number.isInteger(payload.layerSlots) || payload.layerSlots < 1 || payload.layerSlots > 20)) return 'Layer slots must be an integer from 1 to 20.';
+        if (isVaePreset(payload.trainingPreset) && !payload.sourceVaePath) return 'Enter the standard VAE repository or local source path.';
+        if (!isVaePreset(payload.trainingPreset) && !isChromaPreset(payload.trainingPreset) && !payload.modelPath) return 'Enter a Hugging Face model name or local path.';
+        if (payload.trainingPreset === 'transparent_lora' && !payload.vaePath) return 'Select a compatible RGBA VAE path.';
+        if (!payload.datasets.length) return 'Select at least one dataset.';
+        const invalidBatch = payload.datasets.find(dataset => {
+            const value = dataset.batchSizeOverride;
+            return value !== undefined && value !== null && value !== ''
+                && (!Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > (payload.trainingPreset === 'qwen_layered_lora' ? 1 : 128));
+        });
+        if (invalidBatch) return `Batch size override for ${invalidBatch.name} must be an integer from 1 to ${payload.trainingPreset === 'qwen_layered_lora' ? 1 : 128}, or empty to use the global value.`;
+        if (payload.trainingPreset === 'transparent_lora' && !(payload.model === 'minimax_h3_ref2va' && payload.distillationMethod === 'dopsd')) {
+            const missingBackground = payload.datasets.find(dataset =>
+                dataset.rgbaControlMode === 'edit' && !dataset.rgbaBackgroundDataset
+            );
+            if (missingBackground) return `Select a background dataset for ${missingBackground.name}.`;
+            // Pair completeness is checked against current files by the save API.
+            // A missing/stale inspection field must never block saving locally.
+        }
+        if (isChromaPreset(payload.trainingPreset) && !payload.chromaResolutions.length) return 'Select at least one ChromaKey training resolution.';
+        if (isChromaPreset(payload.trainingPreset) && payload.chromaGreenChance + payload.chromaBlueChance + payload.chromaWhiteChance + payload.chromaBlackChance <= 0) return 'Set at least one background colour chance above zero.';
+        const noResolutions = (isVaePreset(payload.trainingPreset) || isChromaPreset(payload.trainingPreset)) ? null : payload.datasets.find(dataset => !dataset.resolutions.length);
+        if (noResolutions) return `Select at least one resolution for ${noResolutions.name}.`;
+        if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling && !payload.samples.length) return 'Add at least one sample prompt or disable sampling.';
+        if (!isChromaPreset(payload.trainingPreset) && !payload.disableSampling) {
+            const sampleWithoutImage = h3.isH3(payload.model) || payload.model === 'qwen_image_2' || payload.trainingPreset === 'transparent_lora' ? null : payload.samples.find(sample => ![1, 2, 3].some(index => sampleControlPath(sample, index)) && !sample.image);
+            if (sampleWithoutImage) return 'Add at least one image to edit for every sample.';
+            const sampleWithoutInstruction = payload.samples.find(sample => [1, 2, 3].some(index => sampleControlPath(sample, index)) && !String(sample.prompt || '').trim());
+            if (sampleWithoutInstruction) return 'Enter an edit instruction for every sample.';
+        }
+        if (payload.validationEnabled && !payload.validationItems.length) return 'Add at least one validation image.';
+        if (payload.validationEnabled && independentValidationUploads) {
+            const missingValidationTarget = payload.validationItems.find(item =>
+                !validationTargetPath(item) && !(item.dataset && item.image)
+            );
+            if (missingValidationTarget) return 'Upload a target for every validation image.';
+            const missingPair = payload.validationItems.find(item => item.mode === 'paired'
+                && (![1, 2, 3].some(index => sampleControlPath(item, index)) || !String(item.prompt || '').trim()));
+            if (missingPair) return 'Paired validation requires input Controls and an edit instruction.';
+        }
+        if (payload.advancedProcess) {
+            try { JSON.parse(payload.advancedProcess); } catch (error) { return `Advanced process JSON is invalid: ${error.message}`; }
+        }
+        return '';
+    }
+
+    async function saveJob(queueAfter = false) {
+        const payload = collectForm();
+        const error = validateForm(payload);
+        if (error) { showFormError(error); return; }
+        showFormError('');
+        setSaving(true);
+        try {
+            const url = state.editingJobId ? `/api/trainer/jobs/${state.editingJobId}` : '/api/trainer/jobs';
+            const method = state.editingJobId ? 'PUT' : 'POST';
+            const result = await api(url, { method, body: JSON.stringify(payload) });
+            let savedJob = result.job;
+            (result.datasets || []).forEach(dataset => {
+                const inspected = { ...dataset, inspected: true };
+                const index = state.datasets.findIndex(item => item.name === dataset.name);
+                if (index >= 0) state.datasets[index] = inspected;
+                else state.datasets.push(inspected);
+            });
+            if (queueAfter) {
+                const queued = await api(`/api/trainer/jobs/${savedJob.id}/start`, { method: 'POST' });
+                savedJob = queued.job || savedJob;
+            }
+            const existingIndex = state.jobs.findIndex(job => job.id === savedJob.id);
+            if (existingIndex >= 0) state.jobs[existingIndex] = savedJob;
+            else state.jobs.unshift(savedJob);
+            state.selectedJobId = savedJob.id;
+            state.editingJobId = null;
+            showDetail(savedJob.id);
+            showToast(queueAfter ? 'Job saved and added to the queue.' : 'Training job saved.');
+        } catch (errorValue) {
+            showFormError(errorValue.message);
+        } finally {
+            setSaving(false);
+        }
+    }
+
+    function setSaving(saving) {
+        $('trainer-save-btn').disabled = saving;
+        $('trainer-save-start-btn').disabled = saving;
+        $('trainer-save-btn').textContent = saving ? 'Saving…' : 'Save job';
+    }
+
+    function setInput(id, value) {
+        if (value === undefined || value === null) return;
+        const input = $(id);
+        if (input.type === 'checkbox') input.checked = Boolean(value);
+        else input.value = String(value);
+    }
+
+    function populateForm(payload = {}) {
+        const defaults = {
+            name: 'qdm_edit_lora_v1', gpuIds: '0', trainingPreset: 'standard_lora', triggerWord: '', model: state.models[0]?.key || 'qwen_image_edit_2511',
+            modelPath: '', qtype: 'qfloat8', qtypeTextEncoder: 'qfloat8', lowVram: true,
+            matchTargetResolution: false, alignReferenceDimensions: true, compileModel: false, networkType: 'lora', rank: 32, lokrFactor: -1, saveDtype: 'bf16', maxSaves: 4,
+            batchSize: 1, gradientAccumulation: 1, steps: 3000, learningRate: 0.0001, optimizer: 'adamw8bit',
+            weightDecay: 0.0001, timestepType: 'weighted', timestepBias: 'balanced', lossType: 'mse', saveEvery: 250,
+            cacheTextEmbeddings: false, unloadTextEncoder: false, useEma: false, emaDecay: 0.99,
+            diffOutputPreservation: false, dopMultiplier: 1, dopClass: 'person', blankPromptPreservation: false,
+            bppMultiplier: 1, guidanceLoss: false, guidanceLossTarget: 4, differentialGuidance: false,
+            differentialGuidanceScale: 3, validationEnabled: false, validateEvery: 1, validationResolution: 1024,
+            validationSigmas: [0.5], validationItems: [], sampleEvery: 250, sampleStartStep: 0,
+            sampler: 'flowmatch', guidanceScale: 4, sampleSteps: 30, sampleWidth: 1024, sampleHeight: 1024,
+            sampleSeed: 42, walkSeed: true, skipFirstSample: false, forceFirstSample: false, disableSampling: true, samples: [],
+            layerOffloading: false, transformerOffload: 1, textEncoderOffload: 1, advancedProcess: '', datasets: [],
+            vaePath: null, sampleLoraPath: null, rgbaEdgeCorrection: 'matte_despill', rgbaEdgeWidth: 3, rgbaAlphaThreshold: 1 / 255,
+            rgbaLoraLossAlpha: 1, rgbaLoraLossAlphaEdge: 0.5,
+            sourceVaePath: 'Qwen/Qwen-Image-Edit-2511', sourceVaeSubfolder: 'vae', sourceVaeLocalOnly: false,
+            vaeResolution: 512, vaeTrainScope: 'full', vaeDtype: 'bf16', vaeAlphaLrMultiplier: 10,
+            vaeWorkers: 2, vaeMaxGradNorm: 1, vaeValidateEvery: 250, vaeValidationMaxImages: 32,
+            vaeRequiredPasses: 2, vaeGradientCheckpointing: true, vaeStopWhenReady: false, vaeComfyExport: true,
+            chromaBatchSize: 4,
+            chromaMegapixelsPerBatch: 1,
+            chromaGradientAccumulation: 3,
+            chromaSteps: 50000,
+            chromaCleanSteps: 10000,
+            chromaWarmupSteps: 1000,
+            chromaLearningRate: 0.0004,
+            chromaMaxGradNorm: 1,
+            chromaSeed: 42,
+            chromaSaveEvery: 500,
+            chromaValidateEvery: 250,
+            chromaValidationMaxSide: 4096,
+            chromaAnalyticPercent: 20,
+            chromaDetailCropPercent: 70,
+            chromaLossAlpha: 5,
+            chromaLossClassification: 1,
+            chromaLossGradient: 0.5,
+            chromaLossConsistency: 0.25,
+            chromaGreenChance: 70,
+            chromaBlueChance: 30,
+            chromaWhiteChance: 0,
+            chromaBlackChance: 0,
+            chromaNoiseStrength: 0.01,
+            chromaJpegChance: 20,
+            chromaSpillChance: 35,
+            chromaDtype: 'bf16', chromaResolutions: [512], chromaValidationItems: [],
+        };
+        const data = { ...defaults, ...(state.models.find(model => model.key === payload.model)?.defaults || {}), ...payload };
+        h3.populate(data);
+        setInput('trainer-name', data.name);
+        setInput('trainer-gpu', data.gpuIds);
+        setInput('trainer-preset', data.trainingPreset);
+        setInput('trainer-trigger', data.triggerWord);
+        setTrainingChoice(data.model, data.trainingPreset);
+        renderModelFields();
+        setInput('trainer-model-path', data.modelPath || selectedModel()?.modelPath || '');
+        setInput('trainer-vae-path', data.vaePath);
+        setInput('trainer-sample-lora-path', data.sampleLoraPath);
+        setInput('trainer-rgba-edge-correction', data.rgbaEdgeCorrection);
+        setInput('trainer-rgba-edge-width', data.rgbaEdgeWidth);
+        setInput('trainer-rgba-alpha-threshold', data.rgbaAlphaThreshold);
+        setInput('trainer-rgba-lora-alpha-loss', data.rgbaLoraLossAlpha);
+        setInput('trainer-rgba-lora-edge-loss', data.rgbaLoraLossAlphaEdge);
+        setInput('trainer-qtype', data.qtype);
+        setInput('trainer-qtype-te', data.qtypeTextEncoder);
+        setInput('trainer-low-vram', data.lowVram);
+        setInput('trainer-match-resolution', data.matchTargetResolution);
+        setInput('trainer-qi2-align-references', data.alignReferenceDimensions);
+        setInput('trainer-native-rgba', data.nativeRgba || false);
+        setInput('trainer-layer-slots', data.layerSlots ?? 4);
+        setInput('trainer-compile', data.compileModel);
+        setInput('trainer-network-type', data.networkType);
+        setInput('trainer-rank', data.rank);
+        setInput('trainer-lokr-factor', data.lokrFactor);
+        setInput('trainer-save-dtype', data.saveDtype);
+        setInput('trainer-max-saves', data.maxSaves);
+        const isVaeData = isVaePreset(data.trainingPreset);
+        setInput('trainer-vae-batch-size', isVaeData ? data.batchSize : 1);
+        setInput('trainer-vae-gradient-accumulation', isVaeData ? data.gradientAccumulation : 1);
+        setInput('trainer-vae-steps', isVaeData ? data.steps : 5000);
+        setInput('trainer-vae-learning-rate', isVaeData ? data.learningRate : 0.00001);
+        setInput('trainer-vae-weight-decay', isVaeData ? data.weightDecay : 0);
+        setInput('trainer-vae-save-every', isVaeData ? data.saveEvery : 250);
+        setInput('trainer-vae-max-saves', isVaeData ? data.maxSaves : 4);
+        setInput('trainer-batch-size', data.batchSize);
+        setInput('trainer-gradient-accumulation', data.gradientAccumulation);
+        setInput('trainer-steps', data.steps);
+        setInput('trainer-learning-rate', data.learningRate);
+        setInput('trainer-optimizer', data.optimizer);
+        setInput('trainer-weight-decay', data.weightDecay);
+        setInput('trainer-timestep', data.timestepType);
+        setInput('trainer-timestep-bias', data.timestepBias);
+        setInput('trainer-loss', data.lossType);
+        setInput('trainer-save-every', data.saveEvery);
+        setInput('trainer-cache-text', data.cacheTextEmbeddings);
+        setInput('trainer-unload-text', data.unloadTextEncoder);
+        setInput('trainer-use-ema', data.useEma);
+        setInput('trainer-ema-decay', data.emaDecay);
+        setInput('trainer-dop', data.diffOutputPreservation);
+        setInput('trainer-dop-multiplier', data.dopMultiplier);
+        setInput('trainer-dop-class', data.dopClass);
+        setInput('trainer-bpp', data.blankPromptPreservation);
+        setInput('trainer-bpp-multiplier', data.bppMultiplier);
+        setInput('trainer-guidance-loss', data.guidanceLoss);
+        setInput('trainer-guidance-loss-target', data.guidanceLossTarget);
+        setInput('trainer-differential-guidance', data.differentialGuidance);
+        setInput('trainer-differential-guidance-scale', data.differentialGuidanceScale);
+        setInput('trainer-validation-enabled', data.validationEnabled);
+        setInput('trainer-validation-every', data.validateEvery);
+        setInput('trainer-validation-resolution', data.validationResolution);
+        setInput('trainer-validation-sigmas', (data.validationSigmas || [0.5]).join(','));
+        setInput('trainer-sample-every', data.sampleEvery);
+        setInput('trainer-sample-start', data.sampleStartStep);
+        setInput('trainer-sampler', data.sampler);
+        setInput('trainer-guidance-scale', data.guidanceScale);
+        setInput('trainer-sample-steps', data.sampleSteps);
+        setInput('trainer-sample-width', data.sampleWidth);
+        setInput('trainer-sample-height', data.sampleHeight);
+        setInput('trainer-sample-seed', data.sampleSeed);
+        setInput('trainer-walk-seed', data.walkSeed);
+        setInput('trainer-skip-first-sample', data.skipFirstSample);
+        setInput('trainer-force-first-sample', data.forceFirstSample);
+        setInput('trainer-disable-sampling', data.disableSampling ?? !data.sampleEnabled);
+        setInput('trainer-source-vae-path', data.sourceVaePath);
+        setInput('trainer-source-vae-subfolder', data.sourceVaeSubfolder);
+        setInput('trainer-source-vae-local', data.sourceVaeLocalOnly);
+        setInput('trainer-vae-resolution', data.vaeResolution);
+        setInput('trainer-vae-scope', data.vaeTrainScope);
+        setInput('trainer-vae-dtype', data.vaeDtype);
+        setInput('trainer-vae-alpha-lr', data.vaeAlphaLrMultiplier);
+        setInput('trainer-vae-workers', data.vaeWorkers);
+        setInput('trainer-vae-max-grad', data.vaeMaxGradNorm);
+        setInput('trainer-vae-validate-every', data.vaeValidateEvery);
+        setInput('trainer-vae-validation-images', data.vaeValidationMaxImages);
+        setInput('trainer-vae-required-passes', data.vaeRequiredPasses);
+        setInput('trainer-vae-gradient-checkpointing', data.vaeGradientCheckpointing);
+        setInput('trainer-vae-stop-ready', data.vaeStopWhenReady);
+        setInput('trainer-vae-comfy-export', data.vaeComfyExport);
+        const chromaInputs = {
+            'trainer-chroma-batch-size': data.chromaBatchSize,
+            'trainer-chroma-megapixels': data.chromaMegapixelsPerBatch,
+            'trainer-chroma-gradient-accumulation': data.chromaGradientAccumulation,
+            'trainer-chroma-steps': data.chromaSteps,
+            'trainer-chroma-clean-steps': data.chromaCleanSteps,
+            'trainer-chroma-warmup': data.chromaWarmupSteps,
+            'trainer-chroma-learning-rate': data.chromaLearningRate,
+            'trainer-chroma-max-grad': data.chromaMaxGradNorm,
+            'trainer-chroma-seed': data.chromaSeed,
+            'trainer-chroma-save-every': data.chromaSaveEvery,
+            'trainer-chroma-validate-every': data.chromaValidateEvery,
+            'trainer-chroma-validation-max-side': data.chromaValidationMaxSide,
+            'trainer-chroma-analytic-percent': data.chromaAnalyticPercent,
+            'trainer-chroma-detail-crop': data.chromaDetailCropPercent,
+            'trainer-chroma-loss-alpha': data.chromaLossAlpha,
+            'trainer-chroma-loss-classification': data.chromaLossClassification,
+            'trainer-chroma-loss-gradient': data.chromaLossGradient,
+            'trainer-chroma-loss-consistency': data.chromaLossConsistency,
+            'trainer-chroma-green-chance': data.chromaGreenChance,
+            'trainer-chroma-blue-chance': data.chromaBlueChance,
+            'trainer-chroma-white-chance': data.chromaWhiteChance,
+            'trainer-chroma-black-chance': data.chromaBlackChance,
+            'trainer-chroma-noise-strength': data.chromaNoiseStrength,
+            'trainer-chroma-jpeg': data.chromaJpegChance,
+            'trainer-chroma-spill-chance': data.chromaSpillChance,
+            'trainer-chroma-dtype': data.chromaDtype,
+        };
+        Object.entries(chromaInputs).forEach(([id, value]) => setInput(id, value));
+        setChromaResolutions(data.chromaResolutions);
+        setInput('trainer-layer-offloading', data.layerOffloading);
+        setInput('trainer-transformer-offload', Number(data.transformerOffload) * 100);
+        setInput('trainer-text-offload', Number(data.textEncoderOffload) * 100);
+        syncSlider('trainer-transformer-offload');
+        syncSlider('trainer-text-offload');
+        const advancedText = typeof data.advancedProcess === 'string' ? data.advancedProcess : (data.advancedProcess ? JSON.stringify(data.advancedProcess, null, 2) : '');
+        setInput('trainer-advanced-config-json', advancedText);
+        setInput('trainer-use-advanced-config', Boolean(advancedText));
+        state.selectedDatasets = [];
+        (data.datasets || []).forEach(dataset => addDataset(dataset.name, dataset, true));
+        state.samples = (data.samples || []).map(sample => ({ ...sample }));
+        state.validationItems = (data.validationItems || []).map(item => ({ ...item }));
+        state.chromaValidationItems = (data.chromaValidationItems || []).map(item => ({ ...item }));
+        renderSelectedDatasets();
+        renderChromaValidationItems();
+        renderConditionalOptions();
+        renderPresetFields();
+    }
+
+    function showEditor(job = null, { updateLocation = true } = {}) {
+        closeSampleViewer();
+        state.initialViewChosen = true;
+        state.selectedJobId = job?.id || null;
+        state.editingJobId = job?.id || null;
+        if (updateLocation) replaceTrainerLocation(job
+            ? { jobId: job.id, edit: true }
+            : { newJob: true });
+        editorView.classList.remove('hidden');
+        detailView.classList.add('hidden');
+        $('trainer-editor-kicker').textContent = job ? 'Edit training job' : 'New training job';
+        $('trainer-editor-title').textContent = job ? job.name : 'Configure LoRA training';
+        $('trainer-cancel-edit-btn').classList.toggle('hidden', !job);
+        populateForm(job?.form || {});
+        inspectSelectedDatasets();
+        showFormError('');
+        renderJobs();
+        document.querySelector('.trainer-workspace').scrollTop = 0;
+    }
+
+    const generatedSampleUrl = (jobId, filename, options = '') =>
+        `/api/trainer/jobs/${encodeURIComponent(jobId)}/samples/${encodeURIComponent(filename)}${options}`;
+
+    function setDetailTab(tab, { refresh = true, updateLocation = true } = {}) {
+        state.detailTab = tab === 'samples' ? 'samples' : 'overview';
+        if (updateLocation && state.selectedJobId && !state.editingJobId) {
+            replaceTrainerLocation({ jobId: state.selectedJobId, tab: state.detailTab });
+        }
+        document.querySelectorAll('[data-detail-tab]').forEach(button =>
+            button.classList.toggle('is-active', button.dataset.detailTab === state.detailTab)
+        );
+        $('trainer-detail-overview-panel').classList.toggle('hidden', state.detailTab !== 'overview');
+        $('trainer-detail-samples-panel').classList.toggle('hidden', state.detailTab !== 'samples');
+        if (state.detailTab === 'samples' && refresh) refreshGeneratedSamples();
+    }
+
+    function renderGeneratedSamples() {
+        const gallery = $('trainer-samples-gallery');
+        const status = $('trainer-samples-state');
+        const summary = $('trainer-samples-summary');
+        const samples = state.generatedSamples;
+        const job = currentJob();
+        const label = samples.length === 1 ? 'image' : 'images';
+        summary.textContent = samples.length
+            ? `${samples.length} generated ${label} · ${state.generatedSampleCount} per validation step`
+            : 'Generated files from the job samples folder appear here automatically.';
+        $('trainer-download-samples').classList.toggle('hidden', !samples.length || !job);
+
+        if (state.generatedSamplesStatus === 'loading' && !samples.length) {
+            status.innerHTML = '<strong>Loading validation images</strong><span>Please wait while the samples folder is scanned.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+        if (state.generatedSamplesStatus === 'error' && !samples.length) {
+            status.innerHTML = '<strong>Could not load validation images</strong><span>The samples endpoint returned an error. Use Refresh to try again.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+        if (!samples.length) {
+            status.innerHTML = '<strong>No validation images yet</strong><span>Images will appear after the first scheduled or manual sample/validation pass.</span>';
+            status.classList.remove('hidden');
+            gallery.classList.add('hidden');
+            return;
+        }
+
+        const rows = [];
+        for (let index = 0; index < samples.length; index += state.generatedSampleCount) {
+            rows.push(samples.slice(index, index + state.generatedSampleCount));
+        }
+        const columns = Math.max(state.generatedSampleCount, 3);
+        gallery.innerHTML = rows.map(row => `
+            <div class="trainer-sample-row" style="--sample-columns:${columns}">
+                ${row.map(sample => `
+                    <figure class="trainer-generated-sample">
+                        <button type="button" data-generated-sample="${escapeHtml(sample.name)}" aria-label="Open ${escapeHtml(sample.name)}">
+                            ${sample.mediaType === 'video'
+                                ? `<video src="${generatedSampleUrl(job.id, sample.name)}" muted preload="metadata"></video>`
+                                : `<img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Validation step ${sample.step}, sample ${sample.sampleIndex + 1}" loading="lazy">`}
+                        </button>
+                        <figcaption><span>Step ${sample.step.toLocaleString()}</span><span>Sample ${sample.sampleIndex + 1}</span></figcaption>
+                        ${sample.audioFile ? `<audio controls preload="none" src="${generatedSampleUrl(job.id, sample.audioFile)}"></audio>` : ''}
+                    </figure>
+                `).join('')}
+            </div>
+        `).join('');
+        status.classList.add('hidden');
+        gallery.classList.remove('hidden');
+    }
+
+    async function refreshGeneratedSamples(notify = false) {
+        const job = currentJob();
+        if (!job) return;
+        const requestedJobId = job.id;
+        if (!state.generatedSamples.length) state.generatedSamplesStatus = 'loading';
+        renderGeneratedSamples();
+        try {
+            const result = await api(`/api/trainer/jobs/${encodeURIComponent(job.id)}/samples`);
+            if (currentJob()?.id !== requestedJobId) return;
+            state.generatedSamples = result.samples || [];
+            state.generatedSampleCount = Math.max(Number(result.sampleCount) || 1, 1);
+            state.generatedSamplesStatus = 'success';
+            renderGeneratedSamples();
+            if (notify) showToast('Validation images refreshed.');
+        } catch (error) {
+            if (currentJob()?.id !== requestedJobId) return;
+            state.generatedSamplesStatus = 'error';
+            renderGeneratedSamples();
+            if (notify) showToast(error.message, true);
+        }
+    }
+
+    function selectedGeneratedSampleIndex() {
+        return state.generatedSamples.findIndex(sample => sample.name === state.selectedGeneratedSample);
+    }
+
+    function setSampleZoom(value) {
+        state.sampleZoom = Math.max(.5, Math.min(6, Number(value) || 1));
+        $('trainer-sample-viewport').style.setProperty('--sample-zoom', state.sampleZoom);
+        $('trainer-sample-zoom-reset').textContent = `${Math.round(state.sampleZoom * 100)}%`;
+    }
+
+    function renderSampleViewer() {
+        const job = currentJob();
+        const index = selectedGeneratedSampleIndex();
+        const sample = state.generatedSamples[index];
+        if (!job || !sample) {
+            closeSampleViewer();
+            return;
+        }
+        const controlIndex = state.selectedSampleControl;
+        const imageUrl = controlIndex === null
+            ? generatedSampleUrl(job.id, sample.name)
+            : `/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${controlIndex}`;
+        $('trainer-sample-viewer-title').textContent = sample.name;
+        const video = $('trainer-sample-viewer-video');
+        const showVideo = (controlIndex === null ? sample.mediaType : sample.controlMediaTypes?.[controlIndex]) === 'video';
+        video.pause();
+        video.classList.toggle('hidden', !showVideo);
+        $('trainer-sample-viewer-image').classList.toggle('hidden', showVideo);
+        if (showVideo) video.src = imageUrl;
+        else { video.removeAttribute('src'); $('trainer-sample-viewer-image').src = imageUrl; }
+        $('trainer-sample-viewer-image').alt = controlIndex === null
+            ? `Generated validation sample ${sample.name}`
+            : `Control image ${controlIndex + 1} for ${sample.name}`;
+        $('trainer-sample-viewer-prompt').textContent = sample.prompt || '—';
+        $('trainer-sample-viewer-step').textContent = Number(sample.step || 0).toLocaleString();
+        $('trainer-sample-viewer-index').textContent = String(Number(sample.sampleIndex || 0) + 1);
+        $('trainer-sample-viewer-seed').textContent = sample.seed ?? '—';
+        $('trainer-sample-download').href = generatedSampleUrl(job.id, sample.name, '?download=1');
+        $('trainer-sample-download-psd').classList.toggle('hidden', !sample.psdFile);
+        $('trainer-sample-download-psd').href = sample.psdFile ? generatedSampleUrl(job.id, sample.psdFile, '?download=1') : '#';
+
+        const controls = $('trainer-sample-controls');
+        if (sample.controlCount > 0) {
+            controls.innerHTML = `
+                <button class="trainer-sample-control ${controlIndex === null ? 'is-active' : ''}" type="button" data-viewer-control="main" title="Generated image">
+                    ${sample.mediaType === 'video' ? '<span>Video</span>' : `<img src="${generatedSampleUrl(job.id, sample.name, '?thumb=1')}" alt="Generated image">`}
+                </button>
+                ${Array.from({ length: sample.controlCount }, (_, control) => `
+                    <button class="trainer-sample-control ${controlIndex === control ? 'is-active' : ''}" type="button" data-viewer-control="${control}" title="Control image ${control + 1}">
+                        ${sample.controlMediaTypes?.[control] === 'video' ? `<span>Video ${control + 1}</span>` : `<img src="/api/trainer/jobs/${encodeURIComponent(job.id)}/sample-controls/${sample.sampleIndex}/${control}" alt="Control ${control + 1}">`}
+                    </button>
+                `).join('')}
+            `;
+            controls.classList.remove('hidden');
+        } else {
+            controls.innerHTML = '';
+            controls.classList.add('hidden');
+        }
+
+        const rowStart = index - Number(sample.sampleIndex || 0);
+        const rowEnd = Math.min(rowStart + state.generatedSampleCount - 1, state.generatedSamples.length - 1);
+        $('trainer-sample-prev').disabled = index <= rowStart;
+        $('trainer-sample-next').disabled = index >= rowEnd;
+        $('trainer-sample-prev-step').disabled = index - state.generatedSampleCount < 0;
+        $('trainer-sample-next-step').disabled = index + state.generatedSampleCount >= state.generatedSamples.length;
+    }
+
+    function openSampleViewer(filename) {
+        state.selectedGeneratedSample = filename;
+        state.selectedSampleControl = null;
+        setSampleZoom(1);
+        $('trainer-sample-viewer').classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+        renderSampleViewer();
+    }
+
+    function closeSampleViewer() {
+        const viewer = $('trainer-sample-viewer');
+        if (!viewer) return;
+        viewer.classList.add('hidden');
+        $('trainer-sample-viewer-video').pause();
+        state.selectedGeneratedSample = null;
+        state.selectedSampleControl = null;
+        document.body.style.overflow = '';
+    }
+
+    function moveSampleViewer(offset) {
+        const index = selectedGeneratedSampleIndex();
+        const next = index + offset;
+        if (index < 0 || next < 0 || next >= state.generatedSamples.length) return;
+        state.selectedGeneratedSample = state.generatedSamples[next].name;
+        state.selectedSampleControl = null;
+        setSampleZoom(1);
+        renderSampleViewer();
+    }
+
+    async function deleteGeneratedSample() {
+        const job = currentJob();
+        const sample = state.generatedSamples[selectedGeneratedSampleIndex()];
+        if (!job || !sample) return;
+        const confirmed = await appDialog.confirm(
+            `Delete validation image “${sample.name}”? This cannot be undone.`,
+            {
+                title: 'Delete Validation Image',
+                tone: 'warning',
+                confirmLabel: 'Delete Image',
+                danger: true
+            }
+        );
+        if (!confirmed) return;
+        try {
+            await api(generatedSampleUrl(job.id, sample.name), { method: 'DELETE' });
+            closeSampleViewer();
+            await refreshGeneratedSamples();
+            showToast('Validation image deleted.');
+        } catch (error) { showToast(error.message, true); }
+    }
+
+    function renderDetail(job) {
+        if (!job) return;
+        const process = job.config.config.process[0];
+        const model = state.models.find(item => item.key === job.form?.model);
+        const isVae = ['qwen_rgba_vae_trainer', 'flux2_rgba_vae_trainer', 'h3_rgba_vae_trainer'].includes(process.type);
+        const isChroma = ['qdm_chromakey_trainer', 'qdm_cleanmatte_trainer'].includes(process.type);
+        const isFlux2Vae = process.type === 'flux2_rgba_vae_trainer';
+        const vaeLabel = process.type === 'h3_rgba_vae_trainer' ? 'MiniMax H3 RGBA VAE' : isFlux2Vae ? 'FLUX.2 Klein RGBA VAE' : 'Qwen RGBA VAE';
+        const presetLabel = job.form?.model === 'qwen_image_edit_2511' && job.form?.trainingPreset === 'transparent_lora'
+            ? 'Edit RGB / RGBA LoRA' : state.trainingPresets.find(item => item.key === (job.form?.trainingPreset || 'standard_lora'))?.label;
+        const modelLabel = isVae
+            ? vaeLabel
+            : (model?.label || process.model?.arch || 'Edit model');
+        $('trainer-detail-name').textContent = job.name;
+        $('trainer-detail-model').textContent = presetLabel || modelLabel;
+        $('trainer-samples-tab').textContent = isVae ? 'VAE Validation' : (isChroma ? 'Chroma Validation' : 'Samples');
+        $('trainer-samples-heading').textContent = isVae ? 'VAE validation images' : (isChroma ? 'Neural ChromaKey validation previews' : 'Training samples');
+        $('trainer-detail-kicker').textContent = job.status === 'running' ? 'Active training job' : 'Training job';
+        $('trainer-detail-status').textContent = job.status;
+        $('trainer-detail-status').dataset.status = job.status;
+        $('trainer-detail-info').textContent = job.info || 'Ready';
+        $('trainer-detail-percent').textContent = `${Number(job.progress || 0).toFixed(job.progress % 1 ? 1 : 0)}%`;
+        $('trainer-detail-progress').style.width = `${job.progress || 0}%`;
+        $('trainer-detail-step').textContent = `${job.step || 0} / ${job.total_steps || process.train.steps} steps`;
+        $('trainer-detail-speed').textContent = job.speed_string || 'Waiting';
+        $('trainer-detail-gpu').textContent = `GPU ${job.gpu_ids}`;
+        const detailItems = isChroma ? [
+            ['Model', process.architecture?.id === 'qdm_cleanmatte_v1' ? 'QDM CleanMatte' : (process.architecture?.id || 'Legacy KeyMatte')],
+            ['Datasets', (job.datasets || []).join(', ')],
+            ['Resolution areas', process.train.resolutions.join(', ')],
+            ['Maximum batch', process.train.batch_size],
+            ['Pixel budget', `${process.train.megapixels_per_batch} MP`],
+            ['Learning rate', process.train.lr],
+            ['Validation', `${process.validation.images.length} images · every ${process.validation.every} steps`],
+            ['Export', 'Safetensors + resumable trainer state'],
+        ] : isVae ? [
+            ['Preset', vaeLabel],
+            ['Datasets', (job.datasets || []).join(', ')],
+            ['Scope', process.train.scope],
+            ['Resolution', process.train.resolution],
+            ['Learning rate', process.train.lr],
+            ['Validation', `every ${process.validation.every} steps`],
+            ['Deployment', process.type === 'h3_rgba_vae_trainer'
+                ? (process.save.comfy_export ? 'Native H3 + QDM ComfyUI loader' : 'Native H3') : isFlux2Vae
+                ? (process.save.comfy_export ? 'Native FLUX.2 + ComfyUI' : 'Native FLUX.2')
+                : (process.save.comfy_export ? 'Diffusers + ComfyUI' : 'Diffusers')],
+        ] : [
+            ['Model', modelLabel],
+            ['Datasets', (job.datasets || []).join(', ')],
+            ['Target', process.network.type === 'lokr' ? `LoKr · factor ${process.network.lokr_factor}` : `LoRA · rank ${process.network.linear}`],
+            ['Optimizer', process.train.optimizer],
+            ['Learning rate', process.train.lr],
+            ['Sampler', process.sample.sampler],
+            ['Quantization', process.model.quantize ? process.model.qtype : 'None'],
+        ];
+        $('trainer-detail-config').innerHTML = detailItems.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>`).join('');
+        const active = ['queued', 'running', 'stopping'].includes(job.status);
+        const running = job.status === 'running';
+        $('trainer-stop-job-btn').classList.toggle('hidden', !active);
+        $('trainer-save-now-btn').classList.toggle('hidden', !running);
+        $('trainer-sample-now-btn').classList.toggle('hidden', !running || (!isVae && !isChroma && process.train.disable_sampling));
+        $('trainer-sample-now-btn').textContent = (isVae || isChroma) ? 'Validate now' : 'Sample now';
+        $('trainer-start-job-btn').classList.toggle('hidden', active);
+        $('trainer-download-model').classList.toggle('hidden', !isChroma || !(job.step > 0) || running);
+        $('trainer-download-model').href = `/api/trainer/jobs/${encodeURIComponent(job.id)}/model`;
+        $('trainer-edit-job-btn').disabled = active;
+        $('trainer-delete-job-btn').disabled = active;
+        $('trainer-download-log').href = `/api/trainer/jobs/${job.id}/log/download`;
+        $('trainer-download-samples').href = `/api/trainer/jobs/${encodeURIComponent(job.id)}/samples/archive`;
+    }
+
+    async function showDetail(jobId, { updateLocation = true, tab = 'overview' } = {}) {
+        closeSampleViewer();
+        state.initialViewChosen = true;
+        state.selectedJobId = jobId;
+        state.editingJobId = null;
+        if (updateLocation) replaceTrainerLocation({ jobId, tab });
+        state.generatedSamples = [];
+        state.generatedSampleCount = 1;
+        state.generatedSamplesStatus = 'idle';
+        state.validationResults = null;
+        editorView.classList.add('hidden');
+        detailView.classList.remove('hidden');
+        renderJobs();
+        renderDetail(currentJob());
+        setDetailTab(tab, { refresh: false, updateLocation: false });
+        renderGeneratedSamples();
+        await refreshLog(false);
+        document.querySelector('.trainer-workspace').scrollTop = 0;
+    }
+
+    function formatTrainerLog(value) {
+        const source = String(value || '').replace(/\r\n/g, '\n');
+        const lines = [[]];
+        let row = 0;
+        let column = 0;
+
+        const ensureRow = () => {
+            while (lines.length <= row) lines.push([]);
+        };
+
+        for (let index = 0; index < source.length; index += 1) {
+            const character = source[index];
+            if (character === '\u001b' && source[index + 1] === '[') {
+                const sequence = source.slice(index).match(/^\u001b\[([0-?]*)([ -/]*)([@-~])/);
+                if (sequence) {
+                    const parameters = sequence[1].split(';');
+                    const amount = Number.parseInt(parameters[0], 10) || 1;
+                    const command = sequence[3];
+                    if (command === 'A') row = Math.max(0, row - amount);
+                    else if (command === 'B') row += amount;
+                    else if (command === 'C') column += amount;
+                    else if (command === 'D') column = Math.max(0, column - amount);
+                    else if (command === 'G') column = Math.max(0, amount - 1);
+                    else if (command === 'K') {
+                        ensureRow();
+                        if (parameters[0] === '2') lines[row] = [];
+                        else lines[row].splice(column);
+                    }
+                    ensureRow();
+                    index += sequence[0].length - 1;
+                    continue;
+                }
+            }
+            if (character === '\r') {
+                column = 0;
+                continue;
+            }
+            if (character === '\n') {
+                row += 1;
+                column = 0;
+                ensureRow();
+                continue;
+            }
+            if (character === '\b') {
+                column = Math.max(0, column - 1);
+                continue;
+            }
+            ensureRow();
+            lines[row][column] = character;
+            column += 1;
+        }
+
+        return lines.map(line => line.join('').trimEnd()).join('\n').trimEnd();
+    }
+
+    async function refreshLog(notify = false) {
+        const job = currentJob();
+        if (!job) return;
+        try {
+            const result = await api(`/api/trainer/jobs/${job.id}/log`);
+            const output = $('trainer-log-output');
+            const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 20;
+            output.textContent = formatTrainerLog(result.log) || 'No log output yet.';
+            if (atBottom) output.scrollTop = output.scrollHeight;
+            await refreshValidationResults();
+            if (notify) showToast('Trainer log refreshed.');
+        } catch (error) {
+            if (notify) showToast(error.message, true);
+        }
+    }
+
+    async function refreshState({ initial = false } = {}) {
+        const result = await api('/api/trainer/state');
+        state.models = result.models || [];
+        state.trainingPresets = result.trainingPresets || [];
+        state.qtypes = result.qtypes || [];
+        state.datasets = result.datasets || [];
+        state.datasetsLoaded = true;
+        state.jobs = result.jobs || [];
+        state.gpus = result.gpus || [];
+        state.trainerInstalled = Boolean(result.trainerInstalled);
+        renderRuntime();
+        if (!initial || !bootstrapCanRestoreEditor) {
+            renderModelOptions();
+            renderPresetOptions();
+        }
+        renderGpuOptions();
+        renderDatasetPicker();
+        if (!editorView.classList.contains('hidden') && state.selectedDatasets.length) {
+            renderSelectedDatasets();
+        }
+        renderJobs();
+        $('trainer-upstream-commit').textContent = result.upstreamCommit || '—';
+        if (state.selectedJobId && !currentJob()) {
+            if (state.jobs.length) showDetail(state.jobs[0].id);
+            else showEditor();
+        }
+        else if (state.selectedJobId && !state.editingJobId && !detailView.classList.contains('hidden')) renderDetail(currentJob());
+        if (initial && !state.initialViewChosen) {
+            restoreInitialView();
+        }
+    }
+
+    function renderValidationResults() {
+        const section = $('trainer-validation-results');
+        const result = state.validationResults;
+        if (!result || !result.items?.length) {
+            section.classList.add('hidden');
+            return;
+        }
+        section.classList.remove('hidden');
+        const measuredOnly = result.passed == null;
+        const overall = measuredOnly ? 'ALPHA METRICS — REVIEW REQUIRED' : (result.passed ? 'PASS' : 'FAIL');
+        $('trainer-validation-results-summary').textContent = `Step ${Number(result.step).toLocaleString()} · overall ${overall}`;
+        $('trainer-validation-results-items').innerHTML = result.items.map(item => {
+            const passed = Boolean(item.passed);
+            const details = measuredOnly ? 'Measured with despill disabled. Inspect clean contours and native details.' : item.failedChecks === 'none'
+                ? 'All strict alpha thresholds passed.'
+                : (item.failedChecks || 'Validation result is incomplete.');
+            return `<article class="trainer-validation-result ${measuredOnly ? '' : (passed ? 'is-pass' : 'is-fail')}">
+                <div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><b>${measuredOnly ? 'MEASURED' : (passed ? 'PASS' : 'FAIL')}</b></div>
+                <p>${escapeHtml(details)}</p>
+            </article>`;
+        }).join('');
+    }
+
+    async function refreshValidationResults() {
+        const job = currentJob();
+        if (!job) return;
+        try {
+            state.validationResults = await api(`/api/trainer/jobs/${job.id}/validation-results`);
+        } catch (_) {
+            state.validationResults = null;
+        }
+        renderValidationResults();
+    }
+
+    function restoreInitialView() {
+        const params = new URLSearchParams(window.location.search);
+        const requestedJob = state.jobs.find(job => job.id === params.get('job'));
+        if (params.get('new') === '1') {
+            showEditor(null, { updateLocation: false });
+        } else if (requestedJob && params.get('edit') === '1') {
+            showEditor(requestedJob, { updateLocation: false });
+        } else if (requestedJob) {
+            showDetail(requestedJob.id, {
+                updateLocation: false,
+                tab: params.get('tab') === 'samples' ? 'samples' : 'overview',
+            });
+        } else if (state.jobs.length) {
+            showDetail(state.jobs[0].id);
+        } else {
+            showEditor();
+        }
+    }
+
+    async function refreshJobsOnly() {
+        const result = await api('/api/trainer/jobs');
+        state.jobs = result.jobs || [];
+        renderJobs();
+        if (state.selectedJobId && !currentJob()) {
+            showEditor();
+            return;
+        }
+        if (state.selectedJobId && !state.editingJobId && !detailView.classList.contains('hidden')) {
+            renderDetail(currentJob());
+        }
+    }
+
+    async function runJobAction(action) {
+        const job = currentJob();
+        if (!job) return;
+        try {
+            await api(`/api/trainer/jobs/${job.id}/${action}`, { method: 'POST' });
+            await refreshJobsOnly();
+            renderDetail(currentJob());
+            showToast(action === 'start' ? 'Job added to the queue.' : 'Stop requested.');
+        } catch (error) { showToast(error.message, true); }
+    }
+
+    async function requestRuntimeAction(action) {
+        const job = currentJob();
+        if (!job) return;
+        try {
+            await api(`/api/trainer/jobs/${job.id}/${action}-now`, { method: 'POST' });
+            await refreshJobsOnly();
+            showToast(action === 'save' ? 'Checkpoint save requested.' : 'Sample requested.');
+        } catch (error) { showToast(error.message, true); }
+    }
+
+    async function deleteJob() {
+        const job = currentJob();
+        if (!job) return;
+        const confirmed = await appDialog.confirm(
+            `Delete job “${job.name}”? Output files will be kept.`,
+            {
+                title: 'Delete Training Job',
+                tone: 'warning',
+                confirmLabel: 'Delete Job',
+                danger: true
+            }
+        );
+        if (!confirmed) return;
+        try {
+            await api(`/api/trainer/jobs/${job.id}`, { method: 'DELETE' });
+            state.selectedJobId = null;
+            await refreshState();
+            showEditor();
+            showToast('Training job deleted. Output files were kept.');
+        } catch (error) { showToast(error.message, true); }
+    }
+
+    async function cloneJob() {
+        const job = currentJob();
+        if (!job) return;
+        const button = $('trainer-clone-job-btn');
+        button.disabled = true;
+        try {
+            const existingNames = new Set(state.jobs.map(item => item.name));
+            let copyIndex = 1;
+            let copyName = '';
+            do {
+                const suffix = copyIndex === 1 ? '_copy' : `_copy_${copyIndex}`;
+                copyName = `${job.name.slice(0, 96 - suffix.length)}${suffix}`;
+                copyIndex += 1;
+            } while (existingNames.has(copyName));
+
+            const payload = JSON.parse(JSON.stringify(job.form || {}));
+            payload.name = copyName;
+            const result = await api('/api/trainer/jobs', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            });
+            state.selectedJobId = result.job.id;
+            await refreshState();
+            showDetail(result.job.id);
+            showToast(`Job cloned as ${result.job.name}.`);
+        } catch (error) {
+            showToast(error.message, true);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    function openSettings() {
+        $('trainer-hf-token').value = '';
+        $('trainer-clear-token').checked = false;
+        $('trainer-settings-modal').classList.remove('hidden');
+        $('trainer-hf-token').focus();
+    }
+
+    function closeSettings() { $('trainer-settings-modal').classList.add('hidden'); }
+
+    async function saveSettings() {
+        try {
+            await api('/api/trainer/settings', {
+                method: 'POST',
+                body: JSON.stringify({ hfToken: $('trainer-hf-token').value, clearHfToken: $('trainer-clear-token').checked }),
+            });
+            closeSettings();
+            await refreshState();
+            showToast('Trainer settings saved.');
+        } catch (error) { showToast(error.message, true); }
+    }
+
+    async function generateAdvancedConfig() {
+        const payload = collectForm(false);
+        const error = validateForm(payload);
+        if (error) { showFormError(error); return; }
+        try {
+            const result = await api('/api/trainer/config/preview', { method: 'POST', body: JSON.stringify(payload) });
+            $('trainer-advanced-config-json').value = JSON.stringify(result.process, null, 2);
+            $('trainer-use-advanced-config').checked = true;
+            showFormError('');
+            showToast('Advanced process config generated.');
+        } catch (errorValue) { showFormError(errorValue.message); }
+    }
+
+    function bindEvents() {
+        $('trainer-new-job-btn').addEventListener('click', () => showEditor());
+        $('trainer-model').addEventListener('change', () => {
+            const previousPreset = $('trainer-preset').value;
+            $('trainer-preset').value = selectedPreset();
+            if (selectedPreset() === 'transparent_lora' && previousPreset !== selectedPreset()) {
+                const learningRate = $('trainer-learning-rate');
+                if (!learningRate.value || Number(learningRate.value) === 0.0001) {
+                    // Latent-transparency adapters are substantially more sensitive
+                    // than ordinary edit LoRAs; use the conservative LayerDiffuse rate.
+                    learningRate.value = '0.00001';
+                }
+            }
+            if (isVaePreset(selectedPreset()) && selectedPreset() !== previousPreset) {
+                setVaeSourceDefaults(true);
+            }
+            renderModelFields(true, true);
+            if (selectedModel()?.nativeRgba) {
+                const defaults = selectedModel().defaults;
+                const fields = { qtype: 'trainer-qtype', qtypeTextEncoder: 'trainer-qtype-te', timestepType: 'trainer-timestep', guidanceScale: 'trainer-guidance-scale', matchTargetResolution: 'trainer-match-resolution', alignReferenceDimensions: 'trainer-qi2-align-references', lowVram: 'trainer-low-vram', nativeRgba: 'trainer-native-rgba' };
+                Object.entries(fields).forEach(([key, id]) => setInput(id, defaults[key]));
+            }
+            if (isQieJoint()) {
+                $('trainer-rgba-edge-correction').value = 'none';
+                state.selectedDatasets.forEach(ds => { ds.rgbaControlMode = 'paired'; });
+            } else {
+                state.selectedDatasets.forEach(ds => { if (ds.rgbaControlMode === 'paired') ds.rgbaControlMode = 'edit'; });
+            }
+            if (isH3()) {
+                const defaults = { ...selectedModel().defaults, ...(selectedPreset() === 'transparent_lora' ? { sampleFrames: 1, h3SampleAudio: false } : {}) };
+                h3.populate(defaults);
+                Object.entries(h3.common).forEach(([key, id]) => setInput(id, defaults[key]));
+                state.selectedDatasets.forEach(ds => Object.assign(ds, h3.datasetDefaults, { cacheLatents: true }));
+            }
+            renderConditionalOptions();
+            renderPresetFields();
+            if (isLayered()) {
+                state.selectedDatasets.forEach(ds => Object.assign(ds, { flipX: false, flipY: false, isRegularization: false }));
+                state.samples.forEach(sample => { delete sample.ctrlImg2; delete sample.ctrlImg3; delete sample.ctrl_img_2; delete sample.ctrl_img_3; delete sample.image; });
+                renderSelectedDatasets();
+                renderSamples();
+            }
+        });
+        $('h3-distillationMethod').addEventListener('change', () => {
+            const method = $('h3-distillationMethod').value;
+            $('trainer-guidance-loss').checked = ['both', 'cg'].includes(method);
+            if (method === 'dopsd') $('trainer-cache-text').checked = true;
+            syncRgbaCacheState();
+            renderSelectedDatasets();
+            renderConditionalOptions();
+        });
+        $('trainer-guidance-loss').addEventListener('change', () => {
+            if (!isH3()) return;
+            const adapter = ['ta', 'both'].includes($('h3-distillationMethod').value);
+            $('h3-distillationMethod').value = $('trainer-guidance-loss').checked ? (adapter ? 'both' : 'cg') : (adapter ? 'ta' : 'none');
+        });
+        $('trainer-network-type').addEventListener('change', renderConditionalOptions);
+        $('trainer-layer-offloading').addEventListener('change', syncOffloadingControls);
+        ['trainer-transformer-offload', 'trainer-text-offload'].forEach(id =>
+            $(id).addEventListener('input', () => syncSlider(id))
+        );
+        ['trainer-use-ema', 'trainer-guidance-loss', 'trainer-differential-guidance', 'trainer-validation-enabled'].forEach(id =>
+            $(id).addEventListener('change', renderConditionalOptions)
+        );
+        $('trainer-dop').addEventListener('change', () => {
+            if ($('trainer-dop').checked) $('trainer-bpp').checked = false;
+            renderConditionalOptions();
+        });
+        $('trainer-bpp').addEventListener('change', () => {
+            if ($('trainer-bpp').checked) $('trainer-dop').checked = false;
+            renderConditionalOptions();
+        });
+        $('trainer-cache-text').addEventListener('change', () => {
+            if (!$('trainer-cache-text').checked && $('trainer-unload-text').checked) {
+                $('trainer-unload-text').checked = false;
+            }
+        });
+        $('trainer-unload-text').addEventListener('change', () => {
+            if ($('trainer-unload-text').checked) $('trainer-cache-text').checked = true;
+        });
+        $('trainer-skip-first-sample').addEventListener('change', () => {
+            if ($('trainer-skip-first-sample').checked) $('trainer-force-first-sample').checked = false;
+        });
+        $('trainer-force-first-sample').addEventListener('change', () => {
+            if ($('trainer-force-first-sample').checked) {
+                $('trainer-skip-first-sample').checked = false;
+                $('trainer-disable-sampling').checked = false;
+            }
+        });
+        $('trainer-disable-sampling').addEventListener('change', () => {
+            if ($('trainer-disable-sampling').checked) $('trainer-force-first-sample').checked = false;
+        });
+        $('trainer-add-dataset-btn').addEventListener('click', () => {
+            const name = $('trainer-dataset-select').value;
+            if (!name) return;
+            addDataset(name);
+            ensureDatasetInspection(name);
+            $('trainer-dataset-select').value = '';
+        });
+        $('trainer-selected-datasets').addEventListener('click', event => {
+            const removeButton = event.target.closest('[data-remove-dataset]');
+            const duplicateButton = event.target.closest('[data-duplicate-dataset]');
+            if (removeButton) state.selectedDatasets.splice(Number(removeButton.dataset.removeDataset), 1);
+            else if (duplicateButton) {
+                const source = state.selectedDatasets[Number(duplicateButton.dataset.duplicateDataset)];
+                if (source) state.selectedDatasets.splice(Number(duplicateButton.dataset.duplicateDataset) + 1, 0, { ...source, resolutions: [...source.resolutions] });
+            } else return;
+            renderSelectedDatasets();
+        });
+        $('trainer-selected-datasets').addEventListener('input', event => {
+            const input = event.target.closest('[data-dataset-field]');
+            if (input) {
+                updateDatasetSetting(input);
+                if (input.dataset.datasetField === 'rgbaControlMode') renderSelectedDatasets();
+            }
+        });
+        $('trainer-add-sample-btn').addEventListener('click', () => {
+            state.samples.push({ prompt: '', width: '', height: '', seed: '', networkMultiplier: '', ctrlImg1: '', ctrlImg2: '', ctrlImg3: '' });
+            renderSamples();
+        });
+        $('trainer-sample-items').addEventListener('click', event => {
+            const removeButton = event.target.closest('[data-remove-sample]');
+            const pickerButton = event.target.closest('[data-pick-sample-image]');
+            const clearButton = event.target.closest('[data-clear-sample-image]');
+            if (removeButton) {
+                state.samples.splice(Number(removeButton.dataset.removeSample), 1);
+                renderSamplesPreservingPlace();
+                return;
+            }
+            if (pickerButton) {
+                const input = $('trainer-sample-items').querySelector(`[data-sample-file="${pickerButton.dataset.pickSampleImage}"]`);
+                input?.click();
+                return;
+            }
+            if (clearButton) {
+                const [sampleIndexText, controlIndexText] = clearButton.dataset.clearSampleImage.split('-');
+                const sample = state.samples[Number(sampleIndexText)];
+                if (!sample) return;
+                sample[`ctrlImg${Number(controlIndexText)}`] = '';
+                delete sample[`ctrl_img_${Number(controlIndexText)}`];
+                renderSamplesPreservingPlace(`[data-pick-sample-image="${sampleIndexText}-${controlIndexText}"]`);
+            }
+        });
+        $('trainer-sample-items').addEventListener('input', event => {
+            const input = event.target.closest('[data-sample-field]');
+            if (input) updateRepeatedItem(input, state.samples, 'sampleIndex', 'sampleField');
+        });
+        $('trainer-sample-items').addEventListener('change', event => {
+            const input = event.target.closest('[data-sample-file]');
+            if (input) uploadSampleImage(input);
+        });
+        ['dragenter', 'dragover'].forEach(eventName => $('trainer-sample-items').addEventListener(eventName, event => {
+            const slot = event.target.closest('[data-sample-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+            slot.classList.add('is-dragging');
+        }));
+        $('trainer-sample-items').addEventListener('dragleave', event => {
+            const slot = event.target.closest('[data-sample-image-slot]');
+            if (slot && !slot.contains(event.relatedTarget)) slot.classList.remove('is-dragging');
+        });
+        $('trainer-sample-items').addEventListener('drop', event => {
+            const slot = event.target.closest('[data-sample-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            slot.classList.remove('is-dragging');
+            const file = event.dataTransfer?.files?.[0];
+            const input = slot.querySelector('[data-sample-file]');
+            if (file && input) uploadSampleImage(input, file);
+        });
+        $('trainer-add-validation-btn').addEventListener('click', () => {
+            state.validationItems.push(independentValidationUploads
+                ? { targetPath: '', prompt: '', mode: isQieJoint() ? 'paired' : 'generation' }
+                : { dataset: state.selectedDatasets[0]?.name || '', image: '', prompt: '' }
+            );
+            renderValidationItems();
+        });
+        $('trainer-validation-items').addEventListener('click', event => {
+            const controlPicker = event.target.closest('[data-pick-sample-image]');
+            const controlClear = event.target.closest('[data-clear-sample-image]');
+            if (controlPicker) {
+                $('trainer-validation-items').querySelector(`[data-sample-file="${controlPicker.dataset.pickSampleImage}"]`)?.click();
+                return;
+            }
+            if (controlClear) {
+                const [index, control] = controlClear.dataset.clearSampleImage.split('-').map(Number);
+                delete state.validationItems[index][`ctrlImg${control}`];
+                delete state.validationItems[index][`ctrl_img_${control}`];
+                renderValidationItemsPreservingPlace();
+                return;
+            }
+            const removeButton = event.target.closest('[data-remove-validation]');
+            const pickerButton = event.target.closest('[data-pick-validation-image]');
+            const clearButton = event.target.closest('[data-clear-validation-image]');
+            if (removeButton) {
+                state.validationItems.splice(Number(removeButton.dataset.removeValidation), 1);
+                renderValidationItems();
+                return;
+            }
+            if (pickerButton) {
+                $('trainer-validation-items').querySelector(`[data-validation-file="${pickerButton.dataset.pickValidationImage}"]`)?.click();
+                return;
+            }
+            if (clearButton) {
+                const item = state.validationItems[Number(clearButton.dataset.clearValidationImage)];
+                if (!item) return;
+                item.targetPath = '';
+                delete item.target_path;
+                renderValidationItemsPreservingPlace();
+            }
+        });
+        $('trainer-validation-items').addEventListener('input', event => {
+            const input = event.target.closest('[data-validation-field]');
+            if (input) updateRepeatedItem(input, state.validationItems, 'validationIndex', 'validationField');
+        });
+        $('trainer-validation-items').addEventListener('change', event => {
+            const controlInput = event.target.closest('[data-sample-file]');
+            if (controlInput) uploadSampleImage(controlInput);
+            if (event.target.dataset.validationField === 'mode') renderValidationItemsPreservingPlace();
+            const input = event.target.closest('[data-validation-file]');
+            if (input) uploadValidationImage(input);
+        });
+        ['dragenter', 'dragover'].forEach(eventName => $('trainer-validation-items').addEventListener(eventName, event => {
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+            slot.classList.add('is-dragging');
+        }));
+        $('trainer-validation-items').addEventListener('dragleave', event => {
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
+            if (slot && !slot.contains(event.relatedTarget)) slot.classList.remove('is-dragging');
+        });
+        $('trainer-validation-items').addEventListener('drop', event => {
+            const slot = event.target.closest('[data-validation-image-slot], [data-sample-image-slot]');
+            if (!slot) return;
+            event.preventDefault();
+            slot.classList.remove('is-dragging');
+            const file = event.dataTransfer?.files?.[0];
+            const input = slot.querySelector('[data-validation-file], [data-sample-file]');
+            if (file && input) {
+                if (input.dataset.sampleFile) uploadSampleImage(input, file);
+                else uploadValidationImage(input, file);
+            }
+        });
+        $('trainer-chroma-add-validation-btn').addEventListener('click', () => {
+            $('trainer-chroma-validation-files').click();
+        });
+        $('trainer-chroma-validation-files').addEventListener('change', event => {
+            const files = Array.from(event.target.files || []);
+            if (files.length) uploadChromaValidationFiles(files);
+            event.target.value = '';
+        });
+        $('trainer-chroma-validation-items').addEventListener('click', event => {
+            const removeButton = event.target.closest('[data-remove-chroma-validation]');
+            if (!removeButton) return;
+            state.chromaValidationItems.splice(Number(removeButton.dataset.removeChromaValidation), 1);
+            renderChromaValidationItems();
+        });
+        form.addEventListener('submit', event => { event.preventDefault(); saveJob(false); });
+        $('trainer-save-start-btn').addEventListener('click', () => saveJob(true));
+        $('trainer-cancel-edit-btn').addEventListener('click', () => state.selectedJobId ? showDetail(state.selectedJobId) : showEditor());
+        jobsList.addEventListener('click', event => {
+            const item = event.target.closest('[data-job-id]');
+            if (item) showDetail(item.dataset.jobId);
+        });
+        document.querySelectorAll('[data-job-filter]').forEach(button => button.addEventListener('click', () => {
+            state.filter = button.dataset.jobFilter;
+            document.querySelectorAll('[data-job-filter]').forEach(item => item.classList.toggle('is-active', item === button));
+            renderJobs();
+        }));
+        $('trainer-edit-job-btn').addEventListener('click', () => showEditor(currentJob()));
+        $('trainer-clone-job-btn').addEventListener('click', cloneJob);
+        $('trainer-start-job-btn').addEventListener('click', () => runJobAction('start'));
+        $('trainer-stop-job-btn').addEventListener('click', () => runJobAction('stop'));
+        $('trainer-save-now-btn').addEventListener('click', () => requestRuntimeAction('save'));
+        $('trainer-sample-now-btn').addEventListener('click', () => requestRuntimeAction('sample'));
+        $('trainer-delete-job-btn').addEventListener('click', deleteJob);
+        $('trainer-refresh-log-btn').addEventListener('click', () => refreshLog(true));
+        document.querySelectorAll('[data-detail-tab]').forEach(button => button.addEventListener('click', () =>
+            setDetailTab(button.dataset.detailTab)
+        ));
+        $('trainer-refresh-samples-btn').addEventListener('click', () => refreshGeneratedSamples(true));
+        $('trainer-samples-gallery').addEventListener('click', event => {
+            const button = event.target.closest('[data-generated-sample]');
+            if (button) openSampleViewer(button.dataset.generatedSample);
+        });
+        document.querySelectorAll('[data-sample-viewer-close]').forEach(button =>
+            button.addEventListener('click', closeSampleViewer)
+        );
+        $('trainer-sample-controls').addEventListener('click', event => {
+            const button = event.target.closest('[data-viewer-control]');
+            if (!button) return;
+            state.selectedSampleControl = button.dataset.viewerControl === 'main'
+                ? null
+                : Number(button.dataset.viewerControl);
+            setSampleZoom(1);
+            renderSampleViewer();
+        });
+        $('trainer-sample-prev').addEventListener('click', () => {
+            if (!$('trainer-sample-prev').disabled) moveSampleViewer(-1);
+        });
+        $('trainer-sample-next').addEventListener('click', () => {
+            if (!$('trainer-sample-next').disabled) moveSampleViewer(1);
+        });
+        $('trainer-sample-prev-step').addEventListener('click', () => {
+            if (!$('trainer-sample-prev-step').disabled) moveSampleViewer(-state.generatedSampleCount);
+        });
+        $('trainer-sample-next-step').addEventListener('click', () => {
+            if (!$('trainer-sample-next-step').disabled) moveSampleViewer(state.generatedSampleCount);
+        });
+        $('trainer-sample-zoom-out').addEventListener('click', () => setSampleZoom(state.sampleZoom - .25));
+        $('trainer-sample-zoom-reset').addEventListener('click', () => setSampleZoom(1));
+        $('trainer-sample-zoom-in').addEventListener('click', () => setSampleZoom(state.sampleZoom + .25));
+        $('trainer-sample-delete').addEventListener('click', deleteGeneratedSample);
+        $('trainer-sample-viewport').addEventListener('wheel', event => {
+            if ($('trainer-sample-viewer').classList.contains('hidden')) return;
+            event.preventDefault();
+            setSampleZoom(state.sampleZoom + (event.deltaY < 0 ? .2 : -.2));
+        }, { passive: false });
+        $('trainer-settings-btn').addEventListener('click', openSettings);
+        $('trainer-settings-close').addEventListener('click', closeSettings);
+        $('trainer-settings-cancel').addEventListener('click', closeSettings);
+        $('trainer-settings-save').addEventListener('click', saveSettings);
+        $('trainer-generate-config-btn').addEventListener('click', generateAdvancedConfig);
+        $('trainer-clear-config-btn').addEventListener('click', () => {
+            $('trainer-advanced-config-json').value = '';
+            $('trainer-use-advanced-config').checked = false;
+            showToast('Advanced override cleared.');
+        });
+        $('trainer-settings-modal').addEventListener('click', event => { if (event.target === $('trainer-settings-modal')) closeSettings(); });
+        document.addEventListener('keydown', event => {
+            const viewerOpen = !$('trainer-sample-viewer').classList.contains('hidden');
+            if (viewerOpen) {
+                if (event.key === 'Escape') closeSampleViewer();
+                else if (event.key === 'ArrowLeft') $('trainer-sample-prev').click();
+                else if (event.key === 'ArrowRight') $('trainer-sample-next').click();
+                else if (event.key === 'ArrowUp') $('trainer-sample-prev-step').click();
+                else if (event.key === 'ArrowDown') $('trainer-sample-next-step').click();
+                else if (event.key === 'Delete' || event.key === 'Backspace') deleteGeneratedSample();
+                if (['Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(event.key)) event.preventDefault();
+                return;
+            }
+            if (event.key === 'Escape' && !$('trainer-settings-modal').classList.contains('hidden')) closeSettings();
+        });
+    }
+
+    function scheduleJobPoll() {
+        window.clearTimeout(state.pollTimer);
+        state.pollTimer = window.setTimeout(async () => {
+            try {
+                await refreshJobsOnly();
+                if (!detailView.classList.contains('hidden') && ['queued', 'running', 'stopping'].includes(currentJob()?.status)) await refreshLog(false);
+            } catch (_) { /* keep the last rendered state */ }
+            scheduleJobPoll();
+        }, 3000);
+    }
+
+    function scheduleSamplePoll() {
+        window.clearTimeout(state.samplePollTimer);
+        state.samplePollTimer = window.setTimeout(async () => {
+            if (!detailView.classList.contains('hidden') && state.detailTab === 'samples' && currentJob()) {
+                await refreshGeneratedSamples(false);
+            }
+            scheduleSamplePoll();
+        }, 5000);
+    }
+
+    async function initialize() {
+        bindEvents();
+        if (!bootstrapCanRestoreEditor) {
+            try {
+                await refreshState({ initial: true });
+            } catch (error) {
+                showFormError(`Could not load trainer: ${error.message}`);
+                $('trainer-runtime-status').textContent = 'Trainer API unavailable';
+                $('trainer-runtime-status').classList.add('is-missing');
+            }
+        }
+        scheduleJobPoll();
+        scheduleSamplePoll();
+    }
+
+    if (bootstrapState) {
+        renderRuntime();
+        renderModelOptions();
+        renderPresetOptions();
+        renderGpuOptions();
+        renderDatasetPicker();
+        renderJobs();
+        $('trainer-upstream-commit').textContent = bootstrapState.upstreamCommit || '—';
+        if (bootstrapCanRestoreEditor) restoreInitialView();
+    }
+    initialize();
+})();

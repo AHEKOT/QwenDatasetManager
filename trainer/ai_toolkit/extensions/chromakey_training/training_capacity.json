@@ -1,0 +1,15 @@
+{
+  "purpose": "VRAM capacity check, random tensors, not quality",
+  "shape": [
+    8,
+    3,
+    512,
+    512
+  ],
+  "step_seconds": [
+    1.1409703000003901,
+    0.08397550000017873,
+    0.0829689000001963
+  ],
+  "peak_cuda_allocated_mib": 3183.72119140625
+}

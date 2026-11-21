@@ -1,9 +1,11 @@
 from flask import Flask, send_from_directory, jsonify, request, send_file
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import html
 import os
 import re
 import json
 import random
+import socket
 import shutil
 import uuid
 import threading
@@ -12,12 +14,57 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from PIL import Image as PillowImage
+from trainer_service import TrainerService, create_trainer_blueprint
+from auto_caption import (
+    AutoCaptionEngine,
+    DEFAULT_AUTO_CAPTION_CONFIG,
+    normalize_auto_caption_config,
+    resolve_catalog_variant,
+    scan_gguf_catalog,
+)
+
+
+def discover_local_ipv4_addresses():
+    """Return usable local IPv4 addresses with the default route first."""
+    addresses = []
+
+    def add(address):
+        if (
+            address
+            and address not in addresses
+            and not address.startswith('127.')
+            and not address.startswith('169.254.')
+            and address != '0.0.0.0'
+        ):
+            addresses.append(address)
+
+    # A UDP connect selects the default route without sending application data.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+            route_socket.connect(('8.8.8.8', 80))
+            add(route_socket.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for address in socket.gethostbyname_ex(socket.gethostname())[2]:
+            add(address)
+    except OSError:
+        pass
+
+    return addresses
+
+
+def default_trusted_hosts():
+    hosts = ['localhost', '127.0.0.1', '[::1]', socket.gethostname()]
+    hosts.extend(discover_local_ipv4_addresses())
+    return list(dict.fromkeys(host for host in hosts if host))
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('QDM_MAX_UPLOAD_MB', '128')) * 1024 * 1024
 app.config['TRUSTED_HOSTS'] = [
     host.strip()
-    for host in os.environ.get('QDM_TRUSTED_HOSTS', 'localhost,127.0.0.1,[::1]').split(',')
+    for host in os.environ.get('QDM_TRUSTED_HOSTS', ','.join(default_trusted_hosts())).split(',')
     if host.strip()
 ]
 PillowImage.MAX_IMAGE_PIXELS = int(os.environ.get('QDM_MAX_IMAGE_PIXELS', '100000000'))
@@ -32,12 +79,23 @@ IMPORT_JOBS = {}
 IMPORT_JOBS_LOCK = threading.Lock()
 TOOL_JOBS = {}
 TOOL_JOBS_LOCK = threading.Lock()
+AUTO_CAPTION_JOBS = {}
+AUTO_CAPTION_JOBS_LOCK = threading.Lock()
+AUTO_CAPTION_RUN_LOCK = threading.Lock()
 ACTIVE_DATASETS = {}
 ACTIVE_DATASETS_LOCK = threading.Lock()
 MAX_RETAINED_JOBS = 200
 
 # Ensure Datasets directory exists
 DATASETS_DIR.mkdir(exist_ok=True)
+MODELS_LLM_DIR = BASE_DIR / 'models' / 'llm'
+MODELS_LLM_DIR.mkdir(parents=True, exist_ok=True)
+AUTO_CAPTION_ENGINE = AutoCaptionEngine()
+
+TRAINER_SERVICE = TrainerService(BASE_DIR, lambda: DATASETS_DIR)
+app.register_blueprint(create_trainer_blueprint(TRAINER_SERVICE))
+if os.environ.get('QDM_DISABLE_TRAINER_WORKER', '').lower() not in {'1', 'true', 'yes'}:
+    TRAINER_SERVICE.start_worker()
 
 
 class InvalidPathError(ValueError):
@@ -119,8 +177,19 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def claim_datasets(names, owner_id):
+def claim_datasets(names, owner_id, trainer_sensitive_names=None):
     normalized = sorted({validate_dataset_name(name) for name in names if name})
+    if trainer_sensitive_names is None:
+        trainer_sensitive = normalized
+    else:
+        trainer_sensitive = {
+            validate_dataset_name(name)
+            for name in trainer_sensitive_names
+            if name
+        }
+    trainer_conflicts = sorted(set(trainer_sensitive) & TRAINER_SERVICE.active_dataset_names())
+    if trainer_conflicts:
+        return trainer_conflicts
     with ACTIVE_DATASETS_LOCK:
         conflicts = [name for name in normalized if name in ACTIVE_DATASETS]
         if conflicts:
@@ -147,10 +216,10 @@ def prune_finished_jobs(jobs):
         jobs.pop(job['jobId'], None)
 
 
-def atomic_write_text(path, content):
+def atomic_write_text(path, content, *, newline=None):
     temp_path = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
     try:
-        with open(temp_path, 'w', encoding='utf-8') as handle:
+        with open(temp_path, 'w', encoding='utf-8', newline=newline) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -243,7 +312,8 @@ def protect_api_requests():
                     _validate_request_paths(payload)
 
         if request.method not in {'GET', 'HEAD', 'OPTIONS'} and request.path not in {
-            '/api/tool-jobs/start', '/api/import/dataset/start'
+            '/api/tool-jobs/start', '/api/import/dataset/start',
+            '/api/auto-caption/preview', '/api/auto-caption/apply'
         }:
             names = []
             sources = [request.args]
@@ -260,7 +330,15 @@ def protect_api_requests():
                     if isinstance(value, str) and value.strip():
                         names.append(value.strip())
             owner_id = f'request-{uuid.uuid4().hex}'
-            conflicts = claim_datasets(names, owner_id)
+            trainer_sensitive_names = None
+            if request.endpoint == 'transfer_image' and isinstance(body, dict):
+                if body.get('operation', 'transfer') == 'copy':
+                    # Copying only reads the source (and optional linked source).
+                    # Keep the short-lived request claim for local operation
+                    # serialization, but only treat the destination as a
+                    # training-sensitive mutation target.
+                    trainer_sensitive_names = [body.get('targetFolder')]
+            conflicts = claim_datasets(names, owner_id, trainer_sensitive_names)
             if conflicts:
                 return jsonify({
                     'error': 'Dataset is busy with another operation',
@@ -1178,6 +1256,78 @@ def run_tool_job(job_id, tool_name, payload):
 def index():
     """Serve the main HTML page"""
     return send_from_directory('static', 'index.html')
+
+
+def render_trainer_jobs_bootstrap(bootstrap):
+    jobs = bootstrap['jobs']
+    model_labels = {item['key']: item['label'] for item in bootstrap['models']}
+    preset_labels = {item['key']: item['label'] for item in bootstrap['trainingPresets']}
+
+    if not jobs:
+        return (
+            '0 training jobs',
+            '<div class="trainer-empty-list"><strong>No jobs yet</strong>'
+            '<span>Create a LoRA training job from your existing datasets.</span></div>',
+        )
+
+    cards = []
+    for job in jobs:
+        form = job.get('form') or {}
+        process_list = (job.get('config') or {}).get('config', {}).get('process') or [{}]
+        process = process_list[0] if isinstance(process_list[0], dict) else {}
+        model = process.get('model') or {}
+        preset_key = form.get('trainingPreset', 'standard_lora')
+        label = (
+            preset_labels.get(preset_key)
+            or model_labels.get(form.get('model'))
+            or model.get('arch')
+            or 'Training'
+        )
+        try:
+            progress = max(0.0, min(100.0, float(job.get('progress') or 0)))
+        except (TypeError, ValueError):
+            progress = 0.0
+        progress_text = f'{progress:g}'
+        cards.append(
+            f'<button class="trainer-job-item" type="button" '
+            f'data-job-id="{html.escape(str(job.get("id", "")), quote=True)}">'
+            '<span class="trainer-job-item-top">'
+            f'<strong>{html.escape(str(job.get("name", "")))}</strong>'
+            f'<span class="trainer-mini-status" data-status="{html.escape(str(job.get("status", "")), quote=True)}">'
+            f'{html.escape(str(job.get("status", "")))}</span></span>'
+            '<span class="trainer-job-item-meta">'
+            f'<span>{html.escape(str(label))}</span>'
+            f'<span>{html.escape(str(job.get("step", 0)))} / {html.escape(str(job.get("total_steps", 0)))}</span></span>'
+            f'<span class="trainer-job-item-progress"><span style="width:{progress_text}%"></span></span>'
+            '</button>'
+        )
+
+    count = len(jobs)
+    return f'{count} training job{"" if count == 1 else "s"}', ''.join(cards)
+
+
+@app.route('/trainer')
+def trainer_page():
+    """Serve the trainer with its lightweight job state embedded in the response."""
+    page = (BASE_DIR / 'static' / 'trainer.html').read_text(encoding='utf-8')
+    bootstrap_state = TRAINER_SERVICE.bootstrap_state()
+    job_count, jobs_markup = render_trainer_jobs_bootstrap(bootstrap_state)
+    bootstrap = json.dumps(
+        bootstrap_state,
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).replace('<', '\\u003c')
+    page = (
+        page.replace('<!--TRAINER_JOB_COUNT-->', job_count)
+        .replace('<!--TRAINER_JOBS-->', jobs_markup)
+        .replace('<!--TRAINER_BOOTSTRAP-->', bootstrap)
+        .replace('<!--TRAINER_VALIDATION_UPLOADS-->', 'true')
+        .replace('trainer-independent-validation-help" class="trainer-help hidden',
+                 'trainer-independent-validation-help" class="trainer-help')
+    )
+    response = app.response_class(page, mimetype='text/html')
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 @app.route('/api/save/<filename>', methods=['POST'])
 def save_image(filename):
@@ -3333,7 +3483,7 @@ DEFAULT_PROCESS_CONFIG = {
         # Age-body descriptors like "teenager girl", "adult woman", "young_adult woman", "loli" —
         # swallowed intentionally: they duplicate the numeric age and clutter remainder.
         {"name": "age_body",
-         "pattern": r"^(?:loli|teenager|adult|young(?:_adult)?)(?:[\s_]\w+)*$",
+         "pattern": r"^(?:loli|teenager|adult|young(?:_adult)?)(?:[\s_]\w{1,64}){0,8}$",
          "transform": "$0"},
 
         # Hair colour: "purple hair" → "purple"
@@ -3526,6 +3676,462 @@ def process_text_apply():
     })
 
 
+# ─── Caption Post-processing ─────────────────────────────────────────────────
+
+def validate_postprocess_config(config):
+    if not isinstance(config, dict):
+        raise ValueError('Post-processing config must be an object')
+    normalized = {}
+    for field in ('prefix', 'suffix', 'find', 'replace'):
+        value = config.get(field, '')
+        if not isinstance(value, str) or len(value) > 10000:
+            raise ValueError(f'{field} must be a string of at most 10000 characters')
+        normalized[field] = value
+    if normalized['replace'] and not normalized['find']:
+        raise ValueError('Enter text to find before specifying a replacement')
+    if not any(normalized[field] for field in ('prefix', 'suffix', 'find')):
+        raise ValueError('Enter a prefix, suffix, or text to find')
+    return normalized
+
+
+def _apply_postprocess_config(caption_text, config):
+    if config['find']:
+        caption_text = caption_text.replace(config['find'], config['replace'])
+    return config['prefix'] + caption_text + config['suffix']
+
+
+def _postprocess_caption_files(dataset_dir):
+    img_dir = dataset_dir / 'img'
+    if not img_dir.is_dir():
+        raise FileNotFoundError('Dataset img folder not found')
+    if not _is_within(img_dir.resolve(), dataset_dir):
+        raise InvalidPathError('Caption folder escapes the dataset directory')
+    files = []
+    for path in sorted(img_dir.iterdir()):
+        if path.suffix.lower() != '.txt':
+            continue
+        if path.is_symlink() or not _is_within(path.resolve(), dataset_dir):
+            raise InvalidPathError('Caption symlinks are not allowed')
+        if path.is_file():
+            files.append(path)
+    return files
+
+
+@app.route('/api/process-text/postprocess/preview', methods=['POST'])
+@app.route('/api/process-text/postprocess/apply', methods=['POST'])
+def postprocess_text():
+    data = request.get_json() or {}
+    try:
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be an object')
+        if not data.get('folder'):
+            raise ValueError('folder required')
+        config = validate_postprocess_config(data.get('config', {}))
+        count = max(1, min(50, int(data.get('count', 5))))
+        dataset_dir = resolve_dataset_dir(data['folder'], must_exist=True)
+        txt_files = _postprocess_caption_files(dataset_dir)
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+
+    apply = request.path.endswith('/apply')
+    backup_dir = None
+    if apply and txt_files:
+        backup_root = dataset_dir / '.postprocess-backup'
+        if backup_root.is_symlink() or not _is_within(backup_root.resolve(), dataset_dir):
+            return jsonify({'error': 'Backup folder escapes the dataset directory'}), 400
+        backup_dir = backup_root / (
+            datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + f'-{uuid.uuid4().hex[:8]}'
+        )
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            for caption_path in txt_files:
+                shutil.copy2(caption_path, backup_dir / caption_path.name)
+        except OSError as exc:
+            return jsonify({'error': f'Backup failed; captions were not changed: {exc}'}), 500
+
+    changed = 0
+    errors = []
+    changed_samples = []
+    unchanged_samples = []
+    for path in txt_files:
+        try:
+            # Keep existing whitespace and line endings exactly as stored.
+            with path.open('r', encoding='utf-8', newline='') as handle:
+                original = handle.read()
+            processed = _apply_postprocess_config(original, config)
+            is_changed = processed != original
+            if apply and is_changed:
+                atomic_write_text(path, processed, newline='')
+            changed += int(is_changed)
+            samples = changed_samples if is_changed else unchanged_samples
+            if len(samples) < count:
+                samples.append({'filename': path.name, 'original': original, 'processed': processed})
+        except (OSError, UnicodeError) as exc:
+            errors.append({'file': path.name, 'error': str(exc)})
+
+    return jsonify({
+        'success': not errors,
+        'total': len(txt_files),
+        'changed': changed,
+        'processed': changed if apply else 0,
+        'results': (changed_samples + unchanged_samples)[:count],
+        'errors': errors,
+        'backup': str(backup_dir.relative_to(dataset_dir)) if backup_dir else None
+    })
+
+
+# ─── Auto Caption ────────────────────────────────────────────────────────────
+
+def update_auto_caption_job(job_id, **changes):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return None
+        job.update(changes)
+        return dict(job)
+
+
+def update_auto_caption_item(job_id, index, status, *, caption=None, error=None):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return
+        item = job['items'][index]
+        item['status'] = status
+        if caption is not None:
+            item['caption'] = caption
+        if error is not None:
+            item['error'] = error
+        if status in {'completed', 'error'}:
+            job['processedItems'] += 1
+        job['currentItem'] = item['filename'] if status == 'generating' else job.get('currentItem')
+        total = job['totalItems']
+        job['progressPercent'] = round((job['processedItems'] / total) * 100, 1) if total else 100.0
+
+
+def auto_caption_stop_requested(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        return bool(job and job.get('stopRequested'))
+
+
+def mark_queued_auto_caption_items_stopped(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return
+        for item in job['items']:
+            if item['status'] == 'queued':
+                item['status'] = 'stopped'
+        job['currentItem'] = None
+
+
+def _auto_caption_image_paths(dataset_dir):
+    img_dir = dataset_dir / 'img'
+    if not img_dir.is_dir():
+        raise FileNotFoundError('Dataset img folder was not found')
+    return sorted(
+        (path for path in img_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
+        key=lambda path: path.name.lower()
+    )
+
+
+def run_auto_caption_job(job_id, folder, config, image_paths, *, apply_all, missing_only=False):
+    staging_dir = None
+    try:
+        dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+        variant = resolve_catalog_variant(
+            MODELS_LLM_DIR,
+            config['modelId'],
+            config['variantId']
+        )
+        update_auto_caption_job(
+            job_id,
+            status='waiting',
+            currentItem='Waiting for the local caption model'
+        )
+
+        successful = []
+        errors = []
+        stopped = False
+        if apply_all:
+            staging_dir = dataset_dir / f'.auto-caption-staging-{job_id}'
+            staging_dir.mkdir(exist_ok=False)
+
+        # llama.cpp owns one large model instance. Keep whole jobs serialized so
+        # another preview cannot evict a model halfway through a dataset run.
+        with AUTO_CAPTION_RUN_LOCK:
+            if auto_caption_stop_requested(job_id):
+                stopped = True
+            else:
+                update_auto_caption_job(
+                    job_id,
+                    status='loading',
+                    currentItem=variant['filename']
+                )
+                AUTO_CAPTION_ENGINE.ensure_loaded(variant)
+                update_auto_caption_job(job_id, status='running', currentItem=None)
+
+            for index, image_path in enumerate(image_paths):
+                if stopped or auto_caption_stop_requested(job_id):
+                    stopped = True
+                    break
+                update_auto_caption_item(job_id, index, 'generating')
+                try:
+                    caption = AUTO_CAPTION_ENGINE.caption(image_path, config)
+                    if apply_all:
+                        atomic_write_text(staging_dir / f'{image_path.stem}.txt', caption)
+                    successful.append((image_path, caption))
+                    update_auto_caption_item(job_id, index, 'completed', caption=caption)
+                except Exception as exc:
+                    error = str(exc)
+                    app.logger.exception(
+                        'Auto Caption failed for %s: %s',
+                        image_path.name,
+                        error,
+                    )
+                    errors.append({'file': image_path.name, 'error': error})
+                    update_auto_caption_item(job_id, index, 'error', error=error)
+
+            if auto_caption_stop_requested(job_id):
+                stopped = True
+
+        if stopped:
+            mark_queued_auto_caption_items_stopped(job_id)
+
+        backup_relative = None
+        if apply_all and successful:
+            update_auto_caption_job(job_id, status='committing', currentItem=None)
+            existing_captions = [
+                dataset_dir / 'img' / f'{image_path.stem}.txt'
+                for image_path, _caption in successful
+                if (dataset_dir / 'img' / f'{image_path.stem}.txt').is_file()
+            ]
+            if existing_captions:
+                backup_dir = dataset_dir / '.auto-caption-backup' / (
+                    datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + f'-{job_id[:8]}'
+                )
+                backup_dir.mkdir(parents=True, exist_ok=False)
+                for caption_path in existing_captions:
+                    shutil.copy2(caption_path, backup_dir / caption_path.name)
+                backup_relative = str(backup_dir.relative_to(dataset_dir))
+
+            for image_path, _caption in successful:
+                staged_caption = staging_dir / f'{image_path.stem}.txt'
+                atomic_write_text(
+                    dataset_dir / 'img' / staged_caption.name,
+                    staged_caption.read_text(encoding='utf-8')
+                )
+
+        result = {
+            'mode': 'apply' if apply_all else 'preview',
+            'generated': len(successful),
+            'failed': len(errors),
+            'stopped': stopped,
+            'missingOnly': bool(apply_all and missing_only),
+            'errors': errors,
+            'backup': backup_relative,
+            'model': variant['modelLabel'],
+            'quantization': variant['quantization'],
+        }
+        if not apply_all and successful:
+            result.update({
+                'filename': successful[0][0].name,
+                'caption': successful[0][1],
+            })
+        update_auto_caption_job(
+            job_id,
+            status='stopped' if stopped else 'completed',
+            currentItem=None,
+            progressPercent=(
+                round(((len(successful) + len(errors)) / len(image_paths)) * 100, 1)
+                if stopped and image_paths else 100.0
+            ),
+            result=result,
+            finished=True,
+            finishedAt=utc_now_iso()
+        )
+    except Exception as exc:
+        update_auto_caption_job(
+            job_id,
+            status='error',
+            currentItem=None,
+            error=str(exc),
+            finished=True,
+            finishedAt=utc_now_iso()
+        )
+    finally:
+        if staging_dir is not None and staging_dir.is_dir():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        release_datasets(job_id)
+
+
+def _start_auto_caption_job(folder, config, *, apply_all, missing_only=False):
+    dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+    catalog = scan_gguf_catalog(MODELS_LLM_DIR)
+    config = normalize_auto_caption_config(config, catalog=catalog, require_model=True)
+    resolve_catalog_variant(MODELS_LLM_DIR, config['modelId'], config['variantId'])
+    all_images = _auto_caption_image_paths(dataset_dir)
+    if not all_images:
+        raise FileNotFoundError('No target images were found in this dataset')
+    if apply_all and missing_only:
+        image_paths = [
+            image_path
+            for image_path in all_images
+            if not image_path.with_suffix('.txt').is_file()
+            or not image_path.with_suffix('.txt').read_text(encoding='utf-8').strip()
+        ]
+        if not image_paths:
+            raise FileNotFoundError('All target images already have captions')
+    else:
+        image_paths = all_images if apply_all else [random.choice(all_images)]
+
+    job_id = uuid.uuid4().hex
+    conflicts = claim_datasets([folder], job_id)
+    if conflicts:
+        raise RuntimeError('Dataset is busy with another operation')
+
+    try:
+        with AUTO_CAPTION_JOBS_LOCK:
+            prune_finished_jobs(AUTO_CAPTION_JOBS)
+            AUTO_CAPTION_JOBS[job_id] = {
+                'jobId': job_id,
+                'mode': 'apply' if apply_all else 'preview',
+                'missingOnly': bool(apply_all and missing_only),
+                'status': 'queued',
+                'processedItems': 0,
+                'totalItems': len(image_paths),
+                'progressPercent': 0.0,
+                'currentItem': None,
+                'items': [
+                    {'filename': image_path.name, 'status': 'queued'}
+                    for image_path in image_paths
+                ],
+                'result': None,
+                'error': None,
+                'finished': False,
+                'stopRequested': False,
+                'createdAt': utc_now_iso(),
+                'finishedAt': None,
+            }
+        worker = threading.Thread(
+            target=run_auto_caption_job,
+            args=(job_id, folder, config, image_paths),
+            kwargs={'apply_all': apply_all, 'missing_only': missing_only},
+            name=f'auto-caption-{job_id[:8]}',
+            daemon=True,
+        )
+        worker.start()
+        return AUTO_CAPTION_JOBS[job_id]
+    except Exception:
+        release_datasets(job_id)
+        raise
+
+
+@app.route('/api/auto-caption/models')
+def auto_caption_models():
+    return jsonify(scan_gguf_catalog(MODELS_LLM_DIR))
+
+
+@app.route('/api/auto-caption/config', methods=['GET', 'POST'])
+def auto_caption_config():
+    folder = request.args.get('folder', '')
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+    dataset_dir = resolve_dataset_dir(folder, must_exist=True)
+    config_path = dataset_dir / '.auto_caption_config.json'
+
+    if request.method == 'GET':
+        config = dict(DEFAULT_AUTO_CAPTION_CONFIG)
+        if config_path.is_file():
+            saved = json.loads(config_path.read_text(encoding='utf-8'))
+            if isinstance(saved, dict):
+                config.update(saved)
+        try:
+            return jsonify(normalize_auto_caption_config(config))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+
+    try:
+        config = normalize_auto_caption_config(
+            request.get_json() or {},
+            catalog=scan_gguf_catalog(MODELS_LLM_DIR)
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    atomic_write_text(config_path, json.dumps(config, ensure_ascii=False, indent=2))
+    return jsonify({'success': True})
+
+
+@app.route('/api/auto-caption/preview', methods=['POST'])
+def auto_caption_preview():
+    data = request.get_json() or {}
+    folder = data.get('folder', '')
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+    try:
+        job = _start_auto_caption_job(folder, data.get('config', {}), apply_all=False)
+        return jsonify({'success': True, 'jobId': job['jobId']})
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/auto-caption/apply', methods=['POST'])
+def auto_caption_apply():
+    data = request.get_json() or {}
+    folder = data.get('folder', '')
+    if not folder:
+        return jsonify({'error': 'folder required'}), 400
+    try:
+        missing_only = data.get('missingOnly', False)
+        if not isinstance(missing_only, bool):
+            raise ValueError('missingOnly must be a boolean')
+        job = _start_auto_caption_job(
+            folder,
+            data.get('config', {}),
+            apply_all=True,
+            missing_only=missing_only,
+        )
+        return jsonify({
+            'success': True,
+            'jobId': job['jobId'],
+            'totalItems': job['totalItems'],
+        })
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/auto-caption/jobs/<job_id>')
+def auto_caption_job_status(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return jsonify({'error': 'Auto Caption job not found'}), 404
+        return jsonify(job)
+
+
+@app.route('/api/auto-caption/jobs/<job_id>/stop', methods=['POST'])
+def auto_caption_job_stop(job_id):
+    with AUTO_CAPTION_JOBS_LOCK:
+        job = AUTO_CAPTION_JOBS.get(job_id)
+        if not job:
+            return jsonify({'error': 'Auto Caption job not found'}), 404
+        if job.get('finished'):
+            return jsonify({'error': 'Auto Caption job has already finished'}), 409
+        job['stopRequested'] = True
+        return jsonify({'success': True})
+
+
 @app.route('/api/stitch', methods=['POST'])
 def stitch_images():
     """Stitch multiple image sets into a single new entry"""
@@ -3674,10 +4280,15 @@ def stitch_images():
 
 
 if __name__ == '__main__':
-    host = os.environ.get('QDM_HOST', '127.0.0.1')
+    host = os.environ.get('QDM_HOST', '0.0.0.0')
     port = int(os.environ.get('QDM_PORT', '5001'))
     debug = os.environ.get('QDM_DEBUG', '').lower() in {'1', 'true', 'yes'}
     print(f"Starting Dataset Manager...")
     print(f"Base directory: {BASE_DIR}")
-    print(f"Open http://{host}:{port} in your browser")
+    if host in {'0.0.0.0', '::'}:
+        print(f"Local URL: http://127.0.0.1:{port}")
+        for address in discover_local_ipv4_addresses():
+            print(f"Network URL: http://{address}:{port}")
+    else:
+        print(f"Open http://{host}:{port} in your browser")
     app.run(debug=debug, host=host, port=port)

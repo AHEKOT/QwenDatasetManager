@@ -1,0 +1,26 @@
+{
+  "architecture": "qdm_keymatte_v4",
+  "trained_checkpoint": null,
+  "device": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+  "torch": "2.13.0+cu130",
+  "threads": 4,
+  "tile": 512,
+  "parameters": 539519,
+  "fp16_weights_mib": 1.0290508270263672,
+  "measurements": [
+    {
+      "size": "1280x720",
+      "median_ms": 615.5330000001413,
+      "min_ms": 587.4124999995729,
+      "max_ms": 637.9600999998729,
+      "peak_cuda_allocated_mib": null
+    },
+    {
+      "size": "1920x1080",
+      "median_ms": 1420.9771999999248,
+      "min_ms": 1403.7368999997852,
+      "max_ms": 1427.5678000003609,
+      "peak_cuda_allocated_mib": null
+    }
+  ]
+}

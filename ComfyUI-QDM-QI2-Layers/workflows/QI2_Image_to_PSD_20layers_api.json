@@ -1,0 +1,111 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_8b_bf16.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "select_input_image.png"
+    }
+  },
+  "5": {
+    "class_type": "QDMLayeredQI2LoRA",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "select_your_trained_layer_lora.safetensors",
+      "layer_slots": 20,
+      "strength": 1.0
+    }
+  },
+  "6": {
+    "class_type": "QDMLayeredQI2Conditioning",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ],
+      "image": [
+        "4",
+        0
+      ],
+      "prompt": "Create layered image from image 1",
+      "negative_prompt": "",
+      "width": 1024,
+      "height": 1024,
+      "match_reference_area": true
+    }
+  },
+  "7": {
+    "class_type": "QDMLayeredQI2Sampler",
+    "inputs": {
+      "model": [
+        "5",
+        0
+      ],
+      "conditioning": [
+        "6",
+        0
+      ],
+      "seed": 0,
+      "steps": 40,
+      "cfg": 1.0
+    }
+  },
+  "8": {
+    "class_type": "QDMLayeredQI2Decode",
+    "inputs": {
+      "samples": [
+        "7",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "QDMLayeredQI2Save",
+    "inputs": {
+      "document": [
+        "8",
+        0
+      ],
+      "filename_prefix": "QI2-Layers/layered"
+    }
+  },
+  "10": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "8",
+        2
+      ]
+    }
+  }
+}

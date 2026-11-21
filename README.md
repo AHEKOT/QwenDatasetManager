@@ -11,7 +11,9 @@ A local web application for managing, reviewing, editing, and transforming Qwen 
 - ⌨️ **Keyboard Navigation** - Navigate with arrow keys, toggle with space, delete with backspace
 - 🧰 **Dataset Tools** - Reshuffle, compress, fit, blur, mirror, merge, import, export, and duplicate review
 - ✏️ **Editing** - Paint/crop images and edit captions with synchronized controls
+- 🤖 **Auto Caption** - Generate preview and full-dataset captions with local GGUF vision-language models through llama.cpp
 - 🗑️ **Recoverable Deletion** - Move complete image/control/caption sets into a hidden `.trash` folder
+- 🚀 **CUDA Trainer** - Train LoRAs, RGBA VAEs, and the compact alpha-first QDM CleanMatte chromakey model from managed datasets
 
 ## Dataset Structure
 
@@ -29,20 +31,147 @@ All three folders must contain images with matching filenames (e.g., `image_0000
 
 ## Installation
 
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+The full installer creates separate virtual environments for the application
+and CUDA trainer, installs their pinned dependencies, and runs import,
+dependency, and CUDA checks.
 
-2. **Run the server**:
-   ```bash
-   python app.py
-   ```
+The application environment also installs `llama-cpp-python`. Its CUDA wheel
+is selected automatically when an NVIDIA GPU is present; otherwise the CPU
+wheel is used.
 
-3. **Open your browser**:
-   Navigate to `http://127.0.0.1:5001`
+### Windows
 
-The server binds to localhost by default. To deliberately expose it on another interface, set `QDM_HOST` and list accepted hostnames in `QDM_TRUSTED_HOSTS`; use a trusted network and a reverse proxy with authentication. `QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are also configurable environment variables.
+Requirements: 64-bit Windows, Git, an NVIDIA GPU with a current driver, an
+internet connection, and at least 10 GB of free space. Python does not need to
+be installed in advance: the installer downloads the signed official Python
+3.12.10 installer and installs it for the current user when necessary.
+
+Double-click `install.cmd`, or run it from a terminal:
+
+```cmd
+install.cmd
+```
+
+Useful variants:
+
+```powershell
+# Install only the dataset manager, without CUDA dependencies
+.\install.ps1 -SkipTrainer
+
+# Install or repair only the CUDA trainer
+install_trainer.cmd
+
+# Do not pause the cmd wrapper (useful for CI and scripts)
+set QDM_NO_PAUSE=1
+install.cmd
+```
+
+If Python 3.12 is installed in a non-standard location, set
+`QDM_PYTHON312` to its `python.exe` before running the installer. Re-running
+the installer is safe: compatible environments and installed packages are
+reused, while incomplete environments are repaired.
+
+### Linux
+
+Install Python 3.12 with its `venv` module, Git, and the current NVIDIA driver,
+then run:
+
+```bash
+./install.sh
+```
+
+Use `./install.sh --skip-trainer` on a machine that only needs the dataset
+manager. `./install_trainer.sh` installs or repairs only the trainer. The CUDA
+trainer is not supported on macOS.
+
+### Run
+
+```cmd
+# Windows
+run.cmd
+```
+
+```bash
+# Linux
+./run.sh
+```
+
+The server prints both the local URL and every detected LAN URL at startup. It
+binds to all local interfaces by default and automatically trusts the machine
+hostname and detected local IP addresses. To restrict it to this computer, set
+`QDM_HOST=127.0.0.1`. Use `QDM_TRUSTED_HOSTS` to override accepted hostnames.
+`QDM_PORT`, `QDM_DEBUG`, `QDM_MAX_UPLOAD_MB`, and `QDM_MAX_IMAGE_PIXELS` are
+also configurable environment variables.
+
+LAN access should only be enabled on a trusted network. Internet exposure
+requires a reverse proxy or VPN with authentication; do not forward the Flask
+development server port directly to the internet.
+
+### CUDA trainer
+
+The trainer remains isolated in `trainer/.venv`. The installer intentionally
+keeps the CUDA dependency set used by the vendored AI Toolkit backend and does
+not provide a macOS or MPS fallback. After installation, start or restart the
+app and open **Trainer** from the main screen.
+
+The trainer supports:
+
+- Qwen Image Edit 2511
+- Qwen Image 2.1 (text-to-image, editing and native RGBA; see [setup](trainer/QWEN21.md))
+- Qwen Image 2.1 Joint PSD layers LoRA (PSD targets, optional Control1, joint layer denoising and PSD samples; [dataset format](trainer/QWEN21_LAYERS.md))
+- Standalone [ComfyUI QI2 Layers nodes and workflows](ComfyUI-QDM-QI2-Layers/README.md) for applying joint-layer adapters and exporting PSD/RGBA layers.
+- FLUX.2 Klein Base 4B
+- FLUX.2 Klein Base 9B (gated model; requires Hugging Face access and is subject to the FLUX non-commercial license)
+- QDM CleanMatte (82,287 parameters; semantic classification and native alpha refinement)
+
+Each selected dataset is passed to AI Toolkit as a separate dataset entry: `img/` is the target and every present `Control1/`, `Control2/`, and `Control3/` folder is a control-image source. Jobs, queue state, progress, and logs are stored under `trainer/`; model checkpoints are written to `trainer/output/`.
+
+Transparent RGBA LoRA jobs expose an Edit/Generation switch on every selected
+training dataset. Edit mode requires a separate managed background dataset and
+places a random opaque image from its `img/` folder behind each RGBA target;
+Generation mode creates a black Control1. Transparent modes do not use the
+target dataset's paired Control folders.
+
+CleanMatte trains clean alpha from RGBA sources. A small semantic classifier
+and native-resolution refiner identify background, opaque foreground, and
+mixed edge pixels. RGB corruption is introduced after a clean training phase;
+there are no foreground-RGB or despill training losses. Exact pixel duplicates
+are grouped before the source holdout is selected. Crops retain native detail;
+full-object examples are letterboxed without distorting their aspect ratio.
+
+Create a **new CleanMatte job** in the trainer model selector. Existing
+ChromaKey weights and optimizer states cannot initialize this architecture.
+The queue uses an independent runner and does not import the legacy trainer.
+The best alpha model is exported as safetensors; the latest optimizer state is
+saved separately. Validation sheets are lossless PNG and display alpha with
+colour correction disabled. Quantitative metrics are measurements, not an
+automatic claim that real-world quality is ready.
+
+The root [`ComfyUI-QDM-ChromaKey`](ComfyUI-QDM-ChromaKey/README.md) package now
+registers **QDM Load CleanMatte** and **QDM CleanMatte (alpha first)**. Copy the
+new checkpoint into `ComfyUI/models/cleanmatte/`. Inference preserves source
+resolution, checks all native pixels in tiles, and supports CPU. Optional
+screen subtraction/despill operates on a fixed alpha and defaults to off.
+
+The [CleanMatte implementation and training guide](trainer/ai_toolkit/extensions/cleanmatte_training/README.md)
+records the architecture, clean-label contract, training settings, checks and
+remaining quality limitations.
+
+The training screen mirrors the AI Toolkit LoRA Trainer settings that apply to
+these three edit architectures: the complete transformer/text-encoder
+quantization lists (including Qwen 2511 ARA), LoRA and LoKr, validation,
+sampling, schedulers, EMA, regularization, compilation and layer offloading.
+Every job also has a live **Samples** tab (labelled **VAE Validation** or
+**Chroma Validation** for those specialized modes) with per-step grouping,
+prompt/seed metadata, full-size
+navigation, control-image switching, deletion and ZIP download. The viewer is
+ported from the locally modified AI Toolkit UI and preserves transparent PNG
+previews over a checkerboard instead of flattening alpha.
+`Name or Path` accepts either a local model path or a Hugging Face repository;
+the vendored backend downloads Hugging Face models in the same way as AI
+Toolkit and uses the token saved in Trainer settings. See
+[`trainer/PARITY.md`](trainer/PARITY.md) for the audited field matrix and the
+architecture-specific restrictions retained from upstream.
 
 ## Usage
 
@@ -52,6 +181,43 @@ The server binds to localhost by default. To deliberately expose it on another i
 4. **Toggle overlay** to compare img with Control1 (img becomes semi-transparent)
 5. **Navigate** using arrow keys or on-screen buttons
 6. **Delete** mismatched sets by pressing Backspace/Delete
+
+### Local Auto Caption models
+
+Put multimodal GGUF files in `models/llm/`. A selectable model needs both the
+language-model GGUF and its matching vision projector (`mmproj`) GGUF. Multiple
+language-model quantizations are grouped under one model automatically. For
+example:
+
+```text
+models/llm/
+├── Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+├── Qwen2.5-VL-7B-Instruct-Q8_0.gguf
+└── mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
+```
+
+Qwen 3.5 multimodal GGUF pairs are also supported through llama.cpp's generic
+multimodal handler (for example, `Qwen3.5-4B-Q8_0.gguf` together with its
+matching `mmproj-Qwen3.5-4B-BF16.gguf`).
+
+Open **Process Text → Auto Caption**, rescan the directory, choose the model
+and quantization, then generate a random preview, generate only missing/empty
+captions, or replace captions for the whole dataset. Existing caption files are
+backed up under `.auto-caption-backup/` before a completed replacement batch is
+written. A running batch can be stopped after its current image; captions that
+already completed are still saved.
+
+## Caption Post-processing
+
+Open **Process Text → Post-processing** to add a literal prefix or suffix, or
+find and replace text across every existing caption in the selected dataset.
+Replacement is case-sensitive and replaces all exact occurrences; an empty
+replacement deletes the matching text. Replacements run before the prefix and
+suffix are added. Include any needed spaces, commas or line breaks in the fields.
+
+Preview shows before/after samples and the total number of captions that will
+change. **Apply to All** backs up the original files under `.postprocess-backup/`
+before saving. Empty caption files are included; missing captions are not created.
 
 ## Keyboard Shortcuts
 
@@ -66,6 +232,7 @@ The server binds to localhost by default. To deliberately expose it on another i
 ## Technical Stack
 
 - **Backend**: Python Flask
+- **Local VLM runtime**: llama.cpp via `llama-cpp-python`
 - **Frontend**: Vanilla JavaScript, HTML5, CSS3
 - **Design**: Modern dark theme with glassmorphism and smooth animations
 

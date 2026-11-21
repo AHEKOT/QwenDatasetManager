@@ -152,8 +152,6 @@ class QwenDatasetSaver:
                             control_image = self.create_black_image(target_image.size)
                         if control_image is None:
                             continue
-                        if control_image.size != target_image.size:
-                            raise ValueError(f"{folder_name} size does not match target size")
                         control_path = directories[folder_name] / filename
                         self.save_png_atomic(control_image, control_path)
                         written_paths.append(control_path)

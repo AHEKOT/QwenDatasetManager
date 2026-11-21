@@ -1,0 +1,63 @@
+# Vendored AI Toolkit trainer
+
+The CUDA training backend in `ai_toolkit/` is a restricted source copy of
+[ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) at commit:
+
+`8a912564ce60047ea44d0f3a98becf3f168d3094`
+
+Upstream is MIT licensed. Its original `LICENSE` is preserved in
+`ai_toolkit/LICENSE`.
+
+## Included scope
+
+- shared `toolkit/` training core;
+- `jobs/` with the extension job entry point;
+- `extensions_built_in/sd_trainer/`;
+- Qwen Image Edit Plus model adapter;
+- Qwen Image 2.1 model, transformer, Qwen3-VL adapter and native RGBA VAE,
+  ported from `D:\AiToolkitNew\AI-Toolkit` at
+  `ecee894ed2b1f3716d9d7326693061ec1a3105bb`. See [QWEN21.md](QWEN21.md).
+- FLUX.2 Klein 4B and 9B model adapters.
+- MiniMax H3 / Ref2VA and their complete dependencies, ported from the local
+  `D:\AiToolkitNew\AI-Toolkit` checkout at
+  `3e1cb5f67f7bebe6ac74e3da5105d18fb3c1dd5a`. See [H3.md](H3.md) for the field
+  audit, local model paths, RGBA additions and verification scope.
+
+The corresponding Simple UI field audit and intentional architecture limits
+are recorded in [`PARITY.md`](PARITY.md). The QDM screen replaces only the
+upstream folder pickers with managed dataset selection; the applicable trainer
+settings continue to produce the same process keys consumed by this vendored
+backend.
+
+Qwen Dataset Manager does not run the upstream Next.js application as a second
+web server. Applicable trainer UI behavior is ported into QDM's Flask/vanilla
+UI instead. This includes the modified Samples / VAE Validation subsystem from
+`D:\AiToolkitNew\AI-Toolkit` (live polling, grouped gallery, metadata,
+full-screen navigation, control images, deletion, ZIP download, and
+alpha-preserving checkerboard previews). The unrelated upstream manager,
+dataset editor, captioning extensions and unrelated image/video/audio model
+adapters are not part of this trainer integration.
+
+## Local integration changes
+
+- the model registry exposes Qwen Image Edit Plus, Qwen Image 2.1, FLUX.2 Klein, and H3/Ref2VA;
+- built-in legacy model imports were removed from `toolkit/util/get_model.py`;
+- `jobs/__init__.py` imports only `BaseJob` and `ExtensionJob`.
+- `extensions/rgba_training/` adds opt-in transparent LoRA architectures and a
+  Qwen RGBA VAE process without changing the standard model entries;
+- `extensions/cleanmatte_training/` and `run_cleanmatte.py` implement the
+  independent alpha-first CleanMatte trainer. Legacy chromakey files are
+  retained but are not used by new jobs; diffusion trainers are unchanged;
+- the dataloader can preserve RGBA targets, sanitize hidden matte RGB, resize
+  alpha safely, and create edit/generation controls;
+- sampling-only LoRAs use AI Toolkit's native adapter hooks and are inactive
+  outside preview generation;
+- alpha-bearing samples and thumbnails are saved as PNG;
+- the local Qwen VAE process reports progress and consumes stop/save/validation
+  flags from QDM's SQLite queue.
+- upstream `info.py` and `version.py` are retained because the shared metadata
+  module imports them during every model backend startup.
+
+Diffusion training math, dataloading, quantization, model loading, LoRA
+creation, checkpoint saving and sampling remain upstream implementations. The
+QDM RGBA and chromakey extensions are intentionally local implementations.

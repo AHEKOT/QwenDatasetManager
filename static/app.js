@@ -51,6 +51,7 @@ let comparisonControlView = null; // Which control is shown in comparison view (
 let linkedDataset = null; // Linked dataset for synchronized operations
 let mainEditor = null; // Main editor instance
 let comparisonEditor = null; // Comparison editor instance
+let previewLoadToken = 0;
 let captionRequestController = null;
 let captionLoadToken = 0;
 let captionLoadedKey = '';
@@ -579,7 +580,10 @@ function submitDatasetNameModal() {
 async function renameCurrentDataset() {
     const selectedFolder = currentFolder || folderSelect.value;
     if (!selectedFolder || selectedFolder === '__create_new__') {
-        alert('Please select a dataset folder first.');
+        await appDialog.alert('Please select a dataset folder first.', {
+            title: 'Dataset Required',
+            tone: 'warning'
+        });
         return;
     }
 
@@ -616,11 +620,17 @@ async function renameCurrentDataset() {
             await loadImages(data.path);
             saveAppState();
         } else {
-            alert(`Failed to rename dataset: ${data.error}`);
+            await appDialog.alert(`Failed to rename dataset: ${data.error}`, {
+                title: 'Rename Failed',
+                tone: 'error'
+            });
         }
     } catch (error) {
         console.error('Failed to rename dataset:', error);
-        alert('Failed to rename dataset. Check console for details.');
+        await appDialog.alert('Failed to rename dataset. Check console for details.', {
+            title: 'Rename Failed',
+            tone: 'error'
+        });
     } finally {
         renameDatasetBtn.disabled = false;
     }
@@ -651,17 +661,26 @@ async function createNewDataset() {
         const data = await response.json();
 
         if (data.success) {
-            alert(`Dataset "${data.name}" created successfully!`);
+            await appDialog.alert(`Dataset "${data.name}" created successfully!`, {
+                title: 'Dataset Created',
+                tone: 'success'
+            });
             await loadFolders(); // Reload folder list
             folderSelect.value = data.path; // Select new dataset
             loadImages(data.path);
         } else {
-            alert(`Failed to create dataset: ${data.error}`);
+            await appDialog.alert(`Failed to create dataset: ${data.error}`, {
+                title: 'Creation Failed',
+                tone: 'error'
+            });
             folderSelect.value = '';
         }
     } catch (error) {
         console.error('Failed to create dataset:', error);
-        alert('Failed to create dataset. Check console for details.');
+        await appDialog.alert('Failed to create dataset. Check console for details.', {
+            title: 'Creation Failed',
+            tone: 'error'
+        });
         folderSelect.value = '';
     }
 }
@@ -727,11 +746,17 @@ async function checkOrphanFiles() {
         const data = await response.json();
 
         if (data.orphans && data.orphans.length > 0) {
-            const deleteOrphans = confirm(
+            const deleteOrphans = await appDialog.confirm(
                 `Found ${data.orphans.length} orphan file(s) in linked dataset ` +
                 `that don't exist in primary dataset.\n\n` +
                 `Examples: ${data.orphans.slice(0, 3).join(', ')}${data.orphans.length > 3 ? '...' : ''}\n\n` +
-                `Delete these orphan files?`
+                `Delete these orphan files?`,
+                {
+                    title: 'Orphan Files Found',
+                    tone: 'warning',
+                    confirmLabel: 'Delete Files',
+                    danger: true
+                }
             );
 
             if (deleteOrphans) {
@@ -756,7 +781,10 @@ async function deleteOrphanFiles(orphans) {
             console.error(`Failed to delete orphan ${filename}:`, error);
         }
     }
-    alert(`Deleted ${deleted} orphan file(s) from linked dataset.`);
+    await appDialog.alert(`Deleted ${deleted} orphan file(s) from linked dataset.`, {
+        title: 'Cleanup Complete',
+        tone: 'success'
+    });
 }
 
 // Load images from selected folder
@@ -1570,7 +1598,10 @@ async function keepDuplicateSide(side) {
 
 async function openToolsModal() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        await appDialog.alert('Please select a dataset folder first.', {
+            title: 'Dataset Required',
+            tone: 'warning'
+        });
         return;
     }
     if (modal.classList.contains('active') && !await checkUnsavedWork()) return;
@@ -2048,6 +2079,11 @@ function updatePreview() {
     const filename = images[currentIndex];
     const baseUrl = `/api/image`;
     const folderParam = `?folder=${encodeURIComponent(currentFolder)}${fileBuster(filename)}`;
+    const targetUrl = activeControlView
+        ? `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`
+        : `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
+    const primaryControlUrl = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
+    const loadToken = ++previewLoadToken;
     const imageContainer = document.querySelector('.image-container');
 
     if (!imageContainer) {
@@ -2071,13 +2107,6 @@ function updatePreview() {
         console.log('Removed comparison-mode class');
     }
 
-    // Update preview images
-    if (activeControlView) {
-        previewImg.src = `${baseUrl}/${activeControlView}/${encodeURIComponent(filename)}${folderParam}`;
-    } else {
-        previewImg.src = `${baseUrl}/img/${encodeURIComponent(filename)}${folderParam}`;
-    }
-    previewControl.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
     currentFilename.textContent = filename;
 
     // Load caption
@@ -2098,32 +2127,65 @@ function updatePreview() {
         setTimeout(() => comparisonEditor.fitToScreen(), 50);
     }
 
-    // Initialize main canvas editor
-    previewImg.onload = () => {
+    // Initialize the canvas as soon as the target loads. Control1 is optional:
+    // target-only datasets (for example TransparentVAE) must still be viewable.
+    const initializeMainEditor = (controlImage) => {
+        if (loadToken !== previewLoadToken) return;
+
+        const canvas = document.getElementById('edit-canvas');
+        const subfolder = activeControlView || 'img';
+        if (!mainEditor) {
+            mainEditor = new ImageEditor(canvas, previewImg, controlImage, previewControl, subfolder);
+            mainEditor.onStateChange = syncEditorButtons;
+        } else {
+            mainEditor.targetImageElement = previewImg;
+            mainEditor.controlImageElement = controlImage;
+            mainEditor.overlayElement = previewControl;
+            mainEditor.subfolder = subfolder;
+            mainEditor.onStateChange = syncEditorButtons;
+            mainEditor.history = [];
+            mainEditor.hasChanges = false;
+            mainEditor.setupCanvas();
+        }
+        mainEditor.currentFilename = filename;
+        mainEditor.currentFolder = currentFolder;
+        mainEditor.updateSaveButton();
+    };
+
+    let targetLoadHandled = false;
+    const handleTargetLoad = () => {
+        if (targetLoadHandled || loadToken !== previewLoadToken) return;
+        targetLoadHandled = true;
+
         const controlImg = new Image();
         controlImg.crossOrigin = 'anonymous';
-        controlImg.src = `${baseUrl}/Control1/${encodeURIComponent(filename)}${folderParam}`;
-        controlImg.onload = () => {
-            const canvas = document.getElementById('edit-canvas');
-            const subfolder = activeControlView || 'img';
-            if (!mainEditor) {
-                mainEditor = new ImageEditor(canvas, previewImg, controlImg, previewControl, subfolder);
-                mainEditor.onStateChange = syncEditorButtons;
-            } else {
-                mainEditor.targetImageElement = previewImg;
-                mainEditor.controlImageElement = controlImg;
-                mainEditor.overlayElement = previewControl;
-                mainEditor.subfolder = subfolder;
-                mainEditor.onStateChange = syncEditorButtons;
-                mainEditor.history = [];
-                mainEditor.hasChanges = false;
-                mainEditor.setupCanvas();
-            }
-            mainEditor.currentFilename = filename;
-            mainEditor.currentFolder = currentFolder;
-            mainEditor.updateSaveButton();
+        let controlLoadHandled = false;
+        const finishControlLoad = (image) => {
+            if (controlLoadHandled) return;
+            controlLoadHandled = true;
+            initializeMainEditor(image);
         };
+        controlImg.onload = () => finishControlLoad(controlImg);
+        controlImg.onerror = () => finishControlLoad(previewImg);
+        controlImg.src = primaryControlUrl;
+
+        // Reassigning an already cached URL does not consistently emit load in
+        // every browser, so handle the completed state explicitly as well.
+        if (controlImg.complete) {
+            finishControlLoad(controlImg.naturalWidth > 0 ? controlImg : previewImg);
+        }
     };
+    previewImg.onload = handleTargetLoad;
+    previewImg.onerror = () => {
+        if (loadToken === previewLoadToken) {
+            console.error(`Failed to load preview image: ${targetUrl}`);
+        }
+    };
+    previewImg.src = targetUrl;
+    previewControl.src = primaryControlUrl;
+    if (previewImg.complete && previewImg.naturalWidth > 0) {
+        handleTargetLoad();
+    }
 
     // Initialize comparison canvas editor if comparison mode is active
     if (comparisonControlView) {
@@ -2331,11 +2393,17 @@ async function transferCurrentImage() {
 
             console.log(`${actionLabel} complete:`, activeMode === 'copy' ? data.copied : data.transferred);
         } else {
-            alert(`Failed to ${activeMode}: ${data.error || 'Unknown error'}`);
+            await appDialog.alert(`Failed to ${activeMode}: ${data.error || 'Unknown error'}`, {
+                title: 'Transfer Failed',
+                tone: 'error'
+            });
         }
     } catch (error) {
         console.error(`Failed to ${activeMode} image:`, error);
-        alert(`Failed to ${activeMode} image. Check console for details.`);
+        await appDialog.alert(`Failed to ${activeMode} image. Check console for details.`, {
+            title: 'Transfer Failed',
+            tone: 'error'
+        });
     } finally {
         transferBtn.disabled = false;
         updateTransferMode(transferMode);
@@ -2379,12 +2447,18 @@ async function duplicateCurrentImage() {
 
             console.log('Duplicated to:', data.newFilename);
         } else {
-            alert(`Failed to duplicate: ${data.error}`);
+            await appDialog.alert(`Failed to duplicate: ${data.error}`, {
+                title: 'Duplicate Failed',
+                tone: 'error'
+            });
         }
 
     } catch (error) {
         console.error('Duplicate failed:', error);
-        alert('Failed to duplicate. Check console.');
+        await appDialog.alert('Failed to duplicate. Check console.', {
+            title: 'Duplicate Failed',
+            tone: 'error'
+        });
     } finally {
         duplicateBtn.disabled = false;
         duplicateBtn.innerHTML = `
@@ -2452,11 +2526,17 @@ async function deleteCurrentImage() {
                 console.warn('Warnings:', data.errors);
             }
         } else {
-            alert(`Failed to delete: ${data.error || 'Unknown error'}`);
+            await appDialog.alert(`Failed to delete: ${data.error || 'Unknown error'}`, {
+                title: 'Delete Failed',
+                tone: 'error'
+            });
         }
     } catch (error) {
         console.error('Failed to delete image:', error);
-        alert('Failed to delete image. Check console for details.');
+        await appDialog.alert('Failed to delete image. Check console for details.', {
+            title: 'Delete Failed',
+            tone: 'error'
+        });
     }
 }
 
@@ -2928,12 +3008,18 @@ async function saveCurrentCaption() {
             setTimeout(() => { saveCaptionBtn.style.background = originalBackground; }, 1000);
             return savedCurrentCaption;
         } else {
-            alert(`Failed to save caption: ${data.error}`);
+            await appDialog.alert(`Failed to save caption: ${data.error}`, {
+                title: 'Save Failed',
+                tone: 'error'
+            });
             return false;
         }
     } catch (error) {
         console.error('Failed to save caption:', error);
-        alert('Failed to save caption. Check console for details.');
+        await appDialog.alert('Failed to save caption. Check console for details.', {
+            title: 'Save Failed',
+            tone: 'error'
+        });
         return false;
     } finally {
         saveCaptionBtn.disabled = false;
@@ -2964,11 +3050,17 @@ async function openInPixelmator() {
         if (data.success) {
             console.log('Opened in Pixelmator Pro');
         } else {
-            alert(`Failed to open in Pixelmator: ${data.error}`);
+            await appDialog.alert(`Failed to open in Pixelmator: ${data.error}`, {
+                title: 'Pixelmator Error',
+                tone: 'error'
+            });
         }
     } catch (error) {
         console.error('Pixelmator opening failed:', error);
-        alert('Failed to call Pixelmator API. Check console.');
+        await appDialog.alert('Failed to call Pixelmator API. Check console.', {
+            title: 'Pixelmator Error',
+            tone: 'error'
+        });
     } finally {
         pixelmatorBtn.disabled = false;
         pixelmatorBtn.classList.remove('loading');
@@ -3281,18 +3373,72 @@ const ptPreviewBtn  = document.getElementById('pt-preview-btn');
 const ptApplyBtn    = document.getElementById('pt-apply-btn');
 const ptSaveBtn     = document.getElementById('pt-save-config-btn');
 const ptLoadBtn     = document.getElementById('pt-load-config-btn');
+const ptTabButtons  = Array.from(ptModal.querySelectorAll('[data-pt-tab]'));
+const ptTabPanels   = Array.from(ptModal.querySelectorAll('[data-pt-panel]'));
+const ptFooterGroups = Array.from(ptModal.querySelectorAll('[data-pt-footer]'));
+
+const ppPrefix = document.getElementById('pp-prefix');
+const ppSuffix = document.getElementById('pp-suffix');
+const ppFind = document.getElementById('pp-find');
+const ppReplace = document.getElementById('pp-replace');
+const ppFields = [ppPrefix, ppSuffix, ppFind, ppReplace];
+const ppPreviewList = document.getElementById('pp-preview-list');
+const ppPreviewCount = document.getElementById('pp-preview-count');
+const ppPreviewBtn = document.getElementById('pp-preview-btn');
+const ppRefreshBtn = document.getElementById('pp-refresh-btn');
+const ppApplyBtn = document.getElementById('pp-apply-btn');
+const ppStatus = document.getElementById('pp-status');
+let ppInitializedFolder = '';
+let ppPreviewDebounce = null;
+let ppPreviewController = null;
+let ppPreviewSequence = 0;
+let ppBusy = false;
+
+const acSystemPrompt = document.getElementById('ac-system-prompt');
+const acModelSelect = document.getElementById('ac-model-select');
+const acQuantSelect = document.getElementById('ac-quant-select');
+const acPrefix = document.getElementById('ac-prefix');
+const acSuffix = document.getElementById('ac-suffix');
+const acModelStatus = document.getElementById('ac-model-status');
+const acPreviewImage = document.getElementById('ac-preview-image');
+const acPreviewEmpty = document.getElementById('ac-preview-empty');
+const acPreviewFilename = document.getElementById('ac-preview-filename');
+const acPreviewCaption = document.getElementById('ac-preview-caption');
+const acProgress = document.getElementById('ac-progress');
+const acProgressLabel = document.getElementById('ac-progress-label');
+const acProgressPercent = document.getElementById('ac-progress-percent');
+const acProgressFill = document.getElementById('ac-progress-fill');
+const acProgressItems = document.getElementById('ac-progress-items');
+const acRescanBtn = document.getElementById('ac-rescan-btn');
+const acLoadBtn = document.getElementById('ac-load-config-btn');
+const acSaveBtn = document.getElementById('ac-save-config-btn');
+const acPreviewBtn = document.getElementById('ac-preview-btn');
+const acRerollBtn = document.getElementById('ac-reroll-btn');
+const acMissingBtn = document.getElementById('ac-missing-btn');
+const acApplyBtn = document.getElementById('ac-apply-btn');
+const acStopBtn = document.getElementById('ac-stop-btn');
 
 let ptPreviewDebounce = null;
+let acCatalog = { models: [], warnings: [], directory: 'models/llm' };
+let acInitializedFolder = '';
+let acSaveDebounce = null;
+let acBusy = false;
+let acActiveJobId = '';
+let acStopRequested = false;
 
 // ── Open / Close ─────────────────────────────────────────────────────────────
 
 async function openProcessTextModal() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        await appDialog.alert('Please select a dataset folder first.', {
+            title: 'Dataset Required',
+            tone: 'warning'
+        });
         return;
     }
     ptModal.classList.add('active');
-    await ptLoadConfig();
+    ppInitialize();
+    await Promise.all([ptLoadConfig(), acInitialize()]);
     ptCloseBtn.focus();
 }
 
@@ -3301,6 +3447,19 @@ function closeProcessTextModal() {
 }
 
 ptCloseBtn.addEventListener('click', closeProcessTextModal);
+
+function ptSelectTab(tabName) {
+    ptTabButtons.forEach(button => {
+        const active = button.dataset.ptTab === tabName;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    ptTabPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.ptPanel === tabName));
+    ptFooterGroups.forEach(group => group.classList.toggle('hidden', group.dataset.ptFooter !== tabName));
+    if (tabName === 'postprocess' && !ppBusy) ppRunPreview();
+}
+
+ptTabButtons.forEach(button => button.addEventListener('click', () => ptSelectTab(button.dataset.ptTab)));
 
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && ptModal.classList.contains('active')) {
@@ -3430,10 +3589,17 @@ async function ptRunPreview() {
             return;
         }
 
-        const countEl = ptModal.querySelector('.pt-preview-count');
+        const countEl = ptModal.querySelector('[data-pt-panel="rules"] .pt-preview-count');
         if (countEl) countEl.textContent = `(${data.results.length} samples)`;
 
-        ptPreviewList.innerHTML = data.results.map(r => `
+        ptRenderPreviewResults(ptPreviewList, data.results);
+    } catch (e) {
+        ptPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(e.message)}</div>`;
+    }
+}
+
+function ptRenderPreviewResults(list, results) {
+    list.innerHTML = results.map(r => `
             <div class="pt-preview-item">
                 <div class="pt-preview-filename">${escHtml(r.filename)}</div>
                 <div class="pt-preview-row">
@@ -3448,9 +3614,6 @@ async function ptRunPreview() {
                     </div>
                 </div>
             </div>`).join('');
-    } catch (e) {
-        ptPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(e.message)}</div>`;
-    }
 }
 
 ptRefreshBtn.addEventListener('click', ptRunPreview);
@@ -3462,8 +3625,13 @@ ptTemplateEl.addEventListener('input', ptSchedulePreview);
 
 ptApplyBtn.addEventListener('click', async () => {
     if (!currentFolder) return;
-    const ok = confirm(
-        `Apply processing to ALL captions in "${currentFolder}"?\n\nA backup will be created inside the dataset before any file is changed.`
+    const ok = await appDialog.confirm(
+        `Apply processing to ALL captions in "${currentFolder}"?\n\nA backup will be created inside the dataset before any file is changed.`,
+        {
+            title: 'Process All Captions',
+            tone: 'warning',
+            confirmLabel: 'Apply to All'
+        }
     );
     if (!ok) return;
 
@@ -3508,11 +3676,491 @@ function ptShowStatus(msg, type = 'info') {
     setTimeout(() => bar.classList.remove('visible'), 4000);
 }
 
+// ── Post-processing ──────────────────────────────────────────────────────────
+
+function ppGetConfig() {
+    return { prefix: ppPrefix.value, suffix: ppSuffix.value, find: ppFind.value, replace: ppReplace.value };
+}
+
+function ppConfigError(config) {
+    if (config.replace && !config.find) return 'Enter text to find before specifying a replacement.';
+    if (!config.prefix && !config.suffix && !config.find) return 'Enter a prefix, suffix, or text to replace to preview changes.';
+    return '';
+}
+
+function ppUpdateButtons() {
+    const disabled = ppBusy || Boolean(ppConfigError(ppGetConfig()));
+    [ppPreviewBtn, ppRefreshBtn, ppApplyBtn].forEach(button => { button.disabled = disabled; });
+    ppFields.forEach(field => { field.disabled = ppBusy; });
+    ppApplyBtn.textContent = ppBusy ? 'Applying…' : 'Apply to All';
+}
+
+function ppInitialize() {
+    if (ppInitializedFolder !== currentFolder) {
+        clearTimeout(ppPreviewDebounce);
+        ppPreviewController?.abort();
+        ppPreviewSequence++;
+        ppInitializedFolder = currentFolder;
+        ppFields.forEach(field => { field.value = ''; });
+        ppPreviewCount.textContent = '';
+        ppPreviewList.innerHTML = '<div class="pt-preview-empty">Enter a prefix, suffix, or text to replace to preview changes.</div>';
+        ppStatus.textContent = 'Applies to all caption files in the selected dataset.';
+    }
+    ppUpdateButtons();
+}
+
+function ppSchedulePreview() {
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    ppPreviewSequence++;
+    ppPreviewCount.textContent = '';
+    ppStatus.textContent = 'Applies to all caption files in the selected dataset.';
+    ppUpdateButtons();
+    ppPreviewDebounce = setTimeout(ppRunPreview, 600);
+}
+
+function ppRenderResults(data, applied = false) {
+    ppPreviewCount.textContent = `(${data.results.length} samples / ${data.total} captions)`;
+    if (data.results.length) {
+        ptRenderPreviewResults(ppPreviewList, data.results);
+    } else {
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty">${data.total ? 'No captions could be processed.' : 'No caption files found in this dataset.'}</div>`;
+    }
+    const errorCount = data.errors?.length || 0;
+    ppStatus.textContent = applied
+        ? `${data.processed} of ${data.total} captions updated.${data.backup ? ` Backup: ${data.backup}.` : ''}`
+        : `${data.changed} of ${data.total} captions will change.`;
+    if (errorCount) {
+        ppStatus.textContent += ` ${errorCount} error(s): ${data.errors.map(error => `${error.file}: ${error.error}`).join('; ')}`;
+    }
+}
+
+async function ppRunPreview() {
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    const sequence = ++ppPreviewSequence;
+    if (!currentFolder || ppBusy) return;
+    const folder = currentFolder;
+    const config = ppGetConfig();
+    const error = ppConfigError(config);
+    ppPreviewCount.textContent = '';
+    if (error) {
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty">${escHtml(error)}</div>`;
+        return;
+    }
+    const controller = new AbortController();
+    ppPreviewController = controller;
+    ppPreviewList.innerHTML = '<div class="pt-preview-empty pt-loading">Generating preview…</div>';
+    try {
+        const res = await fetch('/api/process-text/postprocess/preview', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+            body: JSON.stringify({ folder, config, count: 5 })
+        });
+        const data = await res.json();
+        if (sequence !== ppPreviewSequence || folder !== currentFolder) return;
+        if (!res.ok || data.error) throw new Error(data.error || 'Preview failed');
+        ppRenderResults(data);
+    } catch (error) {
+        if (error.name === 'AbortError' || sequence !== ppPreviewSequence || folder !== currentFolder) return;
+        ppPreviewList.innerHTML = `<div class="pt-preview-empty pt-error">Preview error: ${escHtml(error.message)}</div>`;
+    }
+}
+
+ppFields.forEach(field => field.addEventListener('input', ppSchedulePreview));
+ppPreviewBtn.addEventListener('click', ppRunPreview);
+ppRefreshBtn.addEventListener('click', ppRunPreview);
+
+ppApplyBtn.addEventListener('click', async () => {
+    if (!currentFolder || ppBusy || ppConfigError(ppGetConfig())) return;
+    const folder = currentFolder;
+    const config = ppGetConfig();
+    let confirmed = false;
+    ppBusy = true;
+    clearTimeout(ppPreviewDebounce);
+    ppPreviewController?.abort();
+    ppPreviewSequence++;
+    ppUpdateButtons();
+    try {
+        if (!await checkUnsavedCaption()) return;
+        const ok = await appDialog.confirm(
+            `Apply post-processing to ALL existing captions in "${folder}"?\n\nA backup will be created before saving. Applying again will add the prefix and suffix again.`,
+            { title: 'Post-process All Captions', tone: 'warning', confirmLabel: 'Apply to All' }
+        );
+        if (!ok || folder !== currentFolder) return;
+        confirmed = true;
+        const res = await fetch('/api/process-text/postprocess/apply', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder, config, count: 5 })
+        });
+        const data = await res.json();
+        if (folder !== currentFolder) return;
+        if (!res.ok || data.error) throw new Error(data.error || 'Apply failed');
+        ppRenderResults(data, true);
+        if (images[currentIndex]) loadCaption(images[currentIndex]);
+    } catch (error) {
+        if (folder === currentFolder) ppStatus.textContent = 'Apply failed: ' + error.message;
+    } finally {
+        ppBusy = false;
+        ppUpdateButtons();
+        if (!confirmed && folder === currentFolder) ppRunPreview();
+    }
+});
+
+// ── Auto Caption ─────────────────────────────────────────────────────────────
+
+function acGetConfig() {
+    return {
+        systemPrompt: acSystemPrompt.value,
+        modelId: acModelSelect.value,
+        variantId: acQuantSelect.value,
+        prefix: acPrefix.value,
+        suffix: acSuffix.value
+    };
+}
+
+function acSetBusy(busy) {
+    acBusy = busy;
+    [acPreviewBtn, acRerollBtn, acMissingBtn, acApplyBtn, acRescanBtn, acLoadBtn, acSaveBtn].forEach(button => {
+        button.disabled = busy;
+    });
+    acStopBtn.classList.toggle('hidden', !busy);
+    acStopBtn.disabled = !busy || !acActiveJobId || acStopRequested;
+    if (!busy) {
+        const hasModel = Boolean(acModelSelect.value && acQuantSelect.value);
+        acPreviewBtn.disabled = !hasModel;
+        acRerollBtn.disabled = !hasModel;
+        acMissingBtn.disabled = !hasModel;
+        acApplyBtn.disabled = !hasModel;
+    }
+}
+
+function acSelectedModel() {
+    return acCatalog.models.find(model => model.id === acModelSelect.value) || null;
+}
+
+function acPopulateQuantizations(preferredVariantId = '') {
+    const model = acSelectedModel();
+    const variants = model?.variants || [];
+    acQuantSelect.innerHTML = variants.length
+        ? variants.map(variant => `<option value="${escHtml(variant.id)}">${escHtml(variant.quantization)} — ${escHtml(variant.filename)}</option>`).join('')
+        : '<option value="">No quantizations found</option>';
+    if (preferredVariantId && variants.some(variant => variant.id === preferredVariantId)) {
+        acQuantSelect.value = preferredVariantId;
+    }
+    acQuantSelect.disabled = !variants.length;
+    acSetBusy(acBusy);
+}
+
+function acPopulateModels(preferredModelId = '', preferredVariantId = '') {
+    const models = acCatalog.models || [];
+    acModelSelect.innerHTML = models.length
+        ? models.map(model => `<option value="${escHtml(model.id)}">${escHtml(model.label)}</option>`).join('')
+        : '<option value="">No paired GGUF models found</option>';
+    if (preferredModelId && models.some(model => model.id === preferredModelId)) {
+        acModelSelect.value = preferredModelId;
+    }
+    acModelSelect.disabled = !models.length;
+    acPopulateQuantizations(preferredVariantId);
+
+    const warnings = acCatalog.warnings || [];
+    if (!models.length) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = `No selectable models in ${acCatalog.directory || 'models/llm'}. Add a language-model .gguf and its matching mmproj .gguf, then click Rescan Models.${warnings.length ? `\n\n${warnings.join('\n')}` : ''}`;
+    } else if (warnings.length) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = `${models.length} model famil${models.length === 1 ? 'y' : 'ies'} ready.\n${warnings.join('\n')}`;
+    } else {
+        acModelStatus.dataset.state = 'ready';
+        acModelStatus.textContent = `${models.length} local model famil${models.length === 1 ? 'y' : 'ies'} ready. GGUF quantization is selected from the files on disk.`;
+    }
+}
+
+async function acLoadModels({ modelId = acModelSelect.value, variantId = acQuantSelect.value } = {}) {
+    const response = await fetch('/api/auto-caption/models');
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to scan local models.');
+    acCatalog = data;
+    acPopulateModels(modelId, variantId);
+}
+
+function acSetConfig(config) {
+    acSystemPrompt.value = config.systemPrompt || '';
+    acPrefix.value = config.prefix || '';
+    acSuffix.value = config.suffix || '';
+    acPopulateModels(config.modelId || '', config.variantId || '');
+}
+
+async function acLoadConfig() {
+    if (!currentFolder) return;
+    const response = await fetch(`/api/auto-caption/config?folder=${encodeURIComponent(currentFolder)}`);
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to load Auto Caption config.');
+    acSetConfig(data);
+}
+
+async function acInitialize() {
+    if (!currentFolder) return;
+    clearTimeout(acSaveDebounce);
+    acInitializedFolder = '';
+    const folder = currentFolder;
+    try {
+        await acLoadModels({ modelId: '', variantId: '' });
+        await acLoadConfig();
+        if (currentFolder === folder) acInitializedFolder = folder;
+    } catch (error) {
+        acModelStatus.dataset.state = 'warning';
+        acModelStatus.textContent = error.message;
+    }
+}
+
+async function acSaveConfig({ folder = currentFolder, config = acGetConfig(), silent = false } = {}) {
+    if (!folder) return;
+    const response = await fetch(`/api/auto-caption/config?folder=${encodeURIComponent(folder)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config)
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Failed to save Auto Caption config.');
+    if (!silent) ptShowStatus('Auto Caption config saved.', 'success');
+}
+
+function acScheduleConfigSave() {
+    if (!currentFolder || acInitializedFolder !== currentFolder) return;
+    const folder = currentFolder;
+    const config = acGetConfig();
+    clearTimeout(acSaveDebounce);
+    acSaveDebounce = setTimeout(async () => {
+        try {
+            await acSaveConfig({ folder, config, silent: true });
+        } catch (error) {
+            ptShowStatus(`Auto-save failed: ${error.message}`, 'error');
+        }
+    }, 300);
+}
+
+function acRenderProgress(job) {
+    acProgress.classList.remove('hidden');
+    const percent = Math.max(0, Math.min(100, Number(job.progressPercent || 0)));
+    acProgressPercent.textContent = `${percent.toFixed(0)}%`;
+    acProgressFill.style.width = `${percent}%`;
+
+    const stateLabels = {
+        queued: 'Queued',
+        waiting: 'Waiting for the caption engine',
+        loading: `Loading ${job.currentItem || 'GGUF model'}`,
+        running: job.currentItem ? `Generating ${job.currentItem}` : 'Generating captions',
+        committing: 'Saving generated captions',
+        completed: 'Complete',
+        stopped: 'Stopped',
+        error: 'Failed'
+    };
+    const count = job.totalItems ? ` — ${job.processedItems}/${job.totalItems}` : '';
+    const label = job.stopRequested && !job.finished
+        ? 'Stopping after current image'
+        : (stateLabels[job.status] || job.status);
+    acProgressLabel.textContent = `${label}${count}`;
+
+    const symbols = { queued: '·', generating: '◌', completed: '✓', error: '!', stopped: '–' };
+    acProgressItems.innerHTML = (job.items || []).map(item => `
+        <div class="ac-progress-item" data-status="${escHtml(item.status)}" title="${escHtml(item.error || item.caption || '')}">
+            <span>${symbols[item.status] || '·'}</span><span>${escHtml(item.filename)}</span>
+        </div>
+    `).join('');
+    const current = acProgressItems.querySelector('[data-status="generating"]');
+    current?.scrollIntoView({ block: 'nearest' });
+}
+
+function acRenderCompleted(job) {
+    const result = job.result || {};
+    if (result.stopped || job.status === 'stopped') {
+        const failures = result.failed ? ` ${result.failed} image(s) failed.` : '';
+        ptShowStatus(
+            `Stopped — ${result.generated || 0} caption(s) saved.${failures}`,
+            'warning'
+        );
+        if (images[currentIndex]) loadCaption(images[currentIndex]);
+        return;
+    }
+    if (job.mode === 'preview') {
+        if (!result.filename || !result.caption) {
+            const message = result.errors?.[0]?.error || 'The model did not produce a caption.';
+            throw new Error(message);
+        }
+        const imageUrl = `/api/image/img/${encodeURIComponent(result.filename)}?folder=${encodeURIComponent(currentFolder)}&t=${Date.now()}`;
+        acPreviewImage.src = imageUrl;
+        acPreviewImage.closest('.ac-preview-frame').classList.add('has-image');
+        acPreviewFilename.textContent = result.filename;
+        acPreviewCaption.textContent = result.caption;
+        ptShowStatus(`Preview generated with ${result.model} (${result.quantization}).`, 'success');
+        return;
+    }
+
+    const backup = result.backup ? ` Backup: ${result.backup}.` : '';
+    const failures = result.failed ? ` ${result.failed} image(s) failed.` : '';
+    const scope = result.missingOnly ? ' missing' : '';
+    ptShowStatus(
+        `Generated ${result.generated}${scope} caption(s).${failures}${backup}`,
+        result.failed ? 'warning' : 'success'
+    );
+    if (images[currentIndex]) loadCaption(images[currentIndex]);
+}
+
+async function acPollJob(jobId) {
+    while (true) {
+        const response = await fetch(`/api/auto-caption/jobs/${encodeURIComponent(jobId)}`);
+        const job = await response.json();
+        if (!response.ok || job.error && !job.finished) {
+            throw new Error(job.error || 'Failed to read Auto Caption progress.');
+        }
+        acRenderProgress(job);
+        if (job.status === 'error') throw new Error(job.error || 'Auto Caption failed.');
+        if (job.finished && (job.status === 'completed' || job.status === 'stopped')) {
+            acRenderCompleted(job);
+            return job;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+}
+
+async function acStartJob(mode) {
+    if (!currentFolder || acBusy) return;
+    if (!acModelSelect.value || !acQuantSelect.value) {
+        ptShowStatus('Add a paired GGUF + mmproj model and select it first.', 'warning');
+        return;
+    }
+    clearTimeout(acSaveDebounce);
+    try {
+        await acSaveConfig({ silent: true });
+    } catch (error) {
+        ptShowStatus(`Cannot save Auto Caption config: ${error.message}`, 'error');
+        return;
+    }
+    if (mode === 'apply') {
+        const ok = await appDialog.confirm(
+            `Generate and replace captions for ALL ${images.length} images in "${currentFolder}"?\n\nExisting captions will be backed up before generated text is saved.`,
+            {
+                title: 'Replace All Captions',
+                tone: 'warning',
+                confirmLabel: 'Generate Captions'
+            }
+        );
+        if (!ok) return;
+    } else if (mode === 'missing') {
+        const ok = await appDialog.confirm(
+            `Generate captions only for images without a non-empty .txt caption in "${currentFolder}"?\n\nExisting captions will not be replaced.`,
+            {
+                title: 'Caption Missing Images',
+                tone: 'info',
+                confirmLabel: 'Generate Missing'
+            }
+        );
+        if (!ok) return;
+    }
+
+    acActiveJobId = '';
+    acStopRequested = false;
+    acStopBtn.textContent = 'Stop';
+    acSetBusy(true);
+    acProgress.classList.remove('hidden');
+    acProgressLabel.textContent = 'Starting…';
+    acProgressPercent.textContent = '0%';
+    acProgressFill.style.width = '0%';
+    acProgressItems.innerHTML = '';
+    try {
+        const response = await fetch(`/api/auto-caption/${mode === 'preview' ? 'preview' : 'apply'}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                folder: currentFolder,
+                config: acGetConfig(),
+                missingOnly: mode === 'missing'
+            })
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'Failed to start Auto Caption.');
+        acActiveJobId = data.jobId;
+        acSetBusy(true);
+        await acPollJob(data.jobId);
+    } catch (error) {
+        acProgressLabel.textContent = error.message;
+        acProgressPercent.textContent = 'Error';
+        ptShowStatus(`Auto Caption failed: ${error.message}`, 'error');
+    } finally {
+        acActiveJobId = '';
+        acStopRequested = false;
+        acStopBtn.textContent = 'Stop';
+        acSetBusy(false);
+    }
+}
+
+acSystemPrompt.addEventListener('input', acScheduleConfigSave);
+acPrefix.addEventListener('input', acScheduleConfigSave);
+acSuffix.addEventListener('input', acScheduleConfigSave);
+acModelSelect.addEventListener('change', () => {
+    acPopulateQuantizations();
+    acScheduleConfigSave();
+});
+acQuantSelect.addEventListener('change', acScheduleConfigSave);
+acRescanBtn.addEventListener('click', async () => {
+    try {
+        await acLoadModels();
+        ptShowStatus('Local GGUF models rescanned.', 'success');
+    } catch (error) {
+        ptShowStatus(`Model scan failed: ${error.message}`, 'error');
+    }
+});
+acLoadBtn.addEventListener('click', async () => {
+    try {
+        await acLoadConfig();
+        ptShowStatus('Auto Caption config loaded.', 'success');
+    } catch (error) {
+        ptShowStatus(`Load failed: ${error.message}`, 'error');
+    }
+});
+acSaveBtn.addEventListener('click', async () => {
+    try { await acSaveConfig(); } catch (error) { ptShowStatus(`Save failed: ${error.message}`, 'error'); }
+});
+acPreviewBtn.addEventListener('click', () => acStartJob('preview'));
+acRerollBtn.addEventListener('click', () => acStartJob('preview'));
+acMissingBtn.addEventListener('click', () => acStartJob('missing'));
+acApplyBtn.addEventListener('click', () => acStartJob('apply'));
+acStopBtn.addEventListener('click', async () => {
+    if (!acActiveJobId || acStopRequested) return;
+    acStopRequested = true;
+    acStopBtn.disabled = true;
+    acStopBtn.textContent = 'Stopping…';
+    acProgressLabel.textContent = 'Stopping after current image…';
+    try {
+        const response = await fetch(`/api/auto-caption/jobs/${encodeURIComponent(acActiveJobId)}/stop`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'Failed to stop Auto Caption.');
+    } catch (error) {
+        acStopRequested = false;
+        acStopBtn.disabled = false;
+        acStopBtn.textContent = 'Stop';
+        ptShowStatus(`Stop failed: ${error.message}`, 'error');
+    }
+});
+
+window.addEventListener('pagehide', () => {
+    if (!currentFolder || acInitializedFolder !== currentFolder) return;
+    clearTimeout(acSaveDebounce);
+    const url = `/api/auto-caption/config?folder=${encodeURIComponent(currentFolder)}`;
+    const payload = new Blob([JSON.stringify(acGetConfig())], { type: 'application/json' });
+    navigator.sendBeacon(url, payload);
+});
+
 // ─── Stitch Mode ──────────────────────────────────────────────────────────────
 
-function activateStitchMode() {
+async function activateStitchMode() {
     if (!currentFolder) {
-        alert('Please select a dataset folder first.');
+        await appDialog.alert('Please select a dataset folder first.', {
+            title: 'Dataset Required',
+            tone: 'warning'
+        });
         return;
     }
     stitchMode = true;
@@ -3702,11 +4350,17 @@ async function performStitch() {
                 }
             }
         } else {
-            alert(`Stitch failed: ${data.error || 'Unknown error'}`);
+            await appDialog.alert(`Stitch failed: ${data.error || 'Unknown error'}`, {
+                title: 'Stitch Failed',
+                tone: 'error'
+            });
         }
     } catch (error) {
         console.error('Stitch failed:', error);
-        alert('Stitch failed. Check console for details.');
+        await appDialog.alert('Stitch failed. Check console for details.', {
+            title: 'Stitch Failed',
+            tone: 'error'
+        });
     } finally {
         confirmBtn.disabled = false;
         confirmBtn.innerHTML = `
